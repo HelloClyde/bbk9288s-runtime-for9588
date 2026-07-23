@@ -68,8 +68,11 @@ The original 9288S 海盗船 executable now runs interactively in the QEMU-based
 
 - the portable S1C33 interpreter executes the unmodified D300 program image;
 - the 9288S relocation-table calls are handled by the compatibility runtime;
-- the title artwork and two-board game view render to the 9588 RGB565 scanout;
+- the title artwork and game board render to the 9588 RGB565 scanout;
 - confirm enters the game and the four direction keys change game state;
+- web-frontend touch input is translated to the 9288S pointer-message format;
+- the original 帮助说明 and 退出游戏 touch buttons work, including the
+  native 9588 confirmation dialogs;
 - the timer and persistent 9288S message loop run inside the native 9588 BDA;
 - emulator key events are consumed directly, without re-entering the 9588
   firmware GUI event dispatcher.
@@ -108,6 +111,10 @@ Controls in the 9588 web frontend:
 | Confirm | `J` | 确定 |
 | Exit/back | `K` | 退出 |
 
+The 9588 web display is also touch-enabled. On the game screen, tap
+`帮助说明` to open the original help text or `退出游戏` to open its
+yes/no confirmation.
+
 Restore the overwritten launcher BDA:
 
 ```powershell
@@ -120,10 +127,11 @@ Expose the currently packaged 9588 emulator to the private LAN:
 .\scripts\start-9588-lan.ps1
 ```
 
-The frontend then listens on TCP 8013 on all IPv4 interfaces. Run the firewall
-helper once from an elevated PowerShell prompt; its inbound rule is limited to
-the Private profile, the local subnet, TCP 8013, and the emulator's bundled
-Python executable:
+This launcher also enables the QEMU touch-state mirror required by the
+compatibility BDA. The frontend listens on TCP 8013 on all IPv4 interfaces
+and prints the usable LAN URL. Run the firewall helper once from an elevated
+PowerShell prompt; its inbound rule is limited to the Private profile, the
+local subnet, TCP 8013, and the emulator's bundled Python executable:
 
 ```powershell
 .\scripts\enable-9588-lan-firewall.ps1

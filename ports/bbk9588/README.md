@@ -1,18 +1,18 @@
 # BBK 9588 port
 
-The current adapter is a diagnostic BDA entry point. It looks for an authorized
-local D300 application at:
+The adapter is a native BDA containing the authorized D300 application selected
+at build time. It allocates the guest address space, loads the original program
+at `0x02700000`, installs relocation-table traps, and runs the portable C33
+interpreter.
 
-```text
-A:\pirate.exe
-a:\pirate.exe
-```
+The current QEMU-specific host adapter provides:
 
-It allocates the guest IRAM/SDRAM, loads the D300 program at `0x02700000`,
-installs relocation-table traps, and runs the portable interpreter. The
-diagnostic adapter currently exercises main-window creation, `MSG_CREATE`, and
-one timer callback with headless GUI stubs. It does not present the game
-surface or run a persistent input/message loop yet.
+- a centered 160×240 guest surface on the rotated 240×320 RGB565 display;
+- row-aligned packed 2bpp image decoding;
+- a persistent 9288S GUI message loop and timer;
+- direction/confirm/exit key translation;
+- touch down, move, and up translation through QEMU's touch-state mirror;
+- help, confirmation, window-destruction, and clean-exit handling.
 
 Build from the project root:
 
@@ -20,4 +20,12 @@ Build from the project root:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-bda.ps1
 ```
 
-The existing `E:\eebbk9588` SDK is used only as a build dependency.
+Start the LAN/touch-enabled 9588 frontend with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-9588-lan.ps1
+```
+
+The existing `E:\eebbk9588` SDK is used only as a build dependency. The
+current direct scanout and diagnostic input mirrors are emulator interfaces;
+physical 9588 hardware would require a separate host adapter.

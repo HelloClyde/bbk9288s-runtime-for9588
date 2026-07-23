@@ -11,6 +11,8 @@
 #define SDRAM_SIZE 0x00800000u
 #define SDRAM_BASE 0x02000000u
 
+static uint32_t main_window_callback;
+
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
     unsigned char bytes[4];
@@ -151,6 +153,8 @@ static c33_vm_status_t report_api(
         slot == COMPAT_GUI_PUT_IMAGE_AREA &&
         ++put_image_calls <= 24u) {
         uint32_t index;
+        uint32_t buffer_address = 0;
+        unsigned char header[COMPAT_GUI_IMAGE_HEADER_SIZE];
         printf("  PutImageArea stack sp=0x%08lx:",
                (unsigned long)vm->sp);
         for (index = 0; index < 8u; ++index) {
@@ -162,6 +166,15 @@ static c33_vm_status_t report_api(
             printf(" %08lx", (unsigned long)value);
         }
         printf("\n");
+        if (read_guest_u32(vm, vm->sp + 8u, &buffer_address) &&
+            c33_vm_read(vm, buffer_address, header, sizeof(header))) {
+            printf("  image bytes @0x%08lx:",
+                   (unsigned long)buffer_address);
+            for (index = 0; index < sizeof(header); ++index) {
+                printf(" %02x", header[index]);
+            }
+            printf("\n");
+        }
     }
     if (group == COMPAT_API_GUI &&
         slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
@@ -301,6 +314,21 @@ static c33_vm_status_t report_api(
             (int32_t)vm->regs[8] <= (int32_t)bottom;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SEND_MESSAGE) {
+        if (!main_window_callback) {
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+        return c33_vm_call(
+            vm,
+            main_window_callback,
+            vm->regs[6],
+            vm->regs[7],
+            vm->regs[8],
+            vm->regs[9],
+            1000000u
+        );
+    }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CREATE_MAIN_WINDOW) {
         uint32_t callback;
         c33_vm_status_t status;
@@ -313,6 +341,7 @@ static c33_vm_status_t report_api(
                 vm->regs[6] + COMPAT_MAIN_WIN_CREATE_PROC_OFFSET;
             return C33_VM_FAULT;
         }
+        main_window_callback = callback;
         printf("CreateMainWindow callback=0x%08lx\n", (unsigned long)callback);
         status = c33_vm_call(
             vm, callback, 1u, COMPAT_MSG_CREATE, 0u, 0u, 1000000u
@@ -350,6 +379,42 @@ static c33_vm_status_t report_api(
         if (status != C33_VM_OK) {
             return status;
         }
+        status = c33_vm_call(
+            vm,
+            callback,
+            1u,
+            COMPAT_MSG_LBUTTONDOWN,
+            4u,
+            120u | (230u << 16),
+            1000000u
+        );
+        if (status != C33_VM_OK) {
+            return status;
+        }
+        status = c33_vm_call(
+            vm,
+            callback,
+            1u,
+            COMPAT_MSG_LBUTTONUP,
+            0u,
+            120u | (230u << 16),
+            1000000u
+        );
+        if (status != C33_VM_OK) {
+            return status;
+        }
+        status = c33_vm_call(
+            vm,
+            callback,
+            1u,
+            COMPAT_MSG_KEYDOWN,
+            COMPAT_SCANCODE_RIGHT,
+            0u,
+            1000000u
+        );
+        if (status != C33_VM_OK) {
+            return status;
+        }
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
@@ -364,6 +429,24 @@ static c33_vm_status_t report_api(
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLEAR_SCREEN) {
         vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SAVE_SCREEN_BOX) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_MESSAGE_BOX) {
+        /* The scripted exit-path probe confirms the MB_YESNO dialog. */
+        vm->regs[4] = 6u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_DESTROY_MAIN_WINDOW) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_POST_QUIT_MESSAGE) {
+        vm->regs[4] = 1u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_PUT_IMAGE_AREA) {
@@ -403,6 +486,12 @@ static c33_vm_status_t report_api(
     }
     if (group == COMPAT_API_GUI &&
         slot == COMPAT_GUI_SHOW_STATUS_AND_DESKTOP) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        (slot == COMPAT_GUI_HELP2 ||
+         slot == COMPAT_GUI_TRACE_INIT)) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }

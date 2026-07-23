@@ -19,10 +19,12 @@ enum compat_gui_slot {
     COMPAT_GUI_DISPATCH_MESSAGE = 21,
     COMPAT_GUI_SET_INSTANT_PAINT = 29,
     COMPAT_GUI_CREATE_MAIN_WINDOW = 33,
+    COMPAT_GUI_DESTROY_MAIN_WINDOW = 34,
     COMPAT_GUI_DEFAULT_MAIN_WIN_PROC = 35,
     COMPAT_GUI_MAIN_WINDOW_CLEANUP = 95,
     COMPAT_GUI_SET_TIMER = 107,
     COMPAT_GUI_KILL_TIMER = 108,
+    COMPAT_GUI_MESSAGE_BOX = 174,
     COMPAT_GUI_GET_SYS_PIXEL_INDEX = 191,
     COMPAT_GUI_GET_GD_CAPABILITY = 192,
     COMPAT_GUI_GET_DC = 193,
@@ -48,6 +50,7 @@ enum compat_gui_slot {
     COMPAT_GUI_LINE_TO = 223,
     COMPAT_GUI_MOVE_TO = 224,
     COMPAT_GUI_RECTANGLE = 227,
+    COMPAT_GUI_SAVE_SCREEN_BOX = 254,
     COMPAT_GUI_SET_RECT = 268,
     COMPAT_GUI_SET_RECT_EMPTY = 269,
     COMPAT_GUI_POINT_IN_RECT = 283,
@@ -64,12 +67,19 @@ enum compat_gui_slot {
     COMPAT_GUI_DRAW_HZ = 361,
     COMPAT_GUI_PRINT_STRING = 362,
     COMPAT_GUI_SHOW_STATUS_AND_DESKTOP = 388,
-    COMPAT_GUI_GET_BACKGROUND_PLAY_STATE = 392
+    COMPAT_GUI_GET_BACKGROUND_PLAY_STATE = 392,
+    COMPAT_GUI_HELP2 = 448,
+    COMPAT_GUI_TRACE_INIT = 449
 };
 
 enum compat_gui_message {
+    COMPAT_MSG_LBUTTONDOWN = 0x0001,
+    COMPAT_MSG_LBUTTONUP = 0x0002,
+    COMPAT_MSG_MOUSEMOVE = 0x0004,
     COMPAT_MSG_KEYDOWN = 0x0010,
     COMPAT_MSG_CREATE = 0x0060,
+    COMPAT_MSG_DESTROY = 0x0064,
+    COMPAT_MSG_CLOSE = 0x0066,
     COMPAT_MSG_PAINT = 0x00b1,
     COMPAT_MSG_TIMER = 0x0144
 };
@@ -85,6 +95,24 @@ enum compat_gui_scancode {
 
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
 #define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
+
+static inline unsigned compat_gui_packed_2bpp_stride(unsigned width)
+{
+    return (width + 3u) / 4u;
+}
+
+static inline unsigned compat_gui_packed_2bpp_payload_size(
+    unsigned width,
+    unsigned height
+)
+{
+    return compat_gui_packed_2bpp_stride(width) * height;
+}
+
+static inline unsigned compat_gui_packed_2bpp_shift(unsigned x)
+{
+    return 6u - 2u * (x & 3u);
+}
 
 static inline unsigned compat_gui_image_payload_offset(
     const unsigned char *header,

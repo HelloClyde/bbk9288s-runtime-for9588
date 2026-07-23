@@ -66,6 +66,7 @@ $Arguments = @(
   "-m", "emu.web.frontend",
   "--boot-mode", "nand",
   "--qemu", $Qemu,
+  "--qemu-machine-option", "touch-trace=on",
   "--nand-image", $Nand,
   "--host", $BindAddress,
   "--port", "$Port"

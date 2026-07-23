@@ -22,6 +22,8 @@
 #define QEMU_EVENT_SLOTS  8u
 #define QEMU_EVENT_WORDS  5u
 #define QEMU_EVENT_KIND_KEY 1u
+#define QEMU_TOUCH_TRACE  0xa9f00100u
+#define QEMU_TOUCH_MAGIC  0x54434b42u
 
 #define GUEST_IRAM_SIZE  0x00004000u
 #define GUEST_API_BASE   0x02000000u
@@ -57,6 +59,11 @@ typedef struct compat_9588_state {
     u32 event_count;
     u32 hardware_event_cursor;
     int hardware_events_ready;
+    int touch_ready;
+    int touch_down;
+    int touch_captured;
+    u32 touch_x;
+    u32 touch_y;
     u32 timer_hwnd;
     u32 timer_id;
     u32 timer_interval;
@@ -157,6 +164,36 @@ static int guest_write_u32(c33_vm_t *vm, u32 address, u32 value)
     return c33_vm_write(vm, address, bytes, sizeof(bytes));
 }
 
+static int guest_read_c_string(
+    c33_vm_t *vm,
+    u32 address,
+    char *buffer,
+    u32 capacity
+)
+{
+    u32 index;
+    if (!buffer || capacity == 0u) {
+        return 0;
+    }
+    if (!address) {
+        buffer[0] = 0;
+        return 1;
+    }
+    for (index = 0; index + 1u < capacity; ++index) {
+        u8 ch;
+        if (!c33_vm_read(vm, address + index, &ch, 1u)) {
+            buffer[0] = 0;
+            return 0;
+        }
+        buffer[index] = (char)ch;
+        if (!ch) {
+            return 1;
+        }
+    }
+    buffer[capacity - 1u] = 0;
+    return 1;
+}
+
 static u16 logical_color_to_rgb565(u32 color)
 {
     static const u16 palette[17] = {
@@ -244,6 +281,7 @@ static int draw_packed_2bpp(
     c33_vm_t *vm = state->vm;
     u8 image_header[COMPAT_GUI_IMAGE_HEADER_SIZE];
     u32 pixel_count;
+    u32 source_stride;
     u32 source_bytes;
     u32 source_address = guest_buffer;
     u32 index;
@@ -256,7 +294,8 @@ static int draw_packed_2bpp(
         return 0;
     }
     pixel_count = width * height;
-    source_bytes = (pixel_count + 3u) / 4u;
+    source_stride = compat_gui_packed_2bpp_stride(width);
+    source_bytes = compat_gui_packed_2bpp_payload_size(width, height);
     /*
      * PutImageArea receives the SDK image object, not a pointer to its first
      * pixel.  The common 16-byte header stores width/height at offsets 8/10
@@ -272,9 +311,9 @@ static int draw_packed_2bpp(
         );
     }
     for (index = 0; index < pixel_count; ++index) {
-        u32 byte_index = index / 4u;
         u32 px = index % width;
         u32 py = index / width;
+        u32 byte_index = py * source_stride + px / 4u;
         if (byte_index != loaded_byte) {
             if (byte_index >= source_bytes ||
                 !c33_vm_read(vm, source_address + byte_index, &packed, 1u)) {
@@ -287,7 +326,7 @@ static int draw_packed_2bpp(
             state,
             x + (s32)px,
             y + (s32)py,
-            (packed >> (6u - 2u * (index & 3u))) & 3u
+            (packed >> compat_gui_packed_2bpp_shift(px)) & 3u
         );
     }
     if (!state->instant_paint) {
@@ -431,6 +470,31 @@ static int queue_message(
     return 1;
 }
 
+static int queue_pointer_message(
+    compat_9588_state_t *state,
+    u32 message,
+    u32 x,
+    u32 y,
+    u32 buttons
+)
+{
+    guest_message_t *event;
+    if (!state || state->event_count >= EVENT_QUEUE_SIZE) {
+        return 0;
+    }
+    event = &state->events[state->event_write];
+    event->hwnd = state->guest_hwnd;
+    event->message = message;
+    event->wparam = buttons;
+    event->lparam = (x & 0xffffu) | ((y & 0xffffu) << 16);
+    event->time = ++state->message_time;
+    event->point_x = x;
+    event->point_y = y;
+    state->event_write = (state->event_write + 1u) % EVENT_QUEUE_SIZE;
+    state->event_count++;
+    return 1;
+}
+
 static u32 translate_native_key_value(u32 value);
 
 static int pop_message(compat_9588_state_t *state, guest_message_t *event)
@@ -442,6 +506,96 @@ static int pop_message(compat_9588_state_t *state, guest_message_t *event)
     state->event_read = (state->event_read + 1u) % EVENT_QUEUE_SIZE;
     state->event_count--;
     return 1;
+}
+
+static u32 touch_raw_to_panel_x(u32 raw_x)
+{
+    /*
+     * Invert the four-point C200/9588 calibration used by the frontend.
+     * X raw values decrease from about 0xe74 on the left to 0x172 on the
+     * right.  Extending that line to the physical 0..239 panel avoids a
+     * dead strip outside the original 10..230 calibration targets.
+     */
+    if (raw_x >= 3841u) return 0u;
+    if (raw_x <= 238u) return PHYSICAL_SCREEN_W - 1u;
+    return (3841u - raw_x) * (PHYSICAL_SCREEN_W - 1u) / 3603u;
+}
+
+static u32 touch_raw_to_panel_y(u32 raw_y)
+{
+    if (raw_y >= 3660u) return 0u;
+    if (raw_y <= 141u) return PHYSICAL_SCREEN_H - 1u;
+    return (3660u - raw_y) * (PHYSICAL_SCREEN_H - 1u) / 3519u;
+}
+
+static void service_touch_input(compat_9588_state_t *state)
+{
+    volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
+    u32 down;
+    u32 panel_x;
+    u32 panel_y;
+    u32 guest_x;
+    u32 guest_y;
+
+    if (trace[0] != QEMU_TOUCH_MAGIC) {
+        state->touch_ready = 0;
+        return;
+    }
+    down = trace[4] != 0u;
+    panel_x = touch_raw_to_panel_x(trace[5] & 0xfffu);
+    panel_y = touch_raw_to_panel_y(trace[6] & 0xfffu);
+
+    if (!state->touch_ready) {
+        state->touch_ready = 1;
+        state->touch_down = down;
+        state->touch_captured = 0;
+        state->touch_x = panel_x;
+        state->touch_y = panel_y;
+        return;
+    }
+
+    /*
+     * The 9288S game surface is centered inside the 9588 panel. Ignore the
+     * black border while retaining the last in-surface point for pen-up.
+     */
+    if (panel_x < PHYSICAL_GUEST_X ||
+        panel_x >= PHYSICAL_GUEST_X + GUEST_SCREEN_W ||
+        panel_y < PHYSICAL_GUEST_Y ||
+        panel_y >= PHYSICAL_GUEST_Y + GUEST_SCREEN_H) {
+        if (!down && state->touch_captured) {
+            guest_x = state->touch_x - PHYSICAL_GUEST_X;
+            guest_y = state->touch_y - PHYSICAL_GUEST_Y;
+            queue_pointer_message(
+                state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
+            );
+            state->touch_captured = 0;
+        }
+        state->touch_down = down;
+        return;
+    }
+
+    guest_x = panel_x - PHYSICAL_GUEST_X;
+    guest_y = panel_y - PHYSICAL_GUEST_Y;
+    if (down && !state->touch_captured) {
+        queue_pointer_message(
+            state, COMPAT_MSG_LBUTTONDOWN, guest_x, guest_y, 4u
+        );
+        state->touch_captured = 1;
+        g_diagnostic[14] += 1u;
+    } else if (down &&
+               (panel_x != state->touch_x || panel_y != state->touch_y)) {
+        queue_pointer_message(
+            state, COMPAT_MSG_MOUSEMOVE, guest_x, guest_y, 4u
+        );
+    } else if (!down && state->touch_captured) {
+        queue_pointer_message(
+            state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
+        );
+        state->touch_captured = 0;
+    }
+    state->touch_down = down;
+    state->touch_x = panel_x;
+    state->touch_y = panel_y;
 }
 
 static void service_hardware_input(compat_9588_state_t *state)
@@ -494,6 +648,7 @@ static void service_hardware_input(compat_9588_state_t *state)
             }
         }
     }
+    service_touch_input(state);
 }
 
 static int write_guest_message(
@@ -674,6 +829,22 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = state->guest_hwnd;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_DESTROY_MAIN_WINDOW:
+        {
+            c33_vm_status_t status = call_guest_window_proc(
+                state,
+                vm->regs[6],
+                COMPAT_MSG_DESTROY,
+                0u,
+                0u
+            );
+            if (status != C33_VM_OK) {
+                return status;
+            }
+            state->quit = 1;
+            vm->regs[4] = 1u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_DEFAULT_MAIN_WIN_PROC:
     case COMPAT_GUI_MAIN_WINDOW_CLEANUP:
         vm->regs[4] = 0u;
@@ -692,6 +863,28 @@ static c33_vm_status_t dispatch_9588(
         }
         vm->regs[4] = 1u;
         return C33_VM_OK;
+    case COMPAT_GUI_MESSAGE_BOX:
+        {
+            char text[192];
+            char caption[64];
+            if (!guest_read_c_string(
+                    vm, vm->regs[7], text, sizeof(text)
+                ) ||
+                !guest_read_c_string(
+                    vm, vm->regs[8], caption, sizeof(caption)
+                )) {
+                vm->fault_address =
+                    vm->regs[7] ? vm->regs[7] : vm->regs[8];
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = (u32)bda_msgbox_ex(
+                0,
+                caption[0] ? caption : "9288S",
+                text,
+                vm->regs[9]
+            );
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_GET_SYS_PIXEL_INDEX:
         vm->regs[4] = vm->regs[6] & 0xffu;
         return C33_VM_OK;
@@ -823,6 +1016,9 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_SAVE_SCREEN_BOX:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
     case COMPAT_GUI_SET_RECT:
         {
             u32 bottom;
@@ -932,8 +1128,21 @@ static c33_vm_status_t dispatch_9588(
         }
     case COMPAT_GUI_SHOW_STATUS_AND_DESKTOP:
     case COMPAT_GUI_GET_BACKGROUND_PLAY_STATE:
+    case COMPAT_GUI_TRACE_INIT:
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    case COMPAT_GUI_HELP2:
+        {
+            char help[256];
+            if (!guest_read_c_string(
+                    vm, vm->regs[7], help, sizeof(help)
+                )) {
+                vm->fault_address = vm->regs[7];
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = (u32)bda_msgbox_ex(0, "Help", help, 0u);
+            return C33_VM_OK;
+        }
     default:
         break;
     }
@@ -1092,7 +1301,9 @@ int bda_main(void)
         present_framebuffer(state);
     }
 
-    show_vm_status(vm, vm_status);
+    if (vm_status != C33_VM_DONE) {
+        show_vm_status(vm, vm_status);
+    }
     bda_free(code_ram);
     bda_free(heap_ram);
     bda_free(api_ram);
