@@ -32,17 +32,17 @@ not game content. The title/board artwork is embedded in the program image.
 - Inputs: up, down, left, right, confirm, and exit.
 - The game can run without audio as an initial compatibility milestone.
 
-## First API families to implement
+## Implemented runtime path
 
-- C runtime table: allocation/free and common memory/string helpers.
+- C runtime allocation, memory, and string helpers.
 - GUI message loop and main-window lifecycle.
 - GUI timer calls and tick count.
-- Game drawing helpers (`SysShowPic*`, virtual-screen blit, text helpers).
-- Message box for exit confirmation.
-- Filesystem open/read/write/seek/close for save files.
+- Packed 2bpp drawing, virtual-screen blit, text, lines, and rectangles.
+- Four-level grayscale conversion to the 9588 RGB565 framebuffer.
+- Direct QEMU 9588 key-event translation for direction, confirm, and exit.
 
-The exact slot list will be finalized from app-only call traces before each trap
-is marked supported.
+Save-file translation and audio remain future extensions. They are optional for
+an interactive game session.
 
 ## Verified startup trace
 
@@ -64,3 +64,22 @@ probe executes the entry point and reaches these GUI slots:
 
 The trace completes after 1,471 interpreted instructions when the headless
 probe intentionally returns no queued messages.
+
+## 9588 emulator verification
+
+The native BDA embeds the locally supplied D300 bytes at build time; generated
+game data stays under ignored `build/` and is never committed. The runtime maps
+the program at its original `0x02700000` address and executes it unchanged.
+
+Verified in the 9588 emulator:
+
+1. Launching the BDA reaches the original 海盗船 title image.
+2. The confirm key enters the two-board game screen.
+3. A direction key changes the active board state.
+4. The VM remains in the guest `GetMessage` loop between inputs, with timer
+   messages serviced by the host adapter.
+
+Because starting a BDA occurs inside the firmware's own event dispatch stack,
+calling the native GUI poller recursively is unsafe. This port reads the
+emulator's uncached diagnostic event mirror at `0xA9F00040` and writes its
+160×240 output directly into the rotated 240×320 scanout at `0xA1F82000`.

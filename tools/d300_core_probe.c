@@ -24,6 +24,97 @@ static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
     return 1;
 }
 
+static int write_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t value)
+{
+    unsigned char bytes[4] = {
+        (unsigned char)value,
+        (unsigned char)(value >> 8),
+        (unsigned char)(value >> 16),
+        (unsigned char)(value >> 24)
+    };
+    return c33_vm_write(vm, address, bytes, sizeof(bytes));
+}
+
+static void inspect_put_image(c33_vm_t *vm)
+{
+    static unsigned full_frame_count;
+    uint32_t height;
+    uint32_t buffer_address;
+    uint32_t width = vm->regs[9];
+    size_t raw_size;
+    size_t pixel_count;
+    unsigned char *packed;
+    unsigned char *pixels;
+    unsigned long histogram[256];
+    unsigned unique = 0;
+    unsigned maximum = 0;
+    size_t index;
+
+    if (!read_guest_u32(vm, vm->sp + 4u, &height) ||
+        !read_guest_u32(vm, vm->sp + 8u, &buffer_address) ||
+        width != 160u || height != 240u) {
+        return;
+    }
+    pixel_count = (size_t)width * height;
+    raw_size = (pixel_count + 3u) / 4u;
+    packed = (unsigned char *)malloc(raw_size);
+    pixels = (unsigned char *)malloc(pixel_count);
+    if (!packed || !pixels ||
+        !c33_vm_read(vm, buffer_address, packed, (uint32_t)raw_size)) {
+        free(packed);
+        free(pixels);
+        return;
+    }
+    memset(histogram, 0, sizeof(histogram));
+    for (index = 0; index < pixel_count; ++index) {
+        pixels[index] =
+            (unsigned char)((packed[index / 4u] >> (6u - 2u * (index & 3u))) & 3u);
+        histogram[pixels[index]]++;
+    }
+    for (index = 0; index < 256u; ++index) {
+        if (histogram[index]) {
+            ++unique;
+            maximum = (unsigned)index;
+        }
+    }
+    ++full_frame_count;
+    printf(
+        "  full frame #%u buffer=0x%08lx unique=%u max=%u "
+        "counts[0..3]=%lu,%lu,%lu,%lu\n",
+        full_frame_count,
+        (unsigned long)buffer_address,
+        unique,
+        maximum,
+        histogram[0],
+        histogram[1],
+        histogram[2],
+        histogram[3]
+    );
+    if (full_frame_count <= 4u) {
+        char path[64];
+        FILE *file;
+        snprintf(
+            path,
+            sizeof(path),
+            "build/host-probe/pirate-frame-%u.pgm",
+            full_frame_count
+        );
+        file = fopen(path, "wb");
+        if (file) {
+            fprintf(file, "P5\n%lu %lu\n255\n",
+                    (unsigned long)width, (unsigned long)height);
+            for (index = 0; index < pixel_count; ++index) {
+                unsigned char gray = (unsigned char)(pixels[index] * 85u);
+                fwrite(&gray, 1, 1, file);
+            }
+            fclose(file);
+            printf("  wrote %s\n", path);
+        }
+    }
+    free(packed);
+    free(pixels);
+}
+
 static c33_vm_status_t report_api(
     compat_api_t *api,
     compat_api_group_t group,
@@ -32,6 +123,7 @@ static c33_vm_status_t report_api(
 )
 {
     static unsigned long calls;
+    static unsigned put_image_calls;
     c33_vm_t *vm = api->vm;
     (void)opaque;
     ++calls;
@@ -46,6 +138,67 @@ static c33_vm_status_t report_api(
         (unsigned long)vm->regs[8],
         (unsigned long)vm->regs[9]
     );
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_PUT_IMAGE_AREA &&
+        ++put_image_calls <= 24u) {
+        uint32_t index;
+        printf("  PutImageArea stack sp=0x%08lx:",
+               (unsigned long)vm->sp);
+        for (index = 0; index < 8u; ++index) {
+            uint32_t value = 0;
+            if (!read_guest_u32(vm, vm->sp + index * 4u, &value)) {
+                printf(" <fault>");
+                break;
+            }
+            printf(" %08lx", (unsigned long)value);
+        }
+        printf("\n");
+    }
+    if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
+        slot <= COMPAT_GUI_PRINT_STRING) {
+        uint32_t index;
+        printf("  regs:");
+        for (index = 0; index < 16u; ++index) {
+            printf(" r%lu=%08lx",
+                   (unsigned long)index,
+                   (unsigned long)vm->regs[index]);
+        }
+        printf("\n");
+        printf("  stack sp=0x%08lx:", (unsigned long)vm->sp);
+        for (index = 0; index < 24u; ++index) {
+            uint32_t value = 0;
+            if (!read_guest_u32(vm, vm->sp + index * 4u, &value)) {
+                printf(" <fault>");
+                break;
+            }
+            printf(" %08lx", (unsigned long)value);
+        }
+        printf("\n");
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_TEXT_OUT_LEN) {
+        uint32_t length = 0;
+        unsigned char text_bytes[64];
+        uint32_t i;
+        printf("  TextOutLen stack:");
+        for (i = 0; i < 8u; ++i) {
+            uint32_t value = 0;
+            if (!read_guest_u32(vm, vm->sp + i * 4u, &value)) break;
+            printf(" %08lx", (unsigned long)value);
+        }
+        printf("\n");
+        if (read_guest_u32(vm, vm->sp + 4u, &length)) {
+            if (length > sizeof(text_bytes)) length = sizeof(text_bytes);
+            if (c33_vm_read(vm, vm->regs[9], text_bytes, length)) {
+                printf("  TextOutLen len=%lu bytes:",
+                       (unsigned long)length);
+                for (i = 0; i < length; ++i) {
+                    printf(" %02x", text_bytes[i]);
+                }
+                printf("\n");
+            }
+        }
+    }
 
     /*
      * GUI slot 191 is GetSysPixelIndex in the SDK configuration used by the
@@ -72,6 +225,71 @@ static c33_vm_status_t report_api(
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_RELEASE_DC) {
         vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        (slot == COMPAT_GUI_GET_BK_COLOR ||
+         slot == COMPAT_GUI_GET_TEXT_COLOR ||
+         slot == COMPAT_GUI_GET_PEN_COLOR ||
+         slot == COMPAT_GUI_GET_BRUSH_COLOR)) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        (slot == COMPAT_GUI_GET_BK_MODE ||
+         slot == COMPAT_GUI_GET_PEN_TYPE ||
+         slot == COMPAT_GUI_GET_BRUSH_TYPE)) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        ((slot >= COMPAT_GUI_SET_BK_COLOR &&
+          slot <= COMPAT_GUI_SET_BRUSH_TYPE) ||
+         slot == COMPAT_GUI_SET_PIXEL ||
+         slot == COMPAT_GUI_SET_PIXEL_RGB ||
+         slot == COMPAT_GUI_RGB_TO_PIXEL ||
+         slot == COMPAT_GUI_LINE_TO ||
+         slot == COMPAT_GUI_MOVE_TO ||
+         slot == COMPAT_GUI_RECTANGLE ||
+         slot == COMPAT_GUI_TEXT_OUT_LEN)) {
+        vm->regs[4] = vm->regs[7];
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SET_RECT) {
+        uint32_t bottom;
+        if (!read_guest_u32(vm, vm->sp + 4u, &bottom) ||
+            !write_guest_u32(vm, vm->regs[6] + 0u, vm->regs[7]) ||
+            !write_guest_u32(vm, vm->regs[6] + 4u, vm->regs[8]) ||
+            !write_guest_u32(vm, vm->regs[6] + 8u, vm->regs[9]) ||
+            !write_guest_u32(vm, vm->regs[6] + 12u, bottom)) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SET_RECT_EMPTY) {
+        unsigned i;
+        for (i = 0; i < 4u; ++i) {
+            if (!write_guest_u32(vm, vm->regs[6] + i * 4u, 0u)) {
+                return C33_VM_FAULT;
+            }
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_POINT_IN_RECT) {
+        uint32_t left, top, right, bottom;
+        if (!read_guest_u32(vm, vm->regs[6] + 0u, &left) ||
+            !read_guest_u32(vm, vm->regs[6] + 4u, &top) ||
+            !read_guest_u32(vm, vm->regs[6] + 8u, &right) ||
+            !read_guest_u32(vm, vm->regs[6] + 12u, &bottom)) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] =
+            (int32_t)vm->regs[7] >= (int32_t)left &&
+            (int32_t)vm->regs[7] <= (int32_t)right &&
+            (int32_t)vm->regs[8] >= (int32_t)top &&
+            (int32_t)vm->regs[8] <= (int32_t)bottom;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CREATE_MAIN_WINDOW) {
@@ -105,6 +323,24 @@ static c33_vm_status_t report_api(
         if (status != C33_VM_OK) {
             return status;
         }
+        status = c33_vm_call(
+            vm,
+            callback,
+            1u,
+            COMPAT_MSG_KEYDOWN,
+            COMPAT_SCANCODE_ENTER,
+            0u,
+            1000000u
+        );
+        if (status != C33_VM_OK) {
+            return status;
+        }
+        status = c33_vm_call(
+            vm, callback, 1u, COMPAT_MSG_TIMER, 1u, 0u, 1000000u
+        );
+        if (status != C33_VM_OK) {
+            return status;
+        }
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
@@ -118,6 +354,11 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLEAR_SCREEN) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_PUT_IMAGE_AREA) {
+        inspect_put_image(vm);
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -135,9 +376,39 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_KILL_TIMER) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
+        slot <= COMPAT_GUI_PRINT_STRING) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI &&
         slot == COMPAT_GUI_GET_BACKGROUND_PLAY_STATE) {
         /* No background MP3 state in the headless compatibility host. */
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_SHOW_STATUS_AND_DESKTOP) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_GET_CURRENT_DATETIME) {
+        static const unsigned char time_info[8] = {
+            12, 0, 0, 0, 0, 0, 0, 0
+        };
+        static const unsigned char date_info[6] = {
+            0xea, 0x07, 7, 23, 4, 0
+        };
+        if (!c33_vm_write(vm, vm->regs[6], time_info, sizeof(time_info)) ||
+            !c33_vm_write(vm, vm->regs[7], date_info, sizeof(date_info))) {
+            return C33_VM_FAULT;
+        }
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }

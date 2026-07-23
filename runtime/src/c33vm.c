@@ -170,6 +170,96 @@ static void set_sub_flags(c33_vm_t *vm, uint32_t lhs, uint32_t rhs, uint32_t res
     if (lhs < rhs) vm->psr |= C33_PSR_C;
 }
 
+static unsigned count_leading_zeros32(uint32_t value)
+{
+    unsigned count = 0;
+    if (!value) return 32;
+    while ((value & 0x80000000u) == 0) {
+        value <<= 1;
+        ++count;
+    }
+    return count;
+}
+
+static uint64_t div_extend33(uint32_t value, int sign)
+{
+    return (uint64_t)value | ((uint64_t)(sign != 0) << 32);
+}
+
+static void execute_div_step(c33_vm_t *vm, unsigned operation, uint32_t divisor)
+{
+    const uint64_t mask33 = 0x1ffffffffULL;
+    int dividend_sign;
+    int divisor_sign;
+    uint64_t pair;
+    uint64_t lhs;
+    uint64_t rhs;
+    uint64_t temporary;
+    uint32_t temporary32;
+
+    switch (operation) {
+    case 0: /* div0s */
+        vm->ahr = (vm->alr & 0x80000000u) ? 0xffffffffu : 0u;
+        vm->psr &= ~(C33_PSR_DS | C33_PSR_N);
+        if (vm->alr & 0x80000000u) vm->psr |= C33_PSR_DS;
+        if (divisor & 0x80000000u) vm->psr |= C33_PSR_N;
+        break;
+    case 1: /* div0u */
+        vm->ahr = 0;
+        vm->psr &= ~(C33_PSR_DS | C33_PSR_N);
+        break;
+    case 2: /* div1 */
+        pair = (((uint64_t)vm->ahr << 32) | vm->alr) << 1;
+        vm->ahr = (uint32_t)(pair >> 32);
+        vm->alr = (uint32_t)pair;
+        dividend_sign = !!(vm->psr & C33_PSR_DS);
+        divisor_sign = !!(vm->psr & C33_PSR_N);
+        lhs = div_extend33(vm->ahr, dividend_sign);
+        rhs = div_extend33(divisor, divisor_sign);
+        if (!dividend_sign && !divisor_sign) {
+            temporary = (lhs - rhs) & mask33;
+            if ((temporary >> 32) == 0) {
+                vm->ahr = (uint32_t)temporary;
+                vm->alr |= 1u;
+            }
+        } else if (dividend_sign && !divisor_sign) {
+            temporary = (lhs + rhs) & mask33;
+            if ((temporary >> 32) != 0) {
+                vm->ahr = (uint32_t)temporary;
+                vm->alr |= 1u;
+            }
+        } else if (!dividend_sign && divisor_sign) {
+            temporary = (lhs + rhs) & mask33;
+            if ((temporary >> 32) == 0) {
+                vm->ahr = (uint32_t)temporary;
+                vm->alr |= 1u;
+            }
+        } else {
+            temporary = (lhs - rhs) & mask33;
+            if ((temporary >> 32) != 0) {
+                vm->ahr = (uint32_t)temporary;
+                vm->alr |= 1u;
+            }
+        }
+        break;
+    case 3: /* div2s */
+        if (vm->psr & C33_PSR_DS) {
+            temporary32 = (vm->psr & C33_PSR_N)
+                ? vm->ahr - divisor : vm->ahr + divisor;
+            if (temporary32 == 0) {
+                vm->ahr = 0;
+                vm->alr++;
+            }
+        }
+        break;
+    case 4: /* div3s */
+        if (!!(vm->psr & C33_PSR_DS) != !!(vm->psr & C33_PSR_N)) {
+            vm->alr = 0u - vm->alr;
+        }
+        break;
+    }
+}
+
 static int branch_condition(c33_vm_t *vm, unsigned op)
 {
     unsigned n = !!(vm->psr & C33_PSR_N);
@@ -689,6 +779,38 @@ stack_fault:
         }
         vm->regs[rd] = value;
         set_nz(vm, value);
+        clear_ext(vm);
+        return C33_VM_OK;
+    }
+
+    if (word >= 0x8a00 && word <= 0x8eff &&
+        ((word >> 8) & 3u) == 2u &&
+        ((word >> 10) & 7u) >= 2u &&
+        ((word >> 10) & 7u) <= 3u) {
+        uint32_t value;
+        unsigned count;
+        op1 = (word >> 10) & 7u;
+        rs = (word >> 4) & 0xfu;
+        rd = word & 0xfu;
+        value = vm->regs[rs] >> 24;
+        if (op1 == 2u) value ^= 0xffu;
+        count = count_leading_zeros32(value) - 24u;
+        vm->regs[rd] = count;
+        vm->psr &= ~(C33_PSR_N | C33_PSR_Z | C33_PSR_V | C33_PSR_C);
+        if (count == 0) vm->psr |= C33_PSR_Z;
+        if (count == 8) vm->psr |= C33_PSR_C;
+        clear_ext(vm);
+        return C33_VM_OK;
+    }
+
+    if (word >= 0x8b00 && word <= 0x9bf0 &&
+        ((word >> 8) & 3u) == 3u &&
+        ((word >> 10) & 7u) >= 2u &&
+        ((word >> 10) & 7u) <= 6u &&
+        (word & 0xfu) == 0u) {
+        op1 = (word >> 10) & 7u;
+        rs = (word >> 4) & 0xfu;
+        execute_div_step(vm, op1 - 2u, vm->regs[rs]);
         clear_ext(vm);
         return C33_VM_OK;
     }

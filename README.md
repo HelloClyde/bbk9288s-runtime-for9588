@@ -63,20 +63,56 @@ build/                 generated artifacts (ignored)
 
 ## Current status
 
-The standalone project currently has:
+The original 9288S 海盗船 executable now runs interactively in the QEMU-based
+9588 emulator:
 
-- a validated D300 parser and inspection tool;
-- a portable S1C33 interpreter covering the application's startup path;
-- the real S1C33 GNU ABI (`R6`-`R9` arguments, `R4` return value);
-- generated 9288S relocation tables and an SDK slot-listing tool;
-- synchronous guest window-procedure callbacks;
-- a headless API probe that executes 海盗船 through `MSG_CREATE` and one
-  `MSG_TIMER`, then exits the message loop cleanly;
-- a buildable 9588 diagnostic BDA.
+- the portable S1C33 interpreter executes the unmodified D300 program image;
+- the 9288S relocation-table calls are handled by the compatibility runtime;
+- the title artwork and two-board game view render to the 9588 RGB565 scanout;
+- confirm enters the game and the four direction keys change game state;
+- the timer and persistent 9288S message loop run inside the native 9588 BDA;
+- emulator key events are consumed directly, without re-entering the 9588
+  firmware GUI event dispatcher.
 
-The game is not playable on 9588 yet. The remaining work is the persistent
-message/timer loop, RGB565 presentation, key translation, drawing helpers,
-save-file path translation, and any instructions reached by those paths.
+The current port deliberately targets the project's QEMU 9588 emulator. It
+uses its diagnostic input queue and direct LCD scanout; physical 9588 hardware
+would need a different host adapter. Sound and persistent `.sav` files are
+not implemented yet, but they are not required to play a session.
+
+## Build, install, and play
+
+Prerequisites:
+
+- the 9588 emulator frontend running at `http://127.0.0.1:8013`;
+- the 9588 SDK/reference checkout at `E:\eebbk9588`;
+- an authorized copy of the original 海盗船 D300 executable.
+
+Run the complete workflow:
+
+```powershell
+cd E:\bbk9288s-compat9588
+.\scripts\install-and-play.ps1 -GamePath "D:\path\to\海盗船.exe"
+```
+
+If the executable is at `game\pirate.exe` or at the locally discovered
+original path, `-GamePath` can be omitted. The script builds the BDA, backs up
+the original `宠物单词.bda`, installs the compatibility runtime under that
+fixed launcher name, resets the emulator, selects 背单词/E-pets, and opens
+海盗船.
+
+Controls in the 9588 web frontend:
+
+| Game input | Keyboard | Frontend button |
+| --- | --- | --- |
+| Move | `W` `A` `S` `D` | direction pad |
+| Confirm | `J` | 确定 |
+| Exit/back | `K` | 退出 |
+
+Restore the overwritten launcher BDA:
+
+```powershell
+.\scripts\restore-original-bda.ps1
+```
 
 Inspect a local application:
 
