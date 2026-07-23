@@ -242,8 +242,10 @@ static int draw_packed_2bpp(
 )
 {
     c33_vm_t *vm = state->vm;
+    u8 image_header[COMPAT_GUI_IMAGE_HEADER_SIZE];
     u32 pixel_count;
     u32 source_bytes;
+    u32 source_address = guest_buffer;
     u32 index;
     u8 packed;
     u32 loaded_byte = 0xffffffffu;
@@ -255,14 +257,28 @@ static int draw_packed_2bpp(
     }
     pixel_count = width * height;
     source_bytes = (pixel_count + 3u) / 4u;
+    /*
+     * PutImageArea receives the SDK image object, not a pointer to its first
+     * pixel.  The common 16-byte header stores width/height at offsets 8/10
+     * and the packed payload length at offset 12.  Treating that header as
+     * pixels shifts every following scanline and makes one board look like
+     * two broken half-width boards.
+     */
+    if (c33_vm_read(
+            vm, guest_buffer, image_header, sizeof(image_header)
+        )) {
+        source_address += compat_gui_image_payload_offset(
+            image_header, width, height, source_bytes
+        );
+    }
     for (index = 0; index < pixel_count; ++index) {
         u32 byte_index = index / 4u;
         u32 px = index % width;
         u32 py = index / width;
         if (byte_index != loaded_byte) {
             if (byte_index >= source_bytes ||
-                !c33_vm_read(vm, guest_buffer + byte_index, &packed, 1u)) {
-                vm->fault_address = guest_buffer + byte_index;
+                !c33_vm_read(vm, source_address + byte_index, &packed, 1u)) {
+                vm->fault_address = source_address + byte_index;
                 return 0;
             }
             loaded_byte = byte_index;

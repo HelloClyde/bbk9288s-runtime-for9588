@@ -83,3 +83,9 @@ Because starting a BDA occurs inside the firmware's own event dispatch stack,
 calling the native GUI poller recursively is unsafe. This port reads the
 emulator's uncached diagnostic event mirror at `0xA9F00040` and writes its
 160×240 output directly into the rotated 240×320 scanout at `0xA1F82000`.
+
+`PutImageArea` receives a 16-byte SDK image object header followed by its
+packed 2bpp payload. For the full-screen image the header records width 160,
+height 240, and payload length 9,600. Skipping this header is required before
+decoding pixels; treating it as image data shifts every scanline and visibly
+breaks the board at the middle.

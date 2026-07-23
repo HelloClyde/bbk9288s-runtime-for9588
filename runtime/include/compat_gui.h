@@ -84,5 +84,29 @@ enum compat_gui_scancode {
 };
 
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
+#define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
+
+static inline unsigned compat_gui_image_payload_offset(
+    const unsigned char *header,
+    unsigned width,
+    unsigned height,
+    unsigned minimum_payload_size
+)
+{
+    unsigned header_width =
+        (unsigned)header[8] | ((unsigned)header[9] << 8);
+    unsigned header_height =
+        (unsigned)header[10] | ((unsigned)header[11] << 8);
+    unsigned payload_size =
+        (unsigned)header[12] |
+        ((unsigned)header[13] << 8) |
+        ((unsigned)header[14] << 16) |
+        ((unsigned)header[15] << 24);
+
+    return header_width == width &&
+           header_height == height &&
+           payload_size >= minimum_payload_size
+        ? COMPAT_GUI_IMAGE_HEADER_SIZE : 0u;
+}
 
 #endif

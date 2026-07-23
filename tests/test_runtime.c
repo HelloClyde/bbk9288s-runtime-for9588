@@ -3,6 +3,7 @@
 
 #include "c33vm.h"
 #include "compat_api.h"
+#include "compat_gui.h"
 #include "d300.h"
 
 static void put_u32(unsigned char *p, unsigned value)
@@ -173,6 +174,26 @@ static int test_api_tables(void)
     return vm.regs[4] == 0x02006100 ? 0 : 6;
 }
 
+static int test_gui_image_header(void)
+{
+    unsigned char header[COMPAT_GUI_IMAGE_HEADER_SIZE] = {
+        0x10, 0x00, 0x10, 0x00,
+        0x00, 0x02, 0x00, 0x00,
+        0xa0, 0x00, 0xf0, 0x00,
+        0x80, 0x25, 0x00, 0x00
+    };
+
+    if (compat_gui_image_payload_offset(
+            header, 160, 240, 9600
+        ) != COMPAT_GUI_IMAGE_HEADER_SIZE) {
+        return 1;
+    }
+    if (compat_gui_image_payload_offset(header, 80, 240, 4800) != 0u) {
+        return 2;
+    }
+    return 0;
+}
+
 int main(void)
 {
     int rc;
@@ -199,6 +220,11 @@ int main(void)
     rc = test_api_tables();
     if (rc) {
         fprintf(stderr, "test_api_tables failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_gui_image_header();
+    if (rc) {
+        fprintf(stderr, "test_gui_image_header failed: %d\n", rc);
         return 1;
     }
     puts("host runtime tests: ok");

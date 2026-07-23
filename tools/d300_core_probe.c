@@ -50,6 +50,9 @@ static void inspect_put_image(c33_vm_t *vm)
     unsigned maximum = 0;
     size_t index;
 
+    unsigned char header[COMPAT_GUI_IMAGE_HEADER_SIZE];
+    uint32_t pixel_address;
+
     if (!read_guest_u32(vm, vm->sp + 4u, &height) ||
         !read_guest_u32(vm, vm->sp + 8u, &buffer_address) ||
         width != 160u || height != 240u) {
@@ -59,8 +62,14 @@ static void inspect_put_image(c33_vm_t *vm)
     raw_size = (pixel_count + 3u) / 4u;
     packed = (unsigned char *)malloc(raw_size);
     pixels = (unsigned char *)malloc(pixel_count);
+    pixel_address = buffer_address;
+    if (c33_vm_read(vm, buffer_address, header, sizeof(header))) {
+        pixel_address += compat_gui_image_payload_offset(
+            header, width, height, (unsigned)raw_size
+        );
+    }
     if (!packed || !pixels ||
-        !c33_vm_read(vm, buffer_address, packed, (uint32_t)raw_size)) {
+        !c33_vm_read(vm, pixel_address, packed, (uint32_t)raw_size)) {
         free(packed);
         free(pixels);
         return;
