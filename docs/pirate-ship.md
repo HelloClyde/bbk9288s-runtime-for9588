@@ -44,6 +44,8 @@ not game content. The title/board artwork is embedded in the program image.
   `MSG_MOUSEMOVE`, and `MSG_LBUTTONUP` messages.
 - Native 9588 message boxes for the original help text and exit confirmation.
 - Clean 9288S main-window destruction and quit-message handling.
+- Wall-clock-paced guest timers using MiniGUI's 10 ms tick unit and the 9588
+  SYS delay service.
 
 Save-file translation and audio remain future extensions. They are optional for
 an interactive game session.
@@ -112,3 +114,17 @@ Touch does not appear in the regular QEMU key queue. The LAN launcher enables
 the `touch-trace=on` machine option, and the BDA polls the uncached touch mirror
 at `0xA9F00100`. Raw SADC coordinates are converted to the centered 160×240
 guest surface before pointer messages are queued.
+
+The original help action calls GUI slot 448, `Help2(hWnd, helpString)`.
+The adapter reads the zero-terminated GBK help text from guest memory and
+passes the same bytes to the native 9588
+`bda_msgbox_ex(parent, title, message, flags)` service. Because both calls are
+modal, the guest window procedure simply resumes when the 9588 message box is
+closed; no separate 9288S help window needs to be emulated.
+
+The guest `GetMessage` call yields when no message is available. Each empty
+poll now waits 10,000 microseconds through the 9588 SYS delay service before
+advancing the emulated timer by one 10 ms tick. MiniGUI's legacy `SetTimer`
+argument is a tick count, not a millisecond count, so the original
+`SetTimer(hwnd, 1, 20)` fires every 200 ms (approximately 5 Hz) instead of
+being tied to QEMU CPU execution speed.

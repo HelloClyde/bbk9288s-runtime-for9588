@@ -95,6 +95,12 @@ enum compat_gui_scancode {
 
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
 #define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
+#define COMPAT_GUI_TIMER_TICK_MS 10u
+
+static inline unsigned compat_gui_timer_interval_ms(unsigned speed)
+{
+    return (speed ? speed : 1u) * COMPAT_GUI_TIMER_TICK_MS;
+}
 
 static inline unsigned compat_gui_packed_2bpp_stride(unsigned width)
 {

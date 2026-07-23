@@ -198,6 +198,10 @@ static int test_gui_image_header(void)
         compat_gui_packed_2bpp_shift(4) != 6u) {
         return 3;
     }
+    if (compat_gui_timer_interval_ms(20) != 200u ||
+        compat_gui_timer_interval_ms(0) != 10u) {
+        return 4;
+    }
     return 0;
 }
 

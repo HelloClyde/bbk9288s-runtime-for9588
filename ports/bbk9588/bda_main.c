@@ -37,6 +37,8 @@
 #define VM_SLICE         100000u
 #define CALLBACK_BUDGET  1000000u
 #define EVENT_QUEUE_SIZE 16u
+#define HOST_POLL_MS     10u
+#define HOST_POLL_US     (HOST_POLL_MS * 1000u)
 
 typedef struct guest_message {
     u32 hwnd;
@@ -258,14 +260,6 @@ static void present_framebuffer(compat_9588_state_t *state)
             }
             output[output_y * PHYSICAL_SCREEN_W + output_x] = color;
         }
-    }
-}
-
-static void idle_spin(void)
-{
-    volatile u32 count = 20000u;
-    while (count--) {
-        __asm__ volatile ("" : : : "memory");
     }
 }
 
@@ -852,7 +846,12 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_SET_TIMER:
         state->timer_hwnd = vm->regs[6];
         state->timer_id = vm->regs[7];
-        state->timer_interval = vm->regs[8] ? vm->regs[8] : 20u;
+        /*
+         * MiniGUI's legacy SetTimer "speed" is counted in 10 ms system
+         * ticks, not milliseconds.  海盗船 passes 20, which is 200 ms.
+         */
+        state->timer_interval =
+            compat_gui_timer_interval_ms(vm->regs[8]);
         state->timer_elapsed = 0u;
         vm->regs[4] = 1u;
         return C33_VM_OK;
@@ -1295,9 +1294,16 @@ int bda_main(void)
             break;
         }
 
+        /*
+         * GetMessage yields while the guest queue is empty.  A CPU spin is
+         * not a clock: under QEMU it completes far faster than 10 ms and
+         * makes a 9288S timer run at an arbitrary accelerated rate.
+         * The 9588 SYS delay uses microseconds, so advance the guest timer
+         * only after one real host polling quantum has elapsed.
+         */
+        bda_sys_delay_like(HOST_POLL_US);
         service_hardware_input(state);
-        service_timer(state, 10u);
-        idle_spin();
+        service_timer(state, HOST_POLL_MS);
         present_framebuffer(state);
     }
 
