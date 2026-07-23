@@ -1,0 +1,12 @@
+/build/
+/local/
+*.exe
+*.bda
+*.bin
+*.sav
+*.map
+*.o
+*.obj
+*.elf
+__pycache__/
+*.pyc
