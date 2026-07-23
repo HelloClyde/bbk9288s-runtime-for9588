@@ -114,6 +114,21 @@ Restore the overwritten launcher BDA:
 .\scripts\restore-original-bda.ps1
 ```
 
+Expose the currently packaged 9588 emulator to the private LAN:
+
+```powershell
+.\scripts\start-9588-lan.ps1
+```
+
+The frontend then listens on TCP 8013 on all IPv4 interfaces. Run the firewall
+helper once from an elevated PowerShell prompt; its inbound rule is limited to
+the Private profile, the local subnet, TCP 8013, and the emulator's bundled
+Python executable:
+
+```powershell
+.\scripts\enable-9588-lan-firewall.ps1
+```
+
 Inspect a local application:
 
 ```powershell
