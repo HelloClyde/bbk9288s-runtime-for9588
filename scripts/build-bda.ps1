@@ -5,8 +5,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$SdkRoot = "E:\eebbk9588"
-$Builder = Join-Path $SdkRoot "reverse\bda_compile_c.py"
+$SdkRoot = "C:\Users\ASUS\Documents\eebbk9588_native_sdk"
+$SdkHeader = Join-Path $SdkRoot "sdk\include\bda_dialogs.h"
 $Source = Join-Path $ProjectRoot "ports\bbk9588\bda_main.c"
 $OutputDir = Join-Path $ProjectRoot "build\bbk9588"
 $Output = Join-Path $OutputDir "9288SCompat.bda"
@@ -14,7 +14,7 @@ $GeneratedGame = Join-Path $OutputDir "generated_game.inc"
 $ProjectGame = Join-Path $ProjectRoot "game\pirate.exe"
 $OriginalGame = "D:\Downloads\步步高9288s系统文件\系统\程序\海盗船.exe"
 
-if (-not (Test-Path -LiteralPath $Builder)) {
+if (-not (Test-Path -LiteralPath $SdkHeader)) {
   throw "9588 BDA SDK not found at $SdkRoot"
 }
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -53,9 +53,8 @@ for ($Index = 0; $Index -lt $GameBytes.Length; $Index++) {
   [System.Text.Encoding]::ASCII
 )
 
-python $Builder `
+python -m bda_packer `
   $Source `
-  --no-template `
   --title "9288SCompat" `
   --category 9 `
   -o $Output

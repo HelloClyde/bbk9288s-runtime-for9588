@@ -12,7 +12,8 @@ The current QEMU-specific host adapter provides:
 - a persistent 9288S GUI message loop and timer;
 - direction/confirm/exit key translation;
 - touch down, move, and up translation through QEMU's touch-state mirror;
-- help, confirmation, window-destruction, and clean-exit handling.
+- the public SDK's firmware Help Page, confirmation, window-destruction, and
+  clean-exit handling.
 
 Build from the project root:
 
@@ -26,6 +27,7 @@ Start the LAN/touch-enabled 9588 frontend with:
 powershell -ExecutionPolicy Bypass -File .\scripts\start-9588-lan.ps1
 ```
 
-The existing `E:\eebbk9588` SDK is used only as a build dependency. The
-current direct scanout and diagnostic input mirrors are emulator interfaces;
-physical 9588 hardware would require a separate host adapter.
+The public SDK at `C:\Users\ASUS\Documents\eebbk9588_native_sdk` is used only
+as a build dependency. The current direct scanout and diagnostic input mirrors
+are emulator interfaces; physical 9588 hardware would require a separate host
+adapter.

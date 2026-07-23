@@ -42,7 +42,8 @@ not game content. The title/board artwork is embedded in the program image.
 - Direct QEMU 9588 key-event translation for direction, confirm, and exit.
 - Direct QEMU touch-state translation to 9288S `MSG_LBUTTONDOWN`,
   `MSG_MOUSEMOVE`, and `MSG_LBUTTONUP` messages.
-- Native 9588 message boxes for the original help text and exit confirmation.
+- Native 9588 Help Page for the original help text, plus a native message box
+  for exit confirmation.
 - Clean 9288S main-window destruction and quit-message handling.
 - Wall-clock-paced guest timers using MiniGUI's 10 ms tick unit and the 9588
   SYS delay service.
@@ -117,10 +118,12 @@ guest surface before pointer messages are queued.
 
 The original help action calls GUI slot 448, `Help2(hWnd, helpString)`.
 The adapter reads the zero-terminated GBK help text from guest memory and
-passes the same bytes to the native 9588
-`bda_msgbox_ex(parent, title, message, flags)` service. Because both calls are
-modal, the guest window procedure simply resumes when the 9588 message box is
-closed; no separate 9288S help window needs to be emulated.
+passes it to the public 9588 SDK call
+`bda_help_page(parent, title, body)`. This invokes firmware GUI slot `+0x5A8`,
+which owns the title bar, scrollable body, scrollbar, bottom return bar, and
+its modal message loop. The compatibility BDA has no native parent Frame, so
+it uses the SDK-verified `parent=0` form and restores the guest framebuffer
+after the Help Page closes.
 
 The guest `GetMessage` call yields when no message is available. Each empty
 poll now waits 10,000 microseconds through the 9588 SYS delay service before

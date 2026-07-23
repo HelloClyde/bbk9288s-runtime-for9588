@@ -6,7 +6,8 @@ applications inside a native BBK 9588 `BDA`.
 It is intentionally separate from:
 
 - `E:\eebbk9288s-qemu`, the full-system 9288S emulator.
-- `E:\eebbk9588`, the 9588 native BDA SDK and hardware emulator.
+- `E:\eebbk9588`, the 9588 hardware-emulator source/reference project.
+- `C:\Users\ASUS\Documents\eebbk9588_native_sdk`, the public native BDA SDK.
 
 Those projects are read-only references/build dependencies. No firmware or
 original application is stored here.
@@ -87,7 +88,8 @@ not implemented yet, but they are not required to play a session.
 Prerequisites:
 
 - the 9588 emulator frontend running at `http://127.0.0.1:8013`;
-- the 9588 SDK/reference checkout at `E:\eebbk9588`;
+- the 9588 native SDK at
+  `C:\Users\ASUS\Documents\eebbk9588_native_sdk`;
 - an authorized copy of the original 海盗船 D300 executable.
 
 Run the complete workflow:
@@ -112,8 +114,8 @@ Controls in the 9588 web frontend:
 | Exit/back | `K` | 退出 |
 
 The 9588 web display is also touch-enabled. On the game screen, tap
-`帮助说明` to open the original help text or `退出游戏` to open its
-yes/no confirmation.
+`帮助说明` to open the firmware Help Page (including its scroll bar and return
+controls), or `退出游戏` to open its yes/no confirmation.
 
 Restore the overwritten launcher BDA:
 

@@ -1,4 +1,4 @@
-#include "../../../eebbk9588/reverse/sdk/bda_sdk.h"
+#include "bda_sdk.h"
 
 #include "../../runtime/include/c33vm.h"
 #include "../../runtime/include/compat_api.h"
@@ -39,6 +39,10 @@
 #define EVENT_QUEUE_SIZE 16u
 #define HOST_POLL_MS     10u
 #define HOST_POLL_US     (HOST_POLL_MS * 1000u)
+
+/* "海盗船" in the GBK encoding consumed by the 9588 firmware UI. */
+static const char k_native_help_title[] =
+    "\xba\xa3\xb5\xc1\xb4\xac";
 
 typedef struct guest_message {
     u32 hwnd;
@@ -194,6 +198,40 @@ static int guest_read_c_string(
     }
     buffer[capacity - 1u] = 0;
     return 1;
+}
+
+static char *guest_copy_c_string(
+    c33_vm_t *vm,
+    u32 address,
+    u32 maximum_size
+)
+{
+    u32 length;
+    char *copy;
+    if (!address || maximum_size < 2u) {
+        return 0;
+    }
+    for (length = 0u; length + 1u < maximum_size; ++length) {
+        u8 ch;
+        if (!c33_vm_read(vm, address + length, &ch, 1u)) {
+            vm->fault_address = address + length;
+            return 0;
+        }
+        if (!ch) {
+            copy = (char *)bda_alloc(length + 1u);
+            if (allocation_failed(copy)) {
+                return 0;
+            }
+            if (!c33_vm_read(vm, address, copy, length + 1u)) {
+                bda_free(copy);
+                vm->fault_address = address;
+                return 0;
+            }
+            return copy;
+        }
+    }
+    vm->fault_address = address + maximum_size - 1u;
+    return 0;
 }
 
 static u16 logical_color_to_rgb565(u32 color)
@@ -1132,14 +1170,20 @@ static c33_vm_status_t dispatch_9588(
         return C33_VM_OK;
     case COMPAT_GUI_HELP2:
         {
-            char help[256];
-            if (!guest_read_c_string(
-                    vm, vm->regs[7], help, sizeof(help)
-                )) {
-                vm->fault_address = vm->regs[7];
+            char *help = guest_copy_c_string(vm, vm->regs[7], 4096u);
+            if (!help) {
                 return C33_VM_FAULT;
             }
-            vm->regs[4] = (u32)bda_msgbox_ex(0, "Help", help, 0u);
+            vm->regs[4] = (u32)bda_help_page(
+                0, k_native_help_title, help
+            );
+            bda_free(help);
+            /*
+             * parent=0 is the SDK-supported form for a BDA without a native
+             * Frame. The modal firmware page owns the display until it
+             * returns, so restore the compatibility surface afterwards.
+             */
+            present_framebuffer(state);
             return C33_VM_OK;
         }
     default:
@@ -1301,7 +1345,7 @@ int bda_main(void)
          * The 9588 SYS delay uses microseconds, so advance the guest timer
          * only after one real host polling quantum has elapsed.
          */
-        bda_sys_delay_like(HOST_POLL_US);
+        bda_sys_delay(HOST_POLL_US);
         service_hardware_input(state);
         service_timer(state, HOST_POLL_MS);
         present_framebuffer(state);
