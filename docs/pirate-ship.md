@@ -85,13 +85,14 @@ VM completion.
 
 ## 9588 emulator verification
 
-The native BDA opens the firmware EXE selector at startup and reads the selected
-D300 bytes from NAND. It maps the program at its original `0x02700000` address
-and executes it unchanged; no original game bytes are packaged in the BDA.
+The native BDA scans the private 9288S program directory, draws a launcher from
+each D300 file's embedded title and icon, and reads the selected D300 bytes
+from NAND. It maps the program at its original `0x02700000` address and
+executes it unchanged; no original game bytes are packaged in the BDA.
 
 Verified in the 9588 emulator:
 
-1. Launching the BDA opens the native 9588 `.exe` selector.
+1. Launching the BDA shows its own title/icon program list.
 2. Selecting 海盗船 loads it from NAND and reaches the original title image.
 3. The bottom touch `A` button enters the game board.
 4. Repeated direction input changes game state without scanline corruption or
@@ -103,7 +104,7 @@ Verified in the 9588 emulator:
    support touch selection and confirmation, and restore the board cleanly.
 8. All five 182-byte save files remain available after BDA rebuilds and
    emulator resets.
-9. `EXE` reopens the firmware selector, while `SET` swaps the virtual controls
+9. `EXE` returns to the program list, while `SET` swaps the virtual controls
    between left- and right-handed layouts.
 10. The VM remains in the guest `GetMessage` loop between inputs, with timer
    messages serviced by the host adapter.

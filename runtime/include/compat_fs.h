@@ -16,6 +16,12 @@
     COMPAT_FS_NATIVE_DATA_ROOT "\\9288s"
 #define COMPAT_FS_NATIVE_ROOT_DIRECTORY \
     COMPAT_FS_NATIVE_ROOT "\\"
+#define COMPAT_FS_NATIVE_SYSTEM_ROOT \
+    COMPAT_FS_NATIVE_ROOT "\\\xcf\xb5\xcd\xb3"
+#define COMPAT_FS_NATIVE_PROGRAMS_ROOT \
+    COMPAT_FS_NATIVE_SYSTEM_ROOT "\\\xb3\xcc\xd0\xf2"
+#define COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY \
+    COMPAT_FS_NATIVE_PROGRAMS_ROOT "\\"
 
 /*
  * The 9288S and 9588 firmware file tables use the same stdio-like ordering

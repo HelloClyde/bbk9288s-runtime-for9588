@@ -1,8 +1,10 @@
 # BBK 9588 port
 
-The adapter is a native BDA that opens the public SDK's firmware file selector
-at startup. It reads the selected D300 EXE from the 9588 NAND, allocates the
-guest address space, loads the original program at `0x02700000`, installs
+The adapter is a native BDA that scans
+`A:\应用\数据\9288s\系统\程序`, validates each D300 EXE, reads its
+embedded title and two-state 32x32 icon, and draws its own touchable program
+list. It then reads the selected EXE from the 9588 NAND, allocates the guest
+address space, loads the original program at `0x02700000`, installs
 relocation-table traps, and runs the portable C33 interpreter. No game bytes
 are embedded in the BDA.
 

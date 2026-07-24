@@ -53,6 +53,16 @@
 #define HZK_GLYPH_SIZE     24u
 #define HZK_BASE_OFFSET    0x001a84b0u
 #define SAVED_BOX_SLOTS    8u
+#define PROGRAM_MAX_ENTRIES 32u
+#define PROGRAMS_PER_PAGE   5u
+#define PROGRAM_ROW_TOP     40u
+#define PROGRAM_ROW_HEIGHT  46u
+#define PROGRAM_ICON_HEADER_SIZE 16u
+#define PROGRAM_ICON_WIDTH  32u
+#define PROGRAM_ICON_HEIGHT 32u
+#define PROGRAM_ICON_FRAME_SIZE 256u
+#define PROGRAM_ICON_PAYLOAD_SIZE 512u
+#define PROGRAM_TITLE_CAPACITY 17u
 
 #define VIRTUAL_ACTION_NONE     0u
 #define VIRTUAL_ACTION_UP       1u
@@ -146,6 +156,14 @@ typedef struct compat_9588_runtime {
     compat_api_t api;
     compat_9588_state_t state;
 } compat_9588_runtime_t;
+
+typedef struct program_entry {
+    char path[NATIVE_PATH_CAPACITY];
+    char file_name[NATIVE_PATH_CAPACITY];
+    char title[PROGRAM_TITLE_CAPACITY];
+    u8 icon[PROGRAM_ICON_PAYLOAD_SIZE];
+    int has_icon;
+} program_entry_t;
 
 /*
  * Keep this in the packaged .data section.  The minimal BDA loader copies the
@@ -1121,7 +1139,7 @@ static void render_listbox_selection(compat_9588_state_t *state)
     state->listbox_drawn_caret = state->listbox_caret;
 }
 
-static void present_framebuffer(compat_9588_state_t *state)
+static void present_raw_framebuffer(compat_9588_state_t *state)
 {
     volatile u16 *output = (volatile u16 *)QEMU_FRAMEBUFFER;
     u32 x;
@@ -1129,8 +1147,6 @@ static void present_framebuffer(compat_9588_state_t *state)
     if (!state->framebuffer) {
         return;
     }
-    render_listbox_selection(state);
-    draw_virtual_controls(state);
     for (y = 0; y < PHYSICAL_SCREEN_H; ++y) {
         for (x = 0; x < PHYSICAL_SCREEN_W; ++x) {
             u32 output_x = PHYSICAL_SCREEN_W - 1u - x;
@@ -1139,6 +1155,16 @@ static void present_framebuffer(compat_9588_state_t *state)
                 state->framebuffer[y * SCREEN_W + x];
         }
     }
+}
+
+static void present_framebuffer(compat_9588_state_t *state)
+{
+    if (!state->framebuffer) {
+        return;
+    }
+    render_listbox_selection(state);
+    draw_virtual_controls(state);
+    present_raw_framebuffer(state);
 }
 
 static int draw_packed_2bpp(
@@ -3598,6 +3624,651 @@ static void service_timer(compat_9588_state_t *state, u32 elapsed)
     }
 }
 
+static u32 program_read_u32le(const u8 *bytes)
+{
+    return (u32)bytes[0] |
+           ((u32)bytes[1] << 8) |
+           ((u32)bytes[2] << 16) |
+           ((u32)bytes[3] << 24);
+}
+
+static u32 program_byte_string_length(const char *text, u32 capacity)
+{
+    u32 length = 0u;
+    if (!text) {
+        return 0u;
+    }
+    while (length < capacity && text[length]) {
+        ++length;
+    }
+    return length;
+}
+
+static int program_has_exe_suffix(const char *name)
+{
+    u32 length = program_byte_string_length(name, NATIVE_PATH_CAPACITY);
+    char e;
+    char x;
+    char last;
+    if (length < 4u || length >= NATIVE_PATH_CAPACITY) {
+        return 0;
+    }
+    e = name[length - 3u];
+    x = name[length - 2u];
+    last = name[length - 1u];
+    if (e >= 'A' && e <= 'Z') e = (char)(e + ('a' - 'A'));
+    if (x >= 'A' && x <= 'Z') x = (char)(x + ('a' - 'A'));
+    if (last >= 'A' && last <= 'Z') {
+        last = (char)(last + ('a' - 'A'));
+    }
+    return name[length - 4u] == '.' &&
+           e == 'e' && x == 'x' && last == 'e';
+}
+
+static void program_copy_basename(
+    char destination[NATIVE_PATH_CAPACITY],
+    const char *source
+)
+{
+    u32 length = program_byte_string_length(source, 0x20au);
+    u32 start = 0u;
+    u32 index;
+    for (index = 0u; index < length; ++index) {
+        if (source[index] == '\\' || source[index] == '/') {
+            start = index + 1u;
+        }
+    }
+    index = 0u;
+    while (start + index < length &&
+           index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index] = source[start + index];
+        ++index;
+    }
+    destination[index] = 0;
+}
+
+static int program_build_native_path(
+    char destination[NATIVE_PATH_CAPACITY],
+    const char *file_name
+)
+{
+    const char *root = COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY;
+    u32 root_index = 0u;
+    u32 index = 0u;
+    u32 name_index = 0u;
+    while (root[root_index] && index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index++] = root[root_index++];
+    }
+    while (file_name[name_index] &&
+           index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index++] = file_name[name_index++];
+    }
+    destination[index] = 0;
+    return !root[root_index] && !file_name[name_index];
+}
+
+static void program_title_from_filename(
+    char title[PROGRAM_TITLE_CAPACITY],
+    const char *file_name
+)
+{
+    u32 source_length =
+        program_byte_string_length(file_name, NATIVE_PATH_CAPACITY);
+    u32 limit = source_length;
+    u32 source = 0u;
+    u32 output = 0u;
+    if (source_length >= 4u &&
+        program_has_exe_suffix(file_name)) {
+        limit -= 4u;
+    }
+    while (source < limit && output + 1u < PROGRAM_TITLE_CAPACITY) {
+        u8 ch = (u8)file_name[source];
+        if (ch >= 0x80u) {
+            if (source + 1u >= limit ||
+                output + 2u >= PROGRAM_TITLE_CAPACITY) {
+                break;
+            }
+            title[output++] = file_name[source++];
+            title[output++] = file_name[source++];
+        } else {
+            title[output++] = file_name[source++];
+        }
+    }
+    while (output && title[output - 1u] == ' ') {
+        --output;
+    }
+    title[output] = 0;
+}
+
+static void program_title_from_header(
+    char title[PROGRAM_TITLE_CAPACITY],
+    const u8 header[D300_MIN_HEADER_SIZE],
+    const char *file_name
+)
+{
+    u32 source = 0u;
+    u32 output = 0u;
+    while (source < 16u && header[0xb0u + source] &&
+           output + 1u < PROGRAM_TITLE_CAPACITY) {
+        u8 ch = header[0xb0u + source];
+        if (ch >= 0x80u) {
+            if (source + 1u >= 16u ||
+                !header[0xb0u + source + 1u] ||
+                output + 2u >= PROGRAM_TITLE_CAPACITY) {
+                break;
+            }
+            title[output++] = (char)ch;
+            title[output++] = (char)header[0xb0u + source + 1u];
+            source += 2u;
+        } else {
+            title[output++] = (char)ch;
+            ++source;
+        }
+    }
+    while (output && title[output - 1u] == ' ') {
+        --output;
+    }
+    title[output] = 0;
+    if (!output) {
+        program_title_from_filename(title, file_name);
+    }
+}
+
+static int read_program_metadata(program_entry_t *entry)
+{
+    int file;
+    int file_size;
+    int count;
+    u8 header[D300_MIN_HEADER_SIZE];
+    u8 icon_block[
+        PROGRAM_ICON_HEADER_SIZE + PROGRAM_ICON_PAYLOAD_SIZE
+    ];
+    d300_image_t image;
+    d300_status_t status;
+
+    file = bda_fs_fopen_raw(entry->path, "rb");
+    if (!bda_fs_file_is_valid(file)) {
+        return 0;
+    }
+    file_size = bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    if (file_size < (int)D300_MIN_HEADER_SIZE ||
+        (u32)file_size > MAX_D300_FILE_SIZE ||
+        bda_fs_seek_raw(file, 0, BDA_SEEK_SET) != 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    count = bda_fs_fread_raw(
+        header, 1u, D300_MIN_HEADER_SIZE, file
+    );
+    if (count != (int)D300_MIN_HEADER_SIZE) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    status = d300_parse(&image, header, (u32)file_size);
+    if (status != D300_OK) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    program_title_from_header(entry->title, header, entry->file_name);
+    entry->has_icon = 0;
+    if (image.icon_size >= sizeof(icon_block) &&
+        image.icon_offset <= (u32)file_size &&
+        sizeof(icon_block) <= (u32)file_size - image.icon_offset &&
+        bda_fs_seek_raw(
+            file, (s32)image.icon_offset, BDA_SEEK_SET
+        ) == (int)image.icon_offset) {
+        count = bda_fs_fread_raw(
+            icon_block, 1u, sizeof(icon_block), file
+        );
+        if (count == (int)sizeof(icon_block)) {
+            u32 icon_width =
+                (u32)icon_block[8] |
+                ((u32)icon_block[9] << 8);
+            u32 icon_height =
+                (u32)icon_block[10] |
+                ((u32)icon_block[11] << 8);
+            u32 payload_size = program_read_u32le(icon_block + 12u);
+            if (icon_width == PROGRAM_ICON_WIDTH &&
+                icon_height == PROGRAM_ICON_HEIGHT * 2u &&
+                payload_size >= PROGRAM_ICON_PAYLOAD_SIZE) {
+                bda_memcpy(
+                    entry->icon,
+                    icon_block + PROGRAM_ICON_HEADER_SIZE,
+                    PROGRAM_ICON_PAYLOAD_SIZE
+                );
+                entry->has_icon = 1;
+            }
+        }
+    }
+    (void)bda_fs_close_raw(file);
+    return 1;
+}
+
+static u32 load_program_entries(
+    program_entry_t *entries,
+    u32 capacity
+)
+{
+    bda_fs_find_data_t find_data;
+    int result;
+    int find_open;
+    u32 count = 0u;
+    bda_fs_find_data_init(&find_data);
+    result = bda_fs_findfirst(
+        COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY "*.*",
+        0x27u,
+        &find_data
+    );
+    find_open = result != -1;
+    while (result != -1 && count < capacity) {
+        program_entry_t *entry = &entries[count];
+        bda_memset(entry, 0, sizeof(*entry));
+        program_copy_basename(
+            entry->file_name, find_data.name_or_path
+        );
+        if (!(find_data.attr_or_flags & 0x10u) &&
+            program_has_exe_suffix(entry->file_name) &&
+            program_build_native_path(
+                entry->path, entry->file_name
+            ) &&
+            read_program_metadata(entry)) {
+            ++count;
+        }
+        result = bda_fs_findnext(&find_data);
+    }
+    if (find_open) {
+        (void)bda_fs_findclose(&find_data);
+    }
+    return count;
+}
+
+static s32 draw_panel_gbk_text(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    const char *text,
+    s32 right,
+    u16 color
+)
+{
+    u32 index = 0u;
+    s32 cursor = x;
+    while (text[index] && cursor < right) {
+        u8 ch = (u8)text[index];
+        if (ch >= 0x80u && text[index + 1u]) {
+            u8 glyph[HZK_GLYPH_SIZE];
+            if (cursor + 12 > right) {
+                break;
+            }
+            if (read_hzk_glyph(
+                    state, ch, (u8)text[index + 1u], glyph
+                )) {
+                draw_panel_hz_bitmap(
+                    state, cursor, y, glyph, color
+                );
+            } else {
+                draw_panel_text(state, cursor, y + 2, "?", color);
+            }
+            cursor += 12;
+            index += 2u;
+        } else {
+            char character[2];
+            if (cursor + 6 > right) {
+                break;
+            }
+            character[0] = (char)ch;
+            character[1] = 0;
+            draw_panel_text(state, cursor, y + 2, character, color);
+            cursor += 6;
+            ++index;
+        }
+    }
+    return cursor;
+}
+
+static void draw_program_icon(
+    compat_9588_state_t *state,
+    const program_entry_t *entry,
+    s32 x,
+    s32 y,
+    int selected
+)
+{
+    static const u16 colors[4] = {
+        0x0000u, 0x52aau, 0xad55u, 0xffffu
+    };
+    u32 row;
+    u32 frame_offset =
+        selected ? PROGRAM_ICON_FRAME_SIZE : 0u;
+    if (!entry->has_icon) {
+        fill_panel_rounded_rect(
+            state, x, y, PROGRAM_ICON_WIDTH,
+            PROGRAM_ICON_HEIGHT, 4u, 0x4208u
+        );
+        draw_panel_text(state, x + 7, y + 13, "EXE", 0xffffu);
+        return;
+    }
+    for (row = 0u; row < PROGRAM_ICON_HEIGHT; ++row) {
+        u32 column;
+        for (column = 0u; column < PROGRAM_ICON_WIDTH; ++column) {
+            u32 byte_index =
+                frame_offset + row * (PROGRAM_ICON_WIDTH / 4u) +
+                column / 4u;
+            u8 packed = entry->icon[byte_index];
+            u32 value =
+                (packed >> compat_gui_packed_2bpp_shift(column)) & 3u;
+            put_panel_pixel(
+                state,
+                x + (s32)column,
+                y + (s32)row,
+                colors[value]
+            );
+        }
+    }
+}
+
+static void program_page_text(
+    char text[8],
+    u32 page,
+    u32 page_count
+)
+{
+    u32 output = 0u;
+    if (page >= 9u) {
+        text[output++] = (char)('0' + ((page + 1u) / 10u) % 10u);
+    }
+    text[output++] = (char)('0' + (page + 1u) % 10u);
+    text[output++] = '/';
+    if (page_count >= 10u) {
+        text[output++] = (char)('0' + (page_count / 10u) % 10u);
+    }
+    text[output++] = (char)('0' + page_count % 10u);
+    text[output] = 0;
+}
+
+static void draw_program_browser(
+    compat_9588_state_t *state,
+    const program_entry_t *entries,
+    u32 count,
+    u32 selected
+)
+{
+    u32 page = count ? selected / PROGRAMS_PER_PAGE : 0u;
+    u32 page_count =
+        count ? (count + PROGRAMS_PER_PAGE - 1u) /
+            PROGRAMS_PER_PAGE : 1u;
+    u32 first = page * PROGRAMS_PER_PAGE;
+    u32 row;
+    char page_label[8];
+
+    fill_framebuffer(state, 0xef7du);
+    fill_panel_rect(state, 0, 0, SCREEN_W, 34u, 0x18c3u);
+    draw_panel_gbk_text(
+        state, 10, 10,
+        "9288S \xb3\xcc\xd0\xf2",
+        180, 0xffffu
+    );
+    program_page_text(page_label, page, page_count);
+    draw_panel_text(state, 205, 13, page_label, 0xffffu);
+
+    for (row = 0u; row < PROGRAMS_PER_PAGE; ++row) {
+        u32 index = first + row;
+        s32 y = (s32)(PROGRAM_ROW_TOP + row * PROGRAM_ROW_HEIGHT);
+        int is_selected = count && index == selected;
+        u16 background = is_selected ? 0x2a69u : 0xffffu;
+        u16 title_color = is_selected ? 0xffffu : 0x1082u;
+        fill_panel_rect(
+            state, 6, y, SCREEN_W - 12u,
+            PROGRAM_ROW_HEIGHT - 3u, background
+        );
+        if (index < count) {
+            draw_program_icon(
+                state, &entries[index], 13, y + 5, is_selected
+            );
+            draw_panel_gbk_text(
+                state, 56, y + 15,
+                entries[index].title, 230, title_color
+            );
+        }
+    }
+
+    if (!count) {
+        draw_panel_gbk_text(
+            state, 30, 115,
+            "\xce\xb4\xd5\xd2\xb5\xbd 9288S \xb3\xcc\xd0\xf2",
+            220, 0x4208u
+        );
+        draw_panel_gbk_text(
+            state, 42, 143,
+            "\xc7\xeb\xbd\xab EXE \xb7\xc5\xc8\xeb",
+            215, 0x7befu
+        );
+        draw_panel_gbk_text(
+            state, 18, 165,
+            "\xcf\xb5\xcd\xb3\\\xb3\xcc\xd0\xf2",
+            220, 0x7befu
+        );
+    }
+
+    fill_panel_rounded_rect(state, 8, 284, 70u, 28u, 6u, 0x632cu);
+    draw_panel_gbk_text(
+        state, 31, 291, "\xcd\xcb\xb3\xf6", 70, 0xffffu
+    );
+    fill_panel_rounded_rect(state, 162, 284, 70u, 28u, 6u, 0x2a69u);
+    draw_panel_gbk_text(
+        state, 185, 291, "\xcb\xa2\xd0\xc2", 225, 0xffffu
+    );
+    if (count) {
+        draw_panel_gbk_text(
+            state, 89, 292, "\xc8\xb7\xc8\xcf\xb4\xf2\xbf\xaa",
+            155, 0x4208u
+        );
+    }
+}
+
+static u32 poll_program_browser_key(compat_9588_state_t *state)
+{
+    volatile u32 *queue = (volatile u32 *)QEMU_EVENT_QUEUE;
+    u32 write_index;
+    u32 remaining;
+    if (queue[0] != QEMU_EVENT_MAGIC) {
+        state->hardware_events_ready = 0;
+        return 0u;
+    }
+    write_index = queue[2];
+    if (write_index >= QEMU_EVENT_SLOTS) {
+        state->hardware_events_ready = 0;
+        return 0u;
+    }
+    if (!state->hardware_events_ready) {
+        state->hardware_event_cursor = write_index;
+        state->hardware_events_ready = 1;
+        return 0u;
+    }
+    remaining = QEMU_EVENT_SLOTS;
+    while (state->hardware_event_cursor != write_index && remaining--) {
+        u32 slot = state->hardware_event_cursor;
+        volatile u32 *event =
+            queue + 4u + slot * QEMU_EVENT_WORDS;
+        state->hardware_event_cursor =
+            (state->hardware_event_cursor + 1u) % QEMU_EVENT_SLOTS;
+        if (event[0] == 3u &&
+            event[1] == QEMU_EVENT_KIND_KEY &&
+            event[3]) {
+            u32 scancode = translate_native_key_value(event[2]);
+            if (scancode) {
+                return scancode;
+            }
+        }
+    }
+    return 0u;
+}
+
+static int poll_program_browser_touch(
+    compat_9588_state_t *state,
+    u32 *x_out,
+    u32 *y_out
+)
+{
+    volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
+    u32 down;
+    u32 x;
+    u32 y;
+    if (trace[0] != QEMU_TOUCH_MAGIC) {
+        state->touch_ready = 0;
+        return 0;
+    }
+    down = trace[4] != 0u;
+    x = touch_raw_to_panel_x(trace[5] & 0xfffu);
+    y = touch_raw_to_panel_y(trace[6] & 0xfffu);
+    if (!state->touch_ready) {
+        state->touch_ready = 1;
+        state->touch_down = down;
+        state->touch_x = x;
+        state->touch_y = y;
+        return 0;
+    }
+    state->touch_x = x;
+    state->touch_y = y;
+    if (!down && state->touch_down) {
+        state->touch_down = 0;
+        *x_out = x;
+        *y_out = y;
+        return 1;
+    }
+    state->touch_down = down;
+    return 0;
+}
+
+static int select_9288s_program(
+    char selected_path[NATIVE_PATH_CAPACITY]
+)
+{
+    compat_9588_state_t *state;
+    program_entry_t *entries;
+    u16 *framebuffer;
+    u32 count;
+    u32 selected = 0u;
+    int dirty = 1;
+    int result = 0;
+
+    state = (compat_9588_state_t *)bda_alloc(sizeof(*state));
+    entries = (program_entry_t *)bda_alloc(
+        sizeof(*entries) * PROGRAM_MAX_ENTRIES
+    );
+    framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * sizeof(u16));
+    if (allocation_failed(state) ||
+        allocation_failed(entries) ||
+        allocation_failed(framebuffer)) {
+        if (!allocation_failed(framebuffer)) bda_free(framebuffer);
+        if (!allocation_failed(entries)) bda_free(entries);
+        if (!allocation_failed(state)) bda_free(state);
+        bda_msgbox("9288S", "Not enough memory for program list");
+        return -1;
+    }
+    bda_memset(state, 0, sizeof(*state));
+    state->framebuffer = framebuffer;
+    state->hzk_file = -1;
+    count = load_program_entries(entries, PROGRAM_MAX_ENTRIES);
+
+    for (;;) {
+        u32 key;
+        u32 touch_x = 0u;
+        u32 touch_y = 0u;
+        int touched;
+        int refresh = 0;
+        if (dirty) {
+            draw_program_browser(state, entries, count, selected);
+            present_raw_framebuffer(state);
+            dirty = 0;
+        }
+        key = poll_program_browser_key(state);
+        touched = poll_program_browser_touch(
+            state, &touch_x, &touch_y
+        );
+        if (key == COMPAT_SCANCODE_ESCAPE) {
+            result = 0;
+            break;
+        } else if (key == COMPAT_SCANCODE_ENTER) {
+            if (count) {
+                copy_native_path(selected_path, entries[selected].path);
+                result = 1;
+                break;
+            }
+            refresh = 1;
+        } else if (count && key == COMPAT_SCANCODE_UP) {
+            selected = selected ? selected - 1u : count - 1u;
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_DOWN) {
+            selected = selected + 1u < count ? selected + 1u : 0u;
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_LEFT) {
+            if (selected >= PROGRAMS_PER_PAGE) {
+                selected -= PROGRAMS_PER_PAGE;
+            } else {
+                selected = 0u;
+            }
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_RIGHT) {
+            if (selected + PROGRAMS_PER_PAGE < count) {
+                selected += PROGRAMS_PER_PAGE;
+            } else {
+                selected = count - 1u;
+            }
+            dirty = 1;
+        }
+
+        if (touched) {
+            if (touch_y >= PROGRAM_ROW_TOP &&
+                touch_y <
+                    PROGRAM_ROW_TOP +
+                    PROGRAMS_PER_PAGE * PROGRAM_ROW_HEIGHT &&
+                touch_x >= 6u && touch_x < SCREEN_W - 6u) {
+                u32 page = count
+                    ? selected / PROGRAMS_PER_PAGE : 0u;
+                u32 row =
+                    (touch_y - PROGRAM_ROW_TOP) / PROGRAM_ROW_HEIGHT;
+                u32 index = page * PROGRAMS_PER_PAGE + row;
+                if (index < count) {
+                    copy_native_path(
+                        selected_path, entries[index].path
+                    );
+                    result = 1;
+                    break;
+                }
+            } else if (touch_y >= 280u &&
+                       touch_x >= 8u && touch_x < 78u) {
+                result = 0;
+                break;
+            } else if (touch_y >= 280u &&
+                       touch_x >= 162u && touch_x < 232u) {
+                refresh = 1;
+            }
+        }
+        if (refresh) {
+            bda_memset(
+                entries, 0,
+                sizeof(*entries) * PROGRAM_MAX_ENTRIES
+            );
+            count = load_program_entries(
+                entries, PROGRAM_MAX_ENTRIES
+            );
+            selected = 0u;
+            dirty = 1;
+        }
+        bda_sys_delay(1u);
+    }
+
+    if (state->hzk_attempted &&
+        bda_fs_file_is_valid(state->hzk_file)) {
+        (void)bda_fs_close_raw(state->hzk_file);
+    }
+    bda_free(framebuffer);
+    bda_free(entries);
+    bda_free(state);
+    return result;
+}
+
 static u8 *load_d300_file(
     const char *path,
     u32 *size_out,
@@ -3902,37 +4573,29 @@ static int run_selected_game(
 __attribute__((section(".text.bda_main")))
 int bda_main(void)
 {
-    bda_file_selector_t *selector;
+    char *selected_path;
     int selector_result;
     int run_result = 0;
     int reselect = 0;
 
-    selector = (bda_file_selector_t *)bda_alloc(sizeof(*selector));
-    if (allocation_failed(selector)) {
-        bda_msgbox("9288S", "Not enough memory for file selector");
+    selected_path = (char *)bda_alloc(NATIVE_PATH_CAPACITY);
+    if (allocation_failed(selected_path)) {
+        bda_msgbox("9288S", "Not enough memory for program path");
         return 1;
     }
-    ensure_native_directory_tree(COMPAT_FS_NATIVE_ROOT);
+    ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
     for (;;) {
-        selector_result = bda_gui_select_file(
-            selector,
-            COMPAT_FS_NATIVE_ROOT_DIRECTORY,
-            "exe",
-            "Select 9288S EXE"
-        );
-        if (selector_result != BDA_FILE_SELECTOR_SELECTED) {
-            if (selector_result == BDA_FILE_SELECTOR_ERROR) {
-                bda_msgbox("9288S", "File selector failed");
-                run_result = 2;
-            }
+        selector_result = select_9288s_program(selected_path);
+        if (selector_result != 1) {
+            if (selector_result < 0) run_result = 2;
             break;
         }
-        run_result = run_selected_game(selector->path, &reselect);
+        run_result = run_selected_game(selected_path, &reselect);
         if (!reselect) {
             break;
         }
     }
-    bda_free(selector);
+    bda_free(selected_path);
     return run_result;
 }
 

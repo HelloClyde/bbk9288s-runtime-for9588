@@ -94,6 +94,6 @@ try {
   }
 }
 
-Write-Output "runtime: selectable 9288S D300 EXE"
+Write-Output "runtime: D300 launcher with title/icon program list"
 Write-Output "sdk: $SdkRoot"
 Write-Output "built: $Output"

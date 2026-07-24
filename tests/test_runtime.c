@@ -71,6 +71,16 @@ static int test_fs_path_mapping(void)
         return 3;
     }
     if (!compat_fs_map_guest_path(
+            "A:\\\xcf\xb5\xcd\xb3\\\xb3\xcc\xd0\xf2\\GAME.EXE",
+            path,
+            sizeof(path)
+        ) ||
+        strcmp(
+            path, COMPAT_FS_NATIVE_PROGRAMS_ROOT "\\GAME.EXE"
+        ) != 0) {
+        return 8;
+    }
+    if (!compat_fs_map_guest_path(
             "relative\\slot.sav", path, sizeof(path)
         ) ||
         strcmp(

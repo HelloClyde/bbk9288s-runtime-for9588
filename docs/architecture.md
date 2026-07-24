@@ -52,6 +52,11 @@ normalized below that directory while preserving their original GBK path
 components. No game or save filename is special-cased, and parent traversal
 cannot escape the private root.
 
+Executable discovery is a separate launcher policy: valid D300 EXEs placed in
+`A:\应用\数据\9288s\系统\程序\` appear in the BDA's own program list.
+The launcher reads the 16-byte GBK title and the two stacked 32x32 packed-2bpp
+icon states from each D300 header; it does not use the 9588 file selector.
+
 ## Display/input policy
 
 9288S content is portrait and four-gray-level. The initial 9588 adapter keeps a
@@ -66,7 +71,7 @@ coordinates; touch outside it is reserved for the compatibility controls.
 
 ## Milestones
 
-1. Select, parse, and load D300 images from the 9588 NAND.
+1. Enumerate, present, parse, and load D300 images from the 9588 NAND.
 2. Execute the standard application startup to the first API trap.
 3. Implement C runtime allocation/string/memory calls.
 4. Implement window creation, message queue, drawing surface, timer, and input.
