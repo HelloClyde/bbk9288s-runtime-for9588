@@ -60,5 +60,5 @@ messages. Touch is mapped from the centered guest viewport.
 3. Implement C runtime allocation/string/memory calls.
 4. Implement window creation, message queue, drawing surface, timer, and input.
 5. Reach the 海盗船 title and game board.
-6. Add save-file path translation and persistence.
+6. Add save-file path translation and persistence. (Implemented for 海盗船.)
 7. Generalize API coverage for additional 9288S applications.

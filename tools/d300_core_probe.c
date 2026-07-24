@@ -12,6 +12,9 @@
 #define SDRAM_BASE 0x02000000u
 
 static uint32_t main_window_callback;
+static unsigned char listbox_items[5][64];
+static uint32_t listbox_item_count;
+static uint32_t listbox_caret;
 
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
@@ -89,6 +92,11 @@ static void inspect_put_image(c33_vm_t *vm)
         }
     }
     ++full_frame_count;
+    printf("  full frame header:");
+    for (index = 0; index < sizeof(header); ++index) {
+        printf(" %02x", header[index]);
+    }
+    printf("\n");
     printf(
         "  full frame #%u buffer=0x%08lx unique=%u max=%u "
         "counts[0..3]=%lu,%lu,%lu,%lu\n",
@@ -221,6 +229,32 @@ static c33_vm_status_t report_api(
             }
         }
     }
+    if (group == COMPAT_API_GUI && slot == 105u) {
+        uint32_t i;
+        printf("  CreateWindowEx stack:");
+        for (i = 0; i < 12u; ++i) {
+            uint32_t value = 0;
+            if (!read_guest_u32(vm, vm->sp + i * 4u, &value)) break;
+            printf(" %08lx", (unsigned long)value);
+        }
+        printf("\n");
+    }
+    if (group == COMPAT_API_FS) {
+        unsigned char bytes[96];
+        uint32_t argument;
+        for (argument = 0; argument < 4u; ++argument) {
+            uint32_t i;
+            uint32_t address = vm->regs[6u + argument];
+            if (!c33_vm_read(vm, address, bytes, sizeof(bytes))) {
+                continue;
+            }
+            printf("  FS arg%lu bytes:", (unsigned long)argument);
+            for (i = 0; i < sizeof(bytes) && bytes[i]; ++i) {
+                printf(" %02x", bytes[i]);
+            }
+            printf("\n");
+        }
+    }
 
     /*
      * GUI slot 191 is GetSysPixelIndex in the SDK configuration used by the
@@ -315,6 +349,55 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SEND_MESSAGE) {
+        if (vm->regs[6] == 2u) {
+            uint32_t message = vm->regs[7];
+            if (message == 0xf180u &&
+                listbox_item_count < 5u) {
+                uint32_t i;
+                for (i = 0; i + 1u < sizeof(listbox_items[0]); ++i) {
+                    if (!c33_vm_read(
+                            vm,
+                            vm->regs[9] + i,
+                            &listbox_items[listbox_item_count][i],
+                            1u
+                        ) ||
+                        !listbox_items[listbox_item_count][i]) {
+                        break;
+                    }
+                }
+                listbox_items[listbox_item_count][i] = 0;
+                vm->regs[4] = listbox_item_count++;
+            } else if (message == 0xf186u ||
+                       message == 0xf19eu) {
+                listbox_caret = vm->regs[8];
+                vm->regs[4] = 0u;
+            } else if (message == 0xf188u ||
+                       message == 0xf19fu) {
+                vm->regs[4] = listbox_caret;
+            } else if (message == 0xf18au &&
+                       listbox_caret < listbox_item_count) {
+                vm->regs[4] = (uint32_t)strlen(
+                    (const char *)listbox_items[listbox_caret]
+                );
+            } else if (message == 0xf189u &&
+                       listbox_caret < listbox_item_count) {
+                uint32_t length = (uint32_t)strlen(
+                    (const char *)listbox_items[listbox_caret]
+                );
+                if (!c33_vm_write(
+                        vm,
+                        vm->regs[9],
+                        listbox_items[listbox_caret],
+                        length + 1u
+                    )) {
+                    return C33_VM_FAULT;
+                }
+                vm->regs[4] = length;
+            } else {
+                vm->regs[4] = 0u;
+            }
+            return C33_VM_OK;
+        }
         if (!main_window_callback) {
             vm->regs[4] = 0u;
             return C33_VM_OK;
@@ -385,7 +468,7 @@ static c33_vm_status_t report_api(
             1u,
             COMPAT_MSG_LBUTTONDOWN,
             4u,
-            120u | (230u << 16),
+            120u | (170u << 16),
             1000000u
         );
         if (status != C33_VM_OK) {
@@ -397,7 +480,7 @@ static c33_vm_status_t report_api(
             1u,
             COMPAT_MSG_LBUTTONUP,
             0u,
-            120u | (230u << 16),
+            120u | (170u << 16),
             1000000u
         );
         if (status != C33_VM_OK) {
@@ -416,6 +499,61 @@ static c33_vm_status_t report_api(
             return status;
         }
         vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == 105u) {
+        vm->regs[4] = 2u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == 106u) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == 292u) {
+        vm->regs[4] = 3u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == 294u) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == 77u) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS &&
+        (slot == 15u || slot == 16u)) {
+        vm->regs[4] = 0xffffffffu;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 17u) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 18u) {
+        if (!write_guest_u32(vm, vm->regs[7] + 0u, 4096u) ||
+            !write_guest_u32(vm, vm->regs[7] + 4u, 2048u) ||
+            !write_guest_u32(vm, vm->regs[7] + 8u, 8u) ||
+            !write_guest_u32(vm, vm->regs[7] + 12u, 512u)) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 27u) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 0u) {
+        vm->regs[4] = 4u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 1u) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 3u) {
+        vm->regs[4] = vm->regs[8];
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_DEFAULT_MAIN_WIN_PROC) {

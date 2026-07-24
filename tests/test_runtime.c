@@ -100,6 +100,92 @@ static int test_vm_callback(void)
         ? 0 : 4;
 }
 
+static int async_callback_ready;
+static uint32_t async_callback_tail;
+
+static c33_vm_status_t async_callback_hostcall(
+    c33_vm_t *vm,
+    uint32_t trap_address,
+    void *opaque
+)
+{
+    uint32_t inner_trap = *(uint32_t *)opaque;
+    if (trap_address == C33_VM_API_TRAP_BASE) {
+        return c33_vm_call(vm, inner_trap, 0, 0, 0, 0, 8);
+    }
+    if (trap_address == inner_trap) {
+        if (!async_callback_ready) {
+            return C33_VM_YIELD;
+        }
+        vm->regs[4] = 42;
+        if (async_callback_tail) {
+            unsigned char tail_pc[4];
+            put_u32(tail_pc, async_callback_tail);
+            if (!c33_vm_write(vm, vm->sp, tail_pc, sizeof(tail_pc))) {
+                return C33_VM_FAULT;
+            }
+            /*
+             * Make the suspended callback execute a NOP and RET after the
+             * inner hostcall. This catches accidental clearing of the
+             * callback stack by ordinary instruction cleanup.
+             */
+            vm->callbacks[vm->callback_depth - 1u].resume_sp += 4u;
+        }
+        return C33_VM_OK;
+    }
+    return C33_VM_UNSUPPORTED;
+}
+
+static int test_vm_suspended_callback(void)
+{
+    unsigned char iram[0x4000];
+    unsigned char code[4] = {
+        0x00, 0x00, /* nop */
+        0x40, 0x06  /* ret */
+    };
+    c33_vm_t vm;
+    c33_vm_status_t status;
+    uint32_t inner_trap = C33_VM_API_TRAP_BASE + 4u;
+    static const unsigned char exit_pc[4] = {
+        0xfc, 0xff, 0xff, 0x0f
+    };
+
+    memset(iram, 0, sizeof(iram));
+    c33_vm_init(&vm);
+    if (!c33_vm_map(&vm, 0, iram, sizeof(iram), 1) ||
+        !c33_vm_map(&vm, 0x02700000u, code, sizeof(code), 0)) {
+        return 1;
+    }
+    c33_vm_reset(&vm, C33_VM_API_TRAP_BASE, 0x3f80, 0);
+    vm.hostcall = async_callback_hostcall;
+    vm.hostcall_opaque = &inner_trap;
+    vm.sp -= 4;
+    if (!c33_vm_write(&vm, vm.sp, exit_pc, sizeof(exit_pc)) ||
+        !c33_vm_write(&vm, 0x3f80u, exit_pc, sizeof(exit_pc))) {
+        return 2;
+    }
+
+    async_callback_ready = 0;
+    async_callback_tail = 0x02700000u;
+    status = c33_vm_run(&vm, 16);
+    if (status != C33_VM_YIELD ||
+        vm.callback_depth != 1u ||
+        vm.pc != inner_trap) {
+        return 3;
+    }
+
+    async_callback_ready = 1;
+    status = c33_vm_run(&vm, 16);
+    if (status != C33_VM_DONE ||
+        vm.callback_depth != 0u ||
+        vm.sp != 0x3f84u ||
+        vm.regs[4] != 42u) {
+        return 4;
+    }
+    async_callback_tail = 0u;
+    return 0;
+}
+
 static int test_vm_arithmetic_extensions(void)
 {
     unsigned char code[8];
@@ -182,6 +268,12 @@ static int test_gui_image_header(void)
         0xa0, 0x00, 0xf0, 0x00,
         0x80, 0x25, 0x00, 0x00
     };
+    unsigned char padded_header[COMPAT_GUI_IMAGE_HEADER_SIZE] = {
+        0x10, 0x00, 0x10, 0x00,
+        0x00, 0x02, 0x00, 0x00,
+        0x9d, 0x00, 0xf0, 0x00,
+        0x80, 0x25, 0x00, 0x00
+    };
 
     if (compat_gui_image_payload_offset(
             header, 160, 240, 9600
@@ -191,16 +283,21 @@ static int test_gui_image_header(void)
     if (compat_gui_image_payload_offset(header, 80, 240, 4800) != 0u) {
         return 2;
     }
+    if (compat_gui_image_payload_offset(
+            padded_header, 160, 240, 9600
+        ) != COMPAT_GUI_IMAGE_HEADER_SIZE) {
+        return 3;
+    }
     if (compat_gui_packed_2bpp_stride(13) != 4u ||
         compat_gui_packed_2bpp_payload_size(13, 13) != 52u ||
         compat_gui_packed_2bpp_shift(0) != 6u ||
         compat_gui_packed_2bpp_shift(3) != 0u ||
         compat_gui_packed_2bpp_shift(4) != 6u) {
-        return 3;
+        return 4;
     }
     if (compat_gui_timer_interval_ms(20) != 200u ||
         compat_gui_timer_interval_ms(0) != 10u) {
-        return 4;
+        return 5;
     }
     return 0;
 }
@@ -221,6 +318,11 @@ int main(void)
     rc = test_vm_callback();
     if (rc) {
         fprintf(stderr, "test_vm_callback failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_vm_suspended_callback();
+    if (rc) {
+        fprintf(stderr, "test_vm_suspended_callback failed: %d\n", rc);
         return 1;
     }
     rc = test_vm_arithmetic_extensions();

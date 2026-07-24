@@ -360,6 +360,7 @@ void c33_vm_reset(c33_vm_t *vm, uint32_t entry,
     vm->alr = 0;
     vm->ahr = 0;
     vm->ext_count = 0;
+    vm->callback_depth = 0;
     /* S1C33 GNU ABI: the first argument is passed in R6. */
     vm->regs[6] = argument;
     vm->fault_pc = 0;
@@ -908,6 +909,23 @@ c33_vm_status_t c33_vm_run(c33_vm_t *vm, uint32_t budget)
 {
     while (budget--) {
         c33_vm_status_t status = c33_vm_step(vm);
+        if (status == C33_VM_DONE && vm->callback_depth) {
+            c33_vm_callback_t *callback =
+                &vm->callbacks[--vm->callback_depth];
+            if (vm->sp != callback->resume_sp) {
+                vm->fault_address = vm->sp;
+                return C33_VM_FAULT;
+            }
+            vm->pc = callback->resume_pc;
+            if (vm->pc >= C33_VM_API_TRAP_BASE &&
+                vm->pc <= C33_VM_API_TRAP_END) {
+                status = guest_return(vm);
+                if (status != C33_VM_OK) {
+                    return status;
+                }
+            }
+            continue;
+        }
         if (status != C33_VM_OK) {
             return status;
         }
@@ -943,7 +961,15 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     vm->regs[8] = arg2;
     vm->regs[9] = arg3;
     vm->ext_count = 0;
-    status = c33_vm_run(vm, budget);
+    while (budget--) {
+        status = c33_vm_step(vm);
+        if (status != C33_VM_OK) {
+            break;
+        }
+    }
+    if (status == C33_VM_OK) {
+        status = C33_VM_YIELD;
+    }
 
     /*
      * A normal callback returns through the private sentinel and restores the
@@ -953,6 +979,18 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     if (status == C33_VM_DONE && vm->sp == resume_sp) {
         vm->pc = resume_pc;
         return C33_VM_OK;
+    }
+    if (status == C33_VM_YIELD) {
+        c33_vm_callback_t *callback;
+        if (vm->callback_depth >= C33_VM_MAX_CALLBACKS) {
+            vm->pc = resume_pc;
+            vm->sp = resume_sp;
+            return C33_VM_FAULT;
+        }
+        callback = &vm->callbacks[vm->callback_depth++];
+        callback->resume_pc = resume_pc;
+        callback->resume_sp = resume_sp;
+        return C33_VM_YIELD;
     }
     vm->pc = resume_pc;
     return status == C33_VM_DONE ? C33_VM_FAULT : status;

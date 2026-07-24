@@ -2,6 +2,7 @@
 
 #include "../../runtime/include/c33vm.h"
 #include "../../runtime/include/compat_api.h"
+#include "../../runtime/include/compat_fs.h"
 #include "../../runtime/include/compat_gui.h"
 #include "../../runtime/include/d300.h"
 
@@ -37,12 +38,37 @@
 #define VM_SLICE         100000u
 #define CALLBACK_BUDGET  1000000u
 #define EVENT_QUEUE_SIZE 16u
-#define HOST_POLL_MS     10u
-#define HOST_POLL_US     (HOST_POLL_MS * 1000u)
+#define LISTBOX_ITEM_COUNT 5u
+#define LISTBOX_ITEM_SIZE  64u
+#define GUEST_CONTROL_HWND 0x100u
+#define LISTBOX_SELECT_X   53u
+#define LISTBOX_SELECT_Y   90u
+#define LISTBOX_SELECT_W   88u
+#define LISTBOX_SELECT_H   16u
+#define LISTBOX_ITEM_STEP  19u
+#define HOST_TICK_MS     25u
+#define MAX_FILE_IO_SIZE 0x00020000u
 
 /* "海盗船" in the GBK encoding consumed by the 9588 firmware UI. */
 static const char k_native_help_title[] =
     "\xba\xa3\xb5\xc1\xb4\xac";
+
+static const char *const k_native_save_paths[5] = {
+    "A:\\PIRATE1.SAV",
+    "A:\\PIRATE2.SAV",
+    "A:\\PIRATE3.SAV",
+    "A:\\PIRATE4.SAV",
+    "A:\\PIRATE5.SAV"
+};
+
+/* GBK filenames used by the original game, without the 9288S-only prefix. */
+static const char *const k_guest_save_names[5] = {
+    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xd2\xbb.sav",
+    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xb6\xfe.sav",
+    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xc8\xfd.sav",
+    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xcb\xc4.sav",
+    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xce\xe5.sav"
+};
 
 typedef struct guest_message {
     u32 hwnd;
@@ -59,6 +85,23 @@ typedef struct compat_9588_state {
     u16 *framebuffer;
     u32 guest_window_proc;
     u32 guest_hwnd;
+    u32 parent_window_proc;
+    u32 parent_hwnd;
+    u32 parent_pen_color;
+    u32 parent_brush_color;
+    u32 parent_background_color;
+    s32 parent_current_x;
+    s32 parent_current_y;
+    int parent_instant_paint;
+    u32 next_hwnd;
+    u32 guest_control_hwnd;
+    char listbox_items[LISTBOX_ITEM_COUNT][LISTBOX_ITEM_SIZE];
+    u32 listbox_item_count;
+    u32 listbox_caret;
+    u32 listbox_drawn_caret;
+    bda_fs_find_data_t native_find_data;
+    u32 guest_find_data;
+    int native_find_open;
     guest_message_t events[EVENT_QUEUE_SIZE];
     u32 event_read;
     u32 event_write;
@@ -234,6 +277,42 @@ static char *guest_copy_c_string(
     return 0;
 }
 
+static int byte_string_contains(const char *text, const char *needle)
+{
+    const char *candidate;
+    if (!text || !needle || !*needle) {
+        return 0;
+    }
+    for (candidate = text; *candidate; ++candidate) {
+        const char *left = candidate;
+        const char *right = needle;
+        while (*left && *right && *left == *right) {
+            ++left;
+            ++right;
+        }
+        if (!*right) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char *translate_save_path(const char *guest_path)
+{
+    u32 index;
+    for (index = 0u; index < 5u; ++index) {
+        if (byte_string_contains(guest_path, k_guest_save_names[index])) {
+            return k_native_save_paths[index];
+        }
+    }
+    /*
+     * 海盗船 only opens the five paths above. Return a stable private
+     * fallback instead of allowing an incompatible 9288S absolute path to
+     * escape into the 9588 filesystem.
+     */
+    return "A:\\PIRATE0.DAT";
+}
+
 static u16 logical_color_to_rgb565(u32 color)
 {
     static const u16 palette[17] = {
@@ -273,6 +352,59 @@ static void put_guest_pixel(
         logical_color_to_rgb565(color);
 }
 
+static void fill_guest_rect(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height,
+    u32 color
+)
+{
+    u32 px;
+    u32 py;
+    for (py = 0u; py < height; ++py) {
+        for (px = 0u; px < width; ++px) {
+            put_guest_pixel(
+                state,
+                (s32)(x + px),
+                (s32)(y + py),
+                color
+            );
+        }
+    }
+}
+
+static void render_listbox_selection(compat_9588_state_t *state)
+{
+    if (!state->parent_hwnd ||
+        !state->guest_control_hwnd ||
+        state->listbox_caret >= state->listbox_item_count) {
+        return;
+    }
+    if (state->listbox_drawn_caret < state->listbox_item_count &&
+        state->listbox_drawn_caret != state->listbox_caret) {
+        fill_guest_rect(
+            state,
+            LISTBOX_SELECT_X,
+            LISTBOX_SELECT_Y +
+                state->listbox_drawn_caret * LISTBOX_ITEM_STEP,
+            LISTBOX_SELECT_W,
+            LISTBOX_SELECT_H,
+            3u
+        );
+    }
+    fill_guest_rect(
+        state,
+        LISTBOX_SELECT_X,
+        LISTBOX_SELECT_Y + state->listbox_caret * LISTBOX_ITEM_STEP,
+        LISTBOX_SELECT_W,
+        LISTBOX_SELECT_H,
+        0u
+    );
+    state->listbox_drawn_caret = state->listbox_caret;
+}
+
 static void present_framebuffer(compat_9588_state_t *state)
 {
     volatile u16 *output = (volatile u16 *)QEMU_FRAMEBUFFER;
@@ -281,6 +413,7 @@ static void present_framebuffer(compat_9588_state_t *state)
     if (!state->framebuffer) {
         return;
     }
+    render_listbox_selection(state);
     for (y = 0; y < PHYSICAL_SCREEN_H; ++y) {
         for (x = 0; x < PHYSICAL_SCREEN_W; ++x) {
             u32 output_x = PHYSICAL_SCREEN_W - 1u - x;
@@ -317,6 +450,10 @@ static int draw_packed_2bpp(
     u32 source_bytes;
     u32 source_address = guest_buffer;
     u32 index;
+    int selector_frame =
+        state->parent_hwnd &&
+        x == 0 && y == 0 &&
+        width == GUEST_SCREEN_W && height == GUEST_SCREEN_H;
     u8 packed;
     u32 loaded_byte = 0xffffffffu;
 
@@ -360,6 +497,13 @@ static int draw_packed_2bpp(
             y + (s32)py,
             (packed >> compat_gui_packed_2bpp_shift(px)) & 3u
         );
+    }
+    if (selector_frame) {
+        /*
+         * A full selector repaint replaces the compatibility-drawn listbox
+         * selection, so force that overlay to be drawn again.
+         */
+        state->listbox_drawn_caret = 0xffffffffu;
     }
     if (!state->instant_paint) {
         present_framebuffer(state);
@@ -448,25 +592,25 @@ static void draw_guest_text(
                         state,
                         x + (s32)(index * 12u + column * 2u),
                         y + (s32)(row * 2u),
-                        state->brush_color
+                        state->text_color
                     );
                     put_guest_pixel(
                         state,
                         x + (s32)(index * 12u + column * 2u + 1u),
                         y + (s32)(row * 2u),
-                        state->brush_color
+                        state->text_color
                     );
                     put_guest_pixel(
                         state,
                         x + (s32)(index * 12u + column * 2u),
                         y + (s32)(row * 2u + 1u),
-                        state->brush_color
+                        state->text_color
                     );
                     put_guest_pixel(
                         state,
                         x + (s32)(index * 12u + column * 2u + 1u),
                         y + (s32)(row * 2u + 1u),
-                        state->brush_color
+                        state->text_color
                     );
                 }
             }
@@ -609,6 +753,18 @@ static void service_touch_input(compat_9588_state_t *state)
     guest_x = panel_x - PHYSICAL_GUEST_X;
     guest_y = panel_y - PHYSICAL_GUEST_Y;
     if (down && !state->touch_captured) {
+        if (state->parent_hwnd &&
+            guest_x >= 16u && guest_x < 142u &&
+            guest_y >= LISTBOX_SELECT_Y &&
+            guest_y <
+                LISTBOX_SELECT_Y +
+                LISTBOX_ITEM_COUNT * LISTBOX_ITEM_STEP) {
+            u32 item =
+                (guest_y - LISTBOX_SELECT_Y) / LISTBOX_ITEM_STEP;
+            if (item < state->listbox_item_count) {
+                state->listbox_caret = item;
+            }
+        }
         queue_pointer_message(
             state, COMPAT_MSG_LBUTTONDOWN, guest_x, guest_y, 4u
         );
@@ -623,6 +779,34 @@ static void service_touch_input(compat_9588_state_t *state)
         queue_pointer_message(
             state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
         );
+        if (state->parent_hwnd && guest_y >= 190u) {
+            if (guest_x < 80u) {
+                queue_message(
+                    state,
+                    state->guest_hwnd,
+                    COMPAT_MSG_KEYDOWN,
+                    COMPAT_SCANCODE_ENTER,
+                    0u
+                );
+            } else {
+                queue_message(
+                    state,
+                    state->guest_hwnd,
+                    COMPAT_MSG_KEYDOWN,
+                    COMPAT_SCANCODE_ESCAPE,
+                    0u
+                );
+            }
+        } else if (state->parent_hwnd &&
+                   guest_x >= 132u && guest_y < 24u) {
+            queue_message(
+                state,
+                state->guest_hwnd,
+                COMPAT_MSG_KEYDOWN,
+                COMPAT_SCANCODE_ESCAPE,
+                0u
+            );
+        }
         state->touch_captured = 0;
     }
     state->touch_down = down;
@@ -669,6 +853,16 @@ static void service_hardware_input(compat_9588_state_t *state)
         if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY && down) {
             u32 scancode = translate_native_key_value(key_code);
             if (scancode) {
+                if (state->parent_hwnd && state->listbox_item_count) {
+                    if (scancode == COMPAT_SCANCODE_UP &&
+                        state->listbox_caret > 0u) {
+                        state->listbox_caret--;
+                    } else if (scancode == COMPAT_SCANCODE_DOWN &&
+                               state->listbox_caret + 1u <
+                                   state->listbox_item_count) {
+                        state->listbox_caret++;
+                    }
+                }
                 queue_message(
                     state,
                     state->guest_hwnd,
@@ -760,6 +954,319 @@ static c33_vm_status_t call_guest_window_proc(
     );
 }
 
+static c33_vm_status_t dispatch_listbox_message(
+    compat_9588_state_t *state,
+    u32 message,
+    u32 wparam,
+    u32 lparam
+)
+{
+    c33_vm_t *vm = state->vm;
+    u32 index;
+    u32 length;
+
+    switch (message) {
+    case COMPAT_LB_ADDSTRING:
+        if (state->listbox_item_count >= LISTBOX_ITEM_COUNT ||
+            !guest_read_c_string(
+                vm,
+                lparam,
+                state->listbox_items[state->listbox_item_count],
+                LISTBOX_ITEM_SIZE
+            )) {
+            vm->regs[4] = 0xfffffffdu;
+            return C33_VM_OK;
+        }
+        vm->regs[4] = state->listbox_item_count++;
+        return C33_VM_OK;
+    case COMPAT_LB_SETCURSEL:
+    case COMPAT_LB_SETCARETINDEX:
+        index = wparam;
+        if (index >= state->listbox_item_count) {
+            vm->regs[4] = 0xfffffffdu;
+        } else {
+            state->listbox_caret = index;
+            vm->regs[4] = 0u;
+        }
+        return C33_VM_OK;
+    case COMPAT_LB_GETCURSEL:
+    case COMPAT_LB_GETCARETINDEX:
+        vm->regs[4] = state->listbox_caret;
+        return C33_VM_OK;
+    case COMPAT_LB_GETTEXTLEN:
+        index = wparam;
+        if (index >= state->listbox_item_count) {
+            vm->regs[4] = 0xfffffffdu;
+            return C33_VM_OK;
+        }
+        length = 0u;
+        while (length < LISTBOX_ITEM_SIZE &&
+               state->listbox_items[index][length]) {
+            ++length;
+        }
+        vm->regs[4] = length;
+        return C33_VM_OK;
+    case COMPAT_LB_GETTEXT:
+        index = wparam;
+        if (index >= state->listbox_item_count) {
+            vm->regs[4] = 0xfffffffdu;
+            return C33_VM_OK;
+        }
+        length = 0u;
+        while (length < LISTBOX_ITEM_SIZE &&
+               state->listbox_items[index][length]) {
+            ++length;
+        }
+        if (!c33_vm_write(
+                vm,
+                lparam,
+                state->listbox_items[index],
+                length + 1u
+            )) {
+            vm->fault_address = lparam;
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = length;
+        return C33_VM_OK;
+    case COMPAT_LB_GETCOUNT:
+        vm->regs[4] = state->listbox_item_count;
+        return C33_VM_OK;
+    case COMPAT_LB_SETITEMHEIGHT:
+    case 0x0131u: /* MSG_SETFONT */
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    default:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+}
+
+static c33_vm_status_t dispatch_9588_fs(
+    compat_api_t *api,
+    u32 slot,
+    compat_9588_state_t *state
+)
+{
+    c33_vm_t *vm = api->vm;
+
+    switch (slot) {
+    case COMPAT_FS_OPEN:
+        {
+            char guest_path[192];
+            char mode[8];
+            const char *native_path;
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                ) ||
+                !guest_read_c_string(
+                    vm, vm->regs[7], mode, sizeof(mode)
+                )) {
+                return C33_VM_FAULT;
+            }
+            native_path = translate_save_path(guest_path);
+            vm->regs[4] = (u32)bda_fs_fopen_raw(native_path, mode);
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_CLOSE:
+        if (!bda_fs_file_is_valid((int)vm->regs[6])) {
+            vm->regs[4] = 0xffffffffu;
+        } else {
+            vm->regs[4] = (u32)bda_fs_close_raw((int)vm->regs[6]);
+        }
+        return C33_VM_OK;
+    case COMPAT_FS_READ:
+        {
+            u32 size = vm->regs[7];
+            u32 count = vm->regs[8];
+            u32 byte_count;
+            int items_read;
+            u8 *buffer;
+            if (!size || !count ||
+                size > MAX_FILE_IO_SIZE ||
+                count > MAX_FILE_IO_SIZE / size ||
+                !bda_fs_file_is_valid((int)vm->regs[9])) {
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            byte_count = size * count;
+            buffer = (u8 *)bda_alloc(byte_count);
+            if (allocation_failed(buffer)) {
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            items_read = bda_fs_fread_raw(
+                buffer, size, count, (int)vm->regs[9]
+            );
+            if (items_read > 0 &&
+                !c33_vm_write(
+                    vm,
+                    vm->regs[6],
+                    buffer,
+                    (u32)items_read * size
+                )) {
+                bda_free(buffer);
+                vm->fault_address = vm->regs[6];
+                return C33_VM_FAULT;
+            }
+            bda_free(buffer);
+            vm->regs[4] = items_read > 0 ? (u32)items_read : 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_WRITE:
+        {
+            u32 size = vm->regs[7];
+            u32 count = vm->regs[8];
+            u32 byte_count;
+            int items_written;
+            u8 *buffer;
+            if (!size || !count ||
+                size > MAX_FILE_IO_SIZE ||
+                count > MAX_FILE_IO_SIZE / size ||
+                !bda_fs_file_is_valid((int)vm->regs[9])) {
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            byte_count = size * count;
+            buffer = (u8 *)bda_alloc(byte_count);
+            if (allocation_failed(buffer)) {
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            if (!c33_vm_read(vm, vm->regs[6], buffer, byte_count)) {
+                bda_free(buffer);
+                vm->fault_address = vm->regs[6];
+                return C33_VM_FAULT;
+            }
+            items_written = bda_fs_fwrite_raw(
+                buffer, size, count, (int)vm->regs[9]
+            );
+            bda_free(buffer);
+            vm->regs[4] =
+                items_written > 0 ? (u32)items_written : 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_SEEK:
+        vm->regs[4] = (u32)bda_fs_seek_raw(
+            (int)vm->regs[6], (s32)vm->regs[7], (int)vm->regs[8]
+        );
+        return C33_VM_OK;
+    case COMPAT_FS_TELL:
+        vm->regs[4] = (u32)bda_fs_tell_raw((int)vm->regs[6]);
+        return C33_VM_OK;
+    case COMPAT_FS_EOF:
+        /*
+         * The public 9588 table has no standalone feof entry. 海盗船 uses
+         * fixed-size records and checks fread's item count, so "not EOF yet"
+         * is the compatible result when this legacy slot is queried.
+         */
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_FS_ERROR:
+        vm->regs[4] = (u32)bda_fs_error((int)vm->regs[6]);
+        return C33_VM_OK;
+    case COMPAT_FS_FIND_FIRST:
+        {
+            char guest_path[192];
+            const char *native_path;
+            int result;
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (state->native_find_open) {
+                (void)bda_fs_findclose(&state->native_find_data);
+                state->native_find_open = 0;
+            }
+            native_path = translate_save_path(guest_path);
+            bda_fs_find_data_init(&state->native_find_data);
+            result = bda_fs_findfirst(
+                native_path,
+                vm->regs[7],
+                &state->native_find_data
+            );
+            if (result != -1) {
+                state->native_find_open = 1;
+                state->guest_find_data = vm->regs[8];
+                if (!c33_vm_write(
+                        vm,
+                        vm->regs[8],
+                        &state->native_find_data,
+                        sizeof(state->native_find_data)
+                    )) {
+                    (void)bda_fs_findclose(&state->native_find_data);
+                    state->native_find_open = 0;
+                    return C33_VM_FAULT;
+                }
+            }
+            vm->regs[4] = (u32)result;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_FIND_NEXT:
+        if (!state->native_find_open ||
+            state->guest_find_data != vm->regs[6]) {
+            vm->regs[4] = 0xffffffffu;
+        } else {
+            int result = bda_fs_findnext(&state->native_find_data);
+            if (result != -1 &&
+                !c33_vm_write(
+                    vm,
+                    vm->regs[6],
+                    &state->native_find_data,
+                    sizeof(state->native_find_data)
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = (u32)result;
+        }
+        return C33_VM_OK;
+    case COMPAT_FS_FIND_CLOSE:
+        if (state->native_find_open &&
+            state->guest_find_data == vm->regs[6]) {
+            vm->regs[4] = (u32)bda_fs_findclose(
+                &state->native_find_data
+            );
+            state->native_find_open = 0;
+            state->guest_find_data = 0u;
+        } else {
+            /* The 9288S game closes even after a failed exact-file lookup. */
+            vm->regs[4] = 0u;
+        }
+        return C33_VM_OK;
+    case COMPAT_FS_DISK_INFO:
+        /*
+         * Four 32-bit fields: total clusters, free clusters, sectors per
+         * cluster and bytes per sector. Advertise ample persistent space so
+         * the game's original 128 KiB guard permits saving.
+         */
+        if (!guest_write_u32(vm, vm->regs[7] + 0u, 4096u) ||
+            !guest_write_u32(vm, vm->regs[7] + 4u, 2048u) ||
+            !guest_write_u32(vm, vm->regs[7] + 8u, 8u) ||
+            !guest_write_u32(vm, vm->regs[7] + 12u, 512u)) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_FS_STAT:
+        {
+            char guest_path[192];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            /*
+             * The two legacy directories are virtual in this adapter. Exact
+             * save-file existence is handled by FIND_FIRST above.
+             */
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    default:
+        return C33_VM_UNSUPPORTED;
+    }
+}
+
 static c33_vm_status_t dispatch_9588(
     compat_api_t *api,
     compat_api_group_t group,
@@ -773,7 +1280,13 @@ static c33_vm_status_t dispatch_9588(
     compat_9588_state_t *state = (compat_9588_state_t *)opaque;
     c33_vm_t *vm = api->vm;
 
-    if (group != COMPAT_API_GUI || !state) {
+    if (!state) {
+        return C33_VM_UNSUPPORTED;
+    }
+    if (group == COMPAT_API_FS) {
+        return dispatch_9588_fs(api, slot, state);
+    }
+    if (group != COMPAT_API_GUI) {
         return C33_VM_UNSUPPORTED;
     }
 
@@ -801,10 +1314,28 @@ static c33_vm_status_t dispatch_9588(
         );
         return C33_VM_OK;
     case COMPAT_GUI_SEND_MESSAGE:
+        if (vm->regs[6] == state->guest_control_hwnd &&
+            state->guest_control_hwnd) {
+            return dispatch_listbox_message(
+                state, vm->regs[7], vm->regs[8], vm->regs[9]
+            );
+        }
         return call_guest_window_proc(
             state, vm->regs[6], vm->regs[7], vm->regs[8], vm->regs[9]
         );
     case COMPAT_GUI_POST_QUIT_MESSAGE:
+        if (state->parent_hwnd) {
+            /*
+             * A save/load selector owns a nested 9288S main window. Its
+             * MSG_DESTROY posts a private quit for that selector's loop.
+             * Queue the message so the suspended modal loop can unwind, but
+             * do not mark the outer game as quitting.
+             */
+            vm->regs[4] = queue_message(
+                state, vm->regs[6], 0x0140u, 0u, 0u
+            );
+            return C33_VM_OK;
+        }
         vm->regs[4] = queue_message(
             state, vm->regs[6], 0x0140u, 0u, 0u
         );
@@ -840,16 +1371,34 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_CREATE_MAIN_WINDOW:
         {
             c33_vm_status_t status;
+            u32 callback;
             if (!guest_read_u32(
                     vm,
                     vm->regs[6] + COMPAT_MAIN_WIN_CREATE_PROC_OFFSET,
-                    &state->guest_window_proc
+                    &callback
                 )) {
                 vm->fault_address =
                     vm->regs[6] + COMPAT_MAIN_WIN_CREATE_PROC_OFFSET;
                 return C33_VM_FAULT;
             }
-            state->guest_hwnd = 1u;
+            if (state->guest_hwnd) {
+                if (state->parent_hwnd) {
+                    return C33_VM_UNSUPPORTED;
+                }
+                state->parent_window_proc = state->guest_window_proc;
+                state->parent_hwnd = state->guest_hwnd;
+                state->parent_pen_color = state->pen_color;
+                state->parent_brush_color = state->brush_color;
+                state->parent_background_color =
+                    state->background_color;
+                state->parent_current_x = state->current_x;
+                state->parent_current_y = state->current_y;
+                state->parent_instant_paint = state->instant_paint;
+            } else {
+                state->guest_hwnd = 1u;
+                state->next_hwnd = 2u;
+            }
+            state->guest_window_proc = callback;
             status = call_guest_window_proc(
                 state, state->guest_hwnd, COMPAT_MSG_CREATE, 0u, 0u
             );
@@ -863,6 +1412,9 @@ static c33_vm_status_t dispatch_9588(
         }
     case COMPAT_GUI_DESTROY_MAIN_WINDOW:
         {
+            int nested =
+                state->parent_hwnd != 0u &&
+                vm->regs[6] == state->guest_hwnd;
             c33_vm_status_t status = call_guest_window_proc(
                 state,
                 vm->regs[6],
@@ -873,7 +1425,67 @@ static c33_vm_status_t dispatch_9588(
             if (status != C33_VM_OK) {
                 return status;
             }
-            state->quit = 1;
+            if (nested) {
+                u32 parent_proc = state->parent_window_proc;
+                u32 parent = state->parent_hwnd;
+                state->guest_window_proc = state->parent_window_proc;
+                state->guest_hwnd = state->parent_hwnd;
+                state->parent_window_proc = 0u;
+                state->parent_hwnd = 0u;
+                state->pen_color = state->parent_pen_color;
+                state->brush_color = state->parent_brush_color;
+                state->background_color =
+                    state->parent_background_color;
+                /*
+                 * The board relies on its DC's default black text. The
+                 * selector changes its own DC to white before creating the
+                 * nested window, so a single global color snapshot is
+                 * already too late to represent the parent's independent
+                 * DC state.
+                 */
+                state->text_color = 16u;
+                state->current_x = state->parent_current_x;
+                state->current_y = state->parent_current_y;
+                state->instant_paint = state->parent_instant_paint;
+                state->guest_control_hwnd = 0u;
+                state->listbox_item_count = 0u;
+                state->listbox_caret = 0u;
+                state->listbox_drawn_caret = 0xffffffffu;
+                status = c33_vm_call(
+                    state->vm,
+                    parent_proc,
+                    parent,
+                    COMPAT_MSG_PAINT,
+                    0u,
+                    0u,
+                    CALLBACK_BUDGET
+                );
+                if (status != C33_VM_OK) {
+                    return status;
+                }
+                /*
+                 * 海盗船's WM_PAINT draws the board background; its status
+                 * values are refreshed by the timer callback. The 9288S
+                 * window manager follows a restored modal window with that
+                 * refresh, so reproduce it before presenting the first
+                 * parent frame.
+                 */
+                status = c33_vm_call(
+                    state->vm,
+                    parent_proc,
+                    parent,
+                    COMPAT_MSG_TIMER,
+                    1u,
+                    0u,
+                    CALLBACK_BUDGET
+                );
+                if (status != C33_VM_OK) {
+                    return status;
+                }
+                present_framebuffer(state);
+            } else {
+                state->quit = 1;
+            }
             vm->regs[4] = 1u;
             return C33_VM_OK;
         }
@@ -891,6 +1503,25 @@ static c33_vm_status_t dispatch_9588(
         state->timer_interval =
             compat_gui_timer_interval_ms(vm->regs[8]);
         state->timer_elapsed = 0u;
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SHOW_WINDOW:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_CREATE_CONTROL:
+        state->guest_control_hwnd = GUEST_CONTROL_HWND;
+        state->listbox_item_count = 0u;
+        state->listbox_caret = 0u;
+        state->listbox_drawn_caret = 0xffffffffu;
+        vm->regs[4] = state->guest_control_hwnd;
+        return C33_VM_OK;
+    case COMPAT_GUI_DESTROY_CONTROL:
+        if (vm->regs[6] == state->guest_control_hwnd) {
+            state->guest_control_hwnd = 0u;
+            state->listbox_item_count = 0u;
+            state->listbox_caret = 0u;
+            state->listbox_drawn_caret = 0xffffffffu;
+        }
         vm->regs[4] = 1u;
         return C33_VM_OK;
     case COMPAT_GUI_KILL_TIMER:
@@ -913,6 +1544,23 @@ static c33_vm_status_t dispatch_9588(
                 vm->fault_address =
                     vm->regs[7] ? vm->regs[7] : vm->regs[8];
                 return C33_VM_FAULT;
+            }
+            /*
+             * The original save-success box is informational. A native 9588
+             * modal drawn over the direct compatibility framebuffer leaves
+             * both surfaces visible at once, so acknowledge this one message
+             * immediately and let the original selector close and repaint
+             * its parent board.
+             */
+            if (state->parent_hwnd &&
+                (byte_string_contains(
+                     text, "\xb4\xe6\xb5\xb5\xb3\xc9\xb9\xa6"
+                 ) ||
+                 byte_string_contains(
+                     text, "\xb4\xe6\xc5\xcc\xb3\xc9\xb9\xa6"
+                 ))) {
+                vm->regs[4] = 1u;
+                return C33_VM_OK;
             }
             vm->regs[4] = (u32)bda_msgbox_ex(
                 0,
@@ -1094,6 +1742,13 @@ static c33_vm_status_t dispatch_9588(
                 (s32)vm->regs[8] <= (s32)bottom;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_CREATE_LOG_FONT:
+        /* The compatibility surface uses its own fixed bitmap font. */
+        vm->regs[4] = 3u;
+        return C33_VM_OK;
+    case COMPAT_GUI_DESTROY_LOG_FONT:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
     case COMPAT_GUI_TEXT_OUT_LEN:
         {
             u32 length;
@@ -1227,6 +1882,7 @@ int bda_main(void)
     compat_api_t *api;
     compat_9588_state_t *state;
     c33_vm_status_t vm_status;
+    u32 host_tick;
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
     g_diagnostic[1] = 1u;
@@ -1323,6 +1979,7 @@ int bda_main(void)
     c33_vm_reset(vm, D300_GUEST_LOAD_BASE, GUEST_STACK_TOP, 0);
     vm->sp -= 4u;
     c33_vm_write(vm, vm->sp, exit_pc, sizeof(exit_pc));
+    host_tick = bda_gui_tick_count_25ms();
     g_diagnostic[1] = 7u;
 
     for (;;) {
@@ -1339,19 +1996,41 @@ int bda_main(void)
         }
 
         /*
-         * GetMessage yields while the guest queue is empty.  A CPU spin is
-         * not a clock: under QEMU it completes far faster than 10 ms and
-         * makes a 9288S timer run at an arbitrary accelerated rate.
-         * The 9588 SYS delay uses microseconds, so advance the guest timer
-         * only after one real host polling quantum has elapsed.
+         * GetMessage yields while the guest queue is empty. The firmware
+         * delay is a calibrated busy-wait, not a microsecond sleep, so keep
+         * it at one unit and derive guest timer progress from the verified
+         * 25 ms monotonic 9588 clock.
          */
-        bda_sys_delay(HOST_POLL_US);
-        service_hardware_input(state);
-        service_timer(state, HOST_POLL_MS);
+        {
+            u32 current_tick;
+            u32 elapsed_ticks;
+            bda_sys_delay(1u);
+            service_hardware_input(state);
+            current_tick = bda_gui_tick_count_25ms();
+            elapsed_ticks = current_tick - host_tick;
+            if (elapsed_ticks) {
+                service_timer(state, elapsed_ticks * HOST_TICK_MS);
+                host_tick = current_tick;
+            }
+        }
         present_framebuffer(state);
     }
 
-    if (vm_status != C33_VM_DONE) {
+    if (vm_status == C33_VM_DONE && !state->quit) {
+        char text[128];
+        char *out = text;
+        char *end = text + sizeof(text);
+        append_text(&out, end, "Unexpected guest return\nparent: ");
+        append_hex(&out, end, state->parent_hwnd);
+        append_text(&out, end, "\ncallbacks: ");
+        append_hex(&out, end, vm->callback_depth);
+        append_text(&out, end, "\nlast group: ");
+        append_hex(&out, end, api->last_group);
+        append_text(&out, end, "\nlast slot: ");
+        append_hex(&out, end, api->last_slot);
+        *out = 0;
+        bda_msgbox("9288S compatibility", text);
+    } else if (vm_status != C33_VM_DONE) {
         show_vm_status(vm, vm_status);
     }
     bda_free(code_ram);

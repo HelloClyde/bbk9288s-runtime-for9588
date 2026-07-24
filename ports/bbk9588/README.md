@@ -13,7 +13,10 @@ The current QEMU-specific host adapter provides:
 - direction/confirm/exit key translation;
 - touch down, move, and up translation through QEMU's touch-state mirror;
 - the public SDK's firmware Help Page, confirmation, window-destruction, and
-  clean-exit handling.
+  clean-exit handling;
+- nested save/load window emulation with resumable guest callbacks;
+- five persistent NAND save slots at `A:\PIRATE1.SAV` through
+  `A:\PIRATE5.SAV`.
 
 Build from the project root:
 

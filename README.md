@@ -74,14 +74,17 @@ The original 9288S 海盗船 executable now runs interactively in the QEMU-based
 - web-frontend touch input is translated to the 9288S pointer-message format;
 - the original 帮助说明 and 退出游戏 touch buttons work, including the
   native 9588 confirmation dialogs;
-- the timer and persistent 9288S message loop run inside the native 9588 BDA;
+- the original save/load selectors support touch, render like the 9288S
+  screens, and persist all five slots in the 9588 NAND;
+- score, life, and level text uses the original black-on-white DC state;
+- the timer and resumable 9288S message loops run inside the native 9588 BDA;
 - emulator key events are consumed directly, without re-entering the 9588
   firmware GUI event dispatcher.
 
 The current port deliberately targets the project's QEMU 9588 emulator. It
 uses its diagnostic input queue and direct LCD scanout; physical 9588 hardware
-would need a different host adapter. Sound and persistent `.sav` files are
-not implemented yet, but they are not required to play a session.
+would need a different host adapter. Sound is not implemented, but it is not
+required to play or save a session.
 
 ## Build, install, and play
 
@@ -115,7 +118,19 @@ Controls in the 9588 web frontend:
 
 The 9588 web display is also touch-enabled. On the game screen, tap
 `帮助说明` to open the firmware Help Page (including its scroll bar and return
-controls), or `退出游戏` to open its yes/no confirmation.
+controls), `存储文档` / `读取文档` to use one of the five persistent slots, or
+`退出游戏` to open its yes/no confirmation.
+
+The original long GBK save names are translated to these persistent 9588 NAND
+files:
+
+| Original slot | 9588 NAND file |
+| --- | --- |
+| 海盗船存档一 | `A:\PIRATE1.SAV` |
+| 海盗船存档二 | `A:\PIRATE2.SAV` |
+| 海盗船存档三 | `A:\PIRATE3.SAV` |
+| 海盗船存档四 | `A:\PIRATE4.SAV` |
+| 海盗船存档五 | `A:\PIRATE5.SAV` |
 
 Restore the overwritten launcher BDA:
 

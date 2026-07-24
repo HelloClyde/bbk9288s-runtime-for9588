@@ -45,11 +45,15 @@ not game content. The title/board artwork is embedded in the program image.
 - Native 9588 Help Page for the original help text, plus a native message box
   for exit confirmation.
 - Clean 9288S main-window destruction and quit-message handling.
-- Wall-clock-paced guest timers using MiniGUI's 10 ms tick unit and the 9588
-  SYS delay service.
+- Resumable nested callbacks for the save/load selectors' private
+  `GetMessage` loops.
+- Five persistent save slots translated to `A:\PIRATE1.SAV` through
+  `A:\PIRATE5.SAV`, including find/stat, disk-space, read, write, seek, and
+  close operations.
+- Wall-clock-paced guest timers using MiniGUI's 10 ms timer unit and the
+  public SDK's verified 25 ms monotonic firmware clock.
 
-Save-file translation and audio remain future extensions. They are optional for
-an interactive game session.
+Audio remains a future extension. Save and load are implemented.
 
 ## Verified startup trace
 
@@ -73,9 +77,10 @@ probe executes the entry point and reaches these GUI slots:
 | 35 | `DefaultMainWinProc` | unhandled messages |
 | 12/95 | `GetMessage` / `MainWindowCleanup` | loop and shutdown |
 
-The scripted headless trace now enters the board, injects touch on the exit
-button, accepts the yes/no confirmation, destroys the main window, and reaches
-normal VM completion.
+The scripted headless trace now enters the board, opens the save selector,
+queries the selected list item, validates free space, writes the 182-byte save
+record, closes the nested window, resumes the parent game, and reaches normal
+VM completion.
 
 ## 9588 emulator verification
 
@@ -92,7 +97,11 @@ Verified in the 9588 emulator:
 4. Tapping `帮助说明` opens the original help text.
 5. Tapping `退出游戏` opens a yes/no dialog and confirming returns cleanly to
    the 9588 desktop.
-6. The VM remains in the guest `GetMessage` loop between inputs, with timer
+6. The save and load selectors match their original light/dark 9288S artwork,
+   support touch selection and confirmation, and restore the board cleanly.
+7. All five 182-byte save files remain available after BDA rebuilds and
+   emulator resets.
+8. The VM remains in the guest `GetMessage` loop between inputs, with timer
    messages serviced by the host adapter.
 
 Because starting a BDA occurs inside the firmware's own event dispatch stack,
@@ -101,10 +110,12 @@ emulator's uncached diagnostic event mirror at `0xA9F00040` and writes its
 160×240 output directly into the rotated 240×320 scanout at `0xA1F82000`.
 
 `PutImageArea` receives a 16-byte SDK image object header followed by its
-packed 2bpp payload. For the full-screen image the header records width 160,
-height 240, and payload length 9,600. Skipping this header is required before
-decoding pixels; treating it as image data shifts every scanline and visibly
-breaks the board at the middle.
+packed 2bpp payload. Most full-screen images record width 160, height 240, and
+payload length 9,600. The save/load selector records an effective width of 157
+but has the same 40-byte packed row stride as the 160-pixel destination.
+Header recognition therefore compares row stride as well as height and payload
+size. Treating that valid header as pixels shifts the selector and makes its
+buttons appear reversed.
 
 Packed 2bpp rows are independently byte-aligned. A 13×13 cell therefore uses
 a 4-byte row stride and a 52-byte payload, not a continuous 43-byte bitstream.
@@ -126,8 +137,14 @@ it uses the SDK-verified `parent=0` form and restores the guest framebuffer
 after the Help Page closes.
 
 The guest `GetMessage` call yields when no message is available. Each empty
-poll now waits 10,000 microseconds through the 9588 SYS delay service before
-advancing the emulated timer by one 10 ms tick. MiniGUI's legacy `SetTimer`
-argument is a tick count, not a millisecond count, so the original
-`SetTimer(hwnd, 1, 20)` fires every 200 ms (approximately 5 Hz) instead of
-being tied to QEMU CPU execution speed.
+poll performs only a one-unit firmware busy-wait, then reads the public SDK's
+25 ms monotonic tick counter. MiniGUI's legacy `SetTimer` argument is a 10 ms
+tick count, not a millisecond count, so the original
+`SetTimer(hwnd, 1, 20)` fires every 200 ms (approximately 5 Hz) based on
+elapsed firmware time instead of QEMU CPU execution speed.
+
+The selector runs a private guest message loop inside the parent window
+callback. The VM preserves a small stack of suspended callbacks while
+`GetMessage` yields, then unwinds back to the parent after the selector posts
+its private quit message. Parent drawing state is restored and the board
+receives its paint/timer refresh before the first returned frame is presented.

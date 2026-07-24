@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define C33_VM_MAX_REGIONS 6u
+#define C33_VM_MAX_CALLBACKS 4u
 #define C33_VM_API_TRAP_BASE 0x0f000000u
 #define C33_VM_API_TRAP_END  0x0ffffffcu
 #define C33_VM_EXIT_PC       0x0ffffffcu
@@ -33,6 +34,11 @@ typedef struct c33_vm_region {
     uint8_t writable;
 } c33_vm_region_t;
 
+typedef struct c33_vm_callback {
+    uint32_t resume_pc;
+    uint32_t resume_sp;
+} c33_vm_callback_t;
+
 struct c33_vm;
 
 typedef c33_vm_status_t (*c33_vm_hostcall_fn)(
@@ -52,6 +58,8 @@ typedef struct c33_vm {
     uint8_t ext_count;
     c33_vm_region_t regions[C33_VM_MAX_REGIONS];
     uint8_t region_count;
+    c33_vm_callback_t callbacks[C33_VM_MAX_CALLBACKS];
+    uint8_t callback_depth;
     c33_vm_hostcall_fn hostcall;
     void *hostcall_opaque;
     uint32_t fault_pc;

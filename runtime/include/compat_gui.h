@@ -21,7 +21,10 @@ enum compat_gui_slot {
     COMPAT_GUI_CREATE_MAIN_WINDOW = 33,
     COMPAT_GUI_DESTROY_MAIN_WINDOW = 34,
     COMPAT_GUI_DEFAULT_MAIN_WIN_PROC = 35,
+    COMPAT_GUI_SHOW_WINDOW = 77,
     COMPAT_GUI_MAIN_WINDOW_CLEANUP = 95,
+    COMPAT_GUI_CREATE_CONTROL = 105,
+    COMPAT_GUI_DESTROY_CONTROL = 106,
     COMPAT_GUI_SET_TIMER = 107,
     COMPAT_GUI_KILL_TIMER = 108,
     COMPAT_GUI_MESSAGE_BOX = 174,
@@ -54,6 +57,8 @@ enum compat_gui_slot {
     COMPAT_GUI_SET_RECT = 268,
     COMPAT_GUI_SET_RECT_EMPTY = 269,
     COMPAT_GUI_POINT_IN_RECT = 283,
+    COMPAT_GUI_CREATE_LOG_FONT = 292,
+    COMPAT_GUI_DESTROY_LOG_FONT = 294,
     COMPAT_GUI_TEXT_OUT_LEN = 316,
     COMPAT_GUI_PUT_IMAGE_AREA = 336,
     COMPAT_GUI_CLEAR_SCREEN = 340,
@@ -70,6 +75,18 @@ enum compat_gui_slot {
     COMPAT_GUI_GET_BACKGROUND_PLAY_STATE = 392,
     COMPAT_GUI_HELP2 = 448,
     COMPAT_GUI_TRACE_INIT = 449
+};
+
+enum compat_listbox_message {
+    COMPAT_LB_ADDSTRING = 0xf180,
+    COMPAT_LB_SETCURSEL = 0xf186,
+    COMPAT_LB_GETCURSEL = 0xf188,
+    COMPAT_LB_GETTEXT = 0xf189,
+    COMPAT_LB_GETTEXTLEN = 0xf18a,
+    COMPAT_LB_GETCOUNT = 0xf18b,
+    COMPAT_LB_SETCARETINDEX = 0xf19e,
+    COMPAT_LB_GETCARETINDEX = 0xf19f,
+    COMPAT_LB_SETITEMHEIGHT = 0xf1a0
 };
 
 enum compat_gui_message {
@@ -137,7 +154,8 @@ static inline unsigned compat_gui_image_payload_offset(
         ((unsigned)header[14] << 16) |
         ((unsigned)header[15] << 24);
 
-    return header_width == width &&
+    return compat_gui_packed_2bpp_stride(header_width) ==
+               compat_gui_packed_2bpp_stride(width) &&
            header_height == height &&
            payload_size >= minimum_payload_size
         ? COMPAT_GUI_IMAGE_HEADER_SIZE : 0u;
