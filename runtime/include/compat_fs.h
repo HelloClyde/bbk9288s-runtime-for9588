@@ -37,6 +37,7 @@ enum compat_fs_slot {
     COMPAT_FS_TELL = 5,
     COMPAT_FS_EOF = 6,
     COMPAT_FS_ERROR = 7,
+    COMPAT_FS_MKDIR = 12,
     COMPAT_FS_FIND_FIRST = 15,
     COMPAT_FS_FIND_NEXT = 16,
     COMPAT_FS_FIND_CLOSE = 17,

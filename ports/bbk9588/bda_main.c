@@ -129,6 +129,7 @@ typedef struct compat_9588_state {
     u32 touch_y;
     u32 touch_region;
     u32 virtual_action;
+    u8 combo_keys[6];
     int controls_left;
     int request_reselect;
     u32 timer_hwnd;
@@ -206,15 +207,25 @@ static void show_vm_status(c33_vm_t *vm, c33_vm_status_t status)
     append_text(&out, end, c33_vm_status_string(status));
     append_text(&out, end, "\nPC: ");
     append_hex(&out, end, vm->fault_pc ? vm->fault_pc : vm->pc);
-    append_text(&out, end, "\nOpcode: ");
-    append_hex(&out, end, vm->fault_opcode);
-    append_text(&out, end, "\nLast API: ");
+    append_text(&out, end, "\nAPI: ");
     if (vm->hostcall_opaque) {
         compat_api_t *api = (compat_api_t *)vm->hostcall_opaque;
         append_hex(&out, end, api->last_group);
         append_text(&out, end, "/");
         append_hex(&out, end, api->last_slot);
     }
+    append_text(&out, end, "\nAddress: ");
+    append_hex(&out, end, vm->fault_address);
+    append_text(&out, end, "\nSP: ");
+    append_hex(&out, end, vm->sp);
+    append_text(&out, end, "\nR6: ");
+    append_hex(&out, end, vm->regs[6]);
+    append_text(&out, end, "\nR7: ");
+    append_hex(&out, end, vm->regs[7]);
+    append_text(&out, end, "\nR8: ");
+    append_hex(&out, end, vm->regs[8]);
+    append_text(&out, end, "\nR9: ");
+    append_hex(&out, end, vm->regs[9]);
     *out = 0;
     bda_msgbox("9288S compatibility", text);
 }
@@ -223,6 +234,7 @@ static int guest_read_u32(c33_vm_t *vm, u32 address, u32 *value)
 {
     u8 bytes[4];
     if (!c33_vm_read(vm, address, bytes, sizeof(bytes))) {
+        vm->fault_address = address;
         return 0;
     }
     *value = (u32)bytes[0] |
@@ -998,6 +1010,25 @@ static void fill_guest_rect(
     }
 }
 
+static void reverse_guest_rect(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height
+)
+{
+    u32 px;
+    u32 py;
+    for (py = 0u; py < height && y + py < GUEST_SCREEN_H; ++py) {
+        for (px = 0u; px < width && x + px < GUEST_SCREEN_W; ++px) {
+            u32 panel_x = GAME_VIEW_X + x + px;
+            u32 panel_y = y + py;
+            state->framebuffer[panel_y * SCREEN_W + panel_x] ^= 0xffffu;
+        }
+    }
+}
+
 static saved_box_t *find_saved_box(
     compat_9588_state_t *state,
     u32 guest_buffer,
@@ -1183,18 +1214,58 @@ static int draw_packed_2bpp(
     u32 source_bytes;
     u32 source_address = guest_buffer;
     u32 index;
-    int selector_frame =
-        state->parent_hwnd &&
-        x == 0 && y == 0 &&
-        width == GUEST_SCREEN_W && height == GUEST_SCREEN_H;
+    int has_header = c33_vm_read(
+        vm, guest_buffer, image_header, sizeof(image_header)
+    );
+    int selector_frame;
     u8 packed;
     u32 loaded_byte = 0xffffffffu;
 
+    if (has_header) {
+        u32 header_width =
+            (u32)image_header[8] | ((u32)image_header[9] << 8);
+        u32 header_height =
+            (u32)image_header[10] | ((u32)image_header[11] << 8);
+        u32 header_payload =
+            (u32)image_header[12] |
+            ((u32)image_header[13] << 8) |
+            ((u32)image_header[14] << 16) |
+            ((u32)image_header[15] << 24);
+        u32 required_payload =
+            compat_gui_packed_2bpp_payload_size(
+                header_width, header_height
+            );
+        /*
+         * Some 9288S games pass the inclusive right/bottom extent to
+         * PutImageArea (161x241 for a 160x240 image). The embedded image
+         * header is authoritative when both forms differ by exactly one.
+         */
+        if (header_width && header_height &&
+            header_width <= GUEST_SCREEN_W &&
+            header_height <= GUEST_SCREEN_H &&
+            header_payload >= required_payload &&
+            ((((width == header_width ||
+                width + 1u == header_width ||
+                width == header_width + 1u) &&
+               (height == header_height ||
+                height + 1u == header_height ||
+                height == header_height + 1u))) ||
+             !width || !height ||
+             width > GUEST_SCREEN_W ||
+             height > GUEST_SCREEN_H)) {
+            width = header_width;
+            height = header_height;
+        }
+    }
     if (!width || !height ||
         width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
         width > 0xffffffffu / height) {
         return 0;
     }
+    selector_frame =
+        state->parent_hwnd &&
+        x == 0 && y == 0 &&
+        width == GUEST_SCREEN_W && height == GUEST_SCREEN_H;
     pixel_count = width * height;
     source_stride = compat_gui_packed_2bpp_stride(width);
     source_bytes = compat_gui_packed_2bpp_payload_size(width, height);
@@ -1205,9 +1276,7 @@ static int draw_packed_2bpp(
      * pixels shifts every following scanline and makes one board look like
      * two broken half-width boards.
      */
-    if (c33_vm_read(
-            vm, guest_buffer, image_header, sizeof(image_header)
-        )) {
+    if (has_header) {
         source_address += compat_gui_image_payload_offset(
             image_header, width, height, source_bytes
         );
@@ -1246,8 +1315,8 @@ static int draw_packed_2bpp(
 
 static int legacy_blit_virtual_2bpp(
     compat_9588_state_t *state,
-    u32 x,
-    u32 y,
+    s32 x,
+    s32 y,
     u32 width,
     u32 height,
     u32 picture,
@@ -1257,43 +1326,68 @@ static int legacy_blit_virtual_2bpp(
 {
     c33_vm_t *vm = state->vm;
     u32 source_stride;
-    u32 source_width = width;
+    u32 source_start_x = 0u;
+    u32 source_start_y = 0u;
+    u32 destination_x;
+    u32 destination_y;
+    u32 clipped_width;
+    u32 clipped_height;
     u32 row;
     u8 source[40];
     u8 destination[40];
 
-    if (!virtual_screen || !width || !height ||
-        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
-        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H) {
+    if (!virtual_screen || (!picture && mode != 4u) ||
+        !width || !height ||
+        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H) {
         return 0;
     }
     /*
-     * The 9288S SysShowPicV clips at the virtual-screen edge. 三国霸业
-     * deliberately draws a 160-pixel strip at x=2, so preserve the source
-     * row stride while discarding the two off-screen destination pixels.
+     * SysShowPicV accepts signed positions and clips at every virtual-screen
+     * edge. 雷霆战机 keeps animating sprites after x reaches 180, and 三国霸业
+     * deliberately draws a 160-pixel strip at x=2. Both are valid no-op or
+     * clipped draws, not VM faults.
      */
-    if (width > GUEST_SCREEN_W - x) {
-        width = GUEST_SCREEN_W - x;
+    if (x < 0) {
+        source_start_x = (u32)-x;
     }
-    if (height > GUEST_SCREEN_H - y) {
-        height = GUEST_SCREEN_H - y;
+    if (y < 0) {
+        source_start_y = (u32)-y;
     }
-    source_stride = (source_width + 3u) / 4u;
+    if (source_start_x >= width || source_start_y >= height ||
+        x >= (s32)GUEST_SCREEN_W || y >= (s32)GUEST_SCREEN_H) {
+        return 1;
+    }
+    destination_x = x < 0 ? 0u : (u32)x;
+    destination_y = y < 0 ? 0u : (u32)y;
+    clipped_width = width - source_start_x;
+    clipped_height = height - source_start_y;
+    if (clipped_width > GUEST_SCREEN_W - destination_x) {
+        clipped_width = GUEST_SCREEN_W - destination_x;
+    }
+    if (clipped_height > GUEST_SCREEN_H - destination_y) {
+        clipped_height = GUEST_SCREEN_H - destination_y;
+    }
+    if (!clipped_width || !clipped_height) {
+        return 1;
+    }
+    source_stride = (width + 3u) / 4u;
     if (source_stride > sizeof(source)) {
         return 0;
     }
-    for (row = 0u; row < height; ++row) {
+    for (row = 0u; row < clipped_height; ++row) {
         u32 column;
         u32 destination_address =
-            virtual_screen + (y + row) * (GUEST_SCREEN_W / 4u);
+            virtual_screen +
+            (destination_y + row) * (GUEST_SCREEN_W / 4u);
         if (mode != 4u &&
             !c33_vm_read(
                 vm,
-                picture + row * source_stride,
+                picture + (source_start_y + row) * source_stride,
                 source,
                 source_stride
             )) {
-            vm->fault_address = picture + row * source_stride;
+            vm->fault_address =
+                picture + (source_start_y + row) * source_stride;
             return 0;
         }
         /*
@@ -1302,14 +1396,19 @@ static int legacy_blit_virtual_2bpp(
          * access and branch for every individual pixel makes the intro run
          * hundreds of times slower under the 9588 CPU emulator.
          */
-        if ((x & 3u) == 0u && (width & 3u) == 0u) {
-            u32 first_byte = x / 4u;
-            if (mode == 0u && x == 0u && width == GUEST_SCREEN_W) {
+        if (!source_start_x &&
+            (destination_x & 3u) == 0u &&
+            (clipped_width & 3u) == 0u) {
+            u32 first_byte = destination_x / 4u;
+            u32 clipped_stride = clipped_width / 4u;
+            if (mode == 0u &&
+                destination_x == 0u &&
+                clipped_width == GUEST_SCREEN_W) {
                 if (!c33_vm_write(
                         vm,
                         destination_address,
                         source,
-                        source_stride
+                        clipped_stride
                     )) {
                     vm->fault_address = destination_address;
                     return 0;
@@ -1325,13 +1424,19 @@ static int legacy_blit_virtual_2bpp(
                 vm->fault_address = destination_address;
                 return 0;
             }
-            for (column = 0u; column < source_stride; ++column) {
+            for (column = 0u; column < clipped_stride; ++column) {
                 u8 *destination_byte =
                     &destination[first_byte + column];
+                /*
+                 * The shipped game assets use mode 1 for the sparse sprite
+                 * plane and mode 2 for its inverse mask. This is the order
+                 * used by the 9288S runtime even though an old SDK comment
+                 * labels the two modes the other way around.
+                 */
                 if (mode == 1u) {
-                    *destination_byte &= source[column];
-                } else if (mode == 2u) {
                     *destination_byte |= source[column];
+                } else if (mode == 2u) {
+                    *destination_byte &= source[column];
                 } else if (mode == 3u) {
                     *destination_byte ^= source[column];
                 } else if (mode == 4u) {
@@ -1360,24 +1465,25 @@ static int legacy_blit_virtual_2bpp(
             vm->fault_address = destination_address;
             return 0;
         }
-        for (column = 0u; column < width; ++column) {
-            u32 destination_x = x + column;
-            u32 source_shift = 6u - ((column & 3u) * 2u);
+        for (column = 0u; column < clipped_width; ++column) {
+            u32 source_x = source_start_x + column;
+            u32 output_x = destination_x + column;
+            u32 source_shift = 6u - ((source_x & 3u) * 2u);
             u32 destination_shift =
-                6u - ((destination_x & 3u) * 2u);
+                6u - ((output_x & 3u) * 2u);
             u32 source_pixel =
                 mode == 4u ? 3u :
-                (source[column / 4u] >> source_shift) & 3u;
+                (source[source_x / 4u] >> source_shift) & 3u;
             u8 *destination_byte =
-                &destination[destination_x / 4u];
+                &destination[output_x / 4u];
             u32 destination_pixel =
                 (*destination_byte >> destination_shift) & 3u;
             u32 output_pixel;
 
             if (mode == 1u) {
-                output_pixel = destination_pixel & source_pixel;
-            } else if (mode == 2u) {
                 output_pixel = destination_pixel | source_pixel;
+            } else if (mode == 2u) {
+                output_pixel = destination_pixel & source_pixel;
             } else if (mode == 3u) {
                 output_pixel = destination_pixel ^ source_pixel;
             } else {
@@ -1454,6 +1560,75 @@ static int legacy_blit_screen_2bpp(
     return 1;
 }
 
+static int legacy_get_part_picture_data_2bpp(
+    compat_9588_state_t *state,
+    u32 width,
+    u32 height,
+    u32 x1,
+    u32 y1,
+    u32 x2,
+    u32 y2,
+    u32 source_buffer,
+    u32 destination_buffer
+)
+{
+    c33_vm_t *vm = state->vm;
+    u32 source_stride;
+    u32 destination_width;
+    u32 destination_stride;
+    u32 row;
+    u8 source[40];
+    u8 destination[40];
+
+    if (!width || !height ||
+        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
+        x1 > x2 || y1 > y2 ||
+        x2 >= width || y2 >= height ||
+        !source_buffer || !destination_buffer) {
+        return 0;
+    }
+    source_stride = (width + 3u) / 4u;
+    destination_width = x2 - x1 + 1u;
+    destination_stride = (destination_width + 3u) / 4u;
+    if (source_stride > sizeof(source) ||
+        destination_stride > sizeof(destination)) {
+        return 0;
+    }
+    for (row = 0u; row <= y2 - y1; ++row) {
+        u32 column;
+        u32 source_address =
+            source_buffer + (y1 + row) * source_stride;
+        u32 destination_address =
+            destination_buffer + row * destination_stride;
+        bda_memset(destination, 0, destination_stride);
+        if (!c33_vm_read(
+                vm, source_address, source, source_stride
+            )) {
+            vm->fault_address = source_address;
+            return 0;
+        }
+        for (column = 0u; column < destination_width; ++column) {
+            u32 source_x = x1 + column;
+            u32 source_shift = 6u - ((source_x & 3u) * 2u);
+            u32 destination_shift = 6u - ((column & 3u) * 2u);
+            u32 pixel =
+                (source[source_x / 4u] >> source_shift) & 3u;
+            destination[column / 4u] |=
+                (u8)(pixel << destination_shift);
+        }
+        if (!c33_vm_write(
+                vm,
+                destination_address,
+                destination,
+                destination_stride
+            )) {
+            vm->fault_address = destination_address;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int legacy_write_virtual_pixel_2bpp(
     compat_9588_state_t *state,
     u32 virtual_screen,
@@ -1480,13 +1655,16 @@ static int legacy_write_virtual_pixel_2bpp(
         return 0;
     }
     /*
-     * The 9288S packed grayscale convention is 0=black and 3=white.
-     * Glyph helpers receive a monochrome mask, so write black ink on a
-     * white cell instead of relying on the previously inverted palette.
+     * Game glyph helpers supply a transparent monochrome mask. Ink is the
+     * inverse of the existing pixel: white on 雷霆战机's black playfield and
+     * black on a light menu. Zero bits leave the background untouched.
      */
-    value =
-        (u8)((value & (u8)~(u8)(3u << shift)) |
-             (u8)((set ? 0u : 3u) << shift));
+    if (set) {
+        u32 current = (value >> shift) & 3u;
+        value =
+            (u8)((value & (u8)~(u8)(3u << shift)) |
+                 (u8)((3u - current) << shift));
+    }
     if (!c33_vm_write(state->vm, address, &value, 1u)) {
         state->vm->fault_address = address;
         return 0;
@@ -2328,10 +2506,30 @@ static void service_hardware_input(compat_9588_state_t *state)
 
         state->hardware_event_cursor =
             (state->hardware_event_cursor + 1u) % QEMU_EVENT_SLOTS;
-        if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY && down) {
+        if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY) {
             u32 scancode = translate_native_key_value(key_code);
             if (scancode) {
+                int combo_index = -1;
                 int queued;
+                if (scancode == COMPAT_SCANCODE_RIGHT) {
+                    combo_index = 0;
+                } else if (scancode == COMPAT_SCANCODE_LEFT) {
+                    combo_index = 1;
+                } else if (scancode == COMPAT_SCANCODE_DOWN) {
+                    combo_index = 2;
+                } else if (scancode == COMPAT_SCANCODE_UP) {
+                    combo_index = 3;
+                } else if (scancode == COMPAT_SCANCODE_ESCAPE) {
+                    combo_index = 4;
+                } else if (scancode == COMPAT_SCANCODE_ENTER) {
+                    combo_index = 5;
+                }
+                if (combo_index >= 0) {
+                    state->combo_keys[combo_index] = down ? 1u : 0u;
+                }
+                if (!down) {
+                    continue;
+                }
                 if (state->parent_hwnd && state->listbox_item_count) {
                     if (scancode == COMPAT_SCANCODE_UP &&
                         state->listbox_caret > 0u) {
@@ -2671,6 +2869,25 @@ static c33_vm_status_t dispatch_9588_fs(
     case COMPAT_FS_ERROR:
         vm->regs[4] = (u32)bda_fs_error((int)vm->regs[6]);
         return C33_VM_OK;
+    case COMPAT_FS_MKDIR:
+        {
+            char guest_path[192];
+            char native_path[NATIVE_PATH_CAPACITY];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!compat_fs_map_guest_path(
+                    guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+            ensure_native_directory_tree(native_path);
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_FS_FIND_FIRST:
         {
             char guest_path[192];
@@ -3047,6 +3264,10 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_MAIN_WINDOW_CLEANUP:
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    case COMPAT_GUI_UPDATE_WINDOW:
+        present_framebuffer(state);
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
     case COMPAT_GUI_INVALIDATE_RECT:
         vm->regs[4] = queue_message(
             state,
@@ -3055,6 +3276,15 @@ static c33_vm_status_t dispatch_9588(
             0u,
             0u
         );
+        return C33_VM_OK;
+    case COMPAT_GUI_BEGIN_PAINT:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_END_PAINT:
+        if (!state->instant_paint) {
+            present_framebuffer(state);
+        }
+        vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_CLIENT_TO_SCREEN:
         /* The compatibility window occupies the full 160x240 guest area. */
@@ -3468,8 +3698,8 @@ static c33_vm_status_t dispatch_9588(
                 !guest_read_u32(vm, vm->sp + 12u, &mode) ||
                 !legacy_blit_virtual_2bpp(
                     state,
-                    vm->regs[6],
-                    vm->regs[7],
+                    (s16)(u16)vm->regs[6],
+                    (s16)(u16)vm->regs[7],
                     vm->regs[8],
                     vm->regs[9],
                     picture,
@@ -3503,6 +3733,33 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_GET_PART_PICTURE_DATA:
+        {
+            u32 x2;
+            u32 y2;
+            u32 source_buffer;
+            u32 destination_buffer;
+            if (!guest_read_u32(vm, vm->sp + 4u, &x2) ||
+                !guest_read_u32(vm, vm->sp + 8u, &y2) ||
+                !guest_read_u32(vm, vm->sp + 12u, &source_buffer) ||
+                !guest_read_u32(
+                    vm, vm->sp + 16u, &destination_buffer
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = legacy_get_part_picture_data_2bpp(
+                state,
+                vm->regs[6],
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                x2,
+                y2,
+                source_buffer,
+                destination_buffer
+            ) ? 1u : 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_BLIT_FRAME:
         if (!legacy_present_virtual_2bpp(state, vm->regs[7])) {
             return C33_VM_FAULT;
@@ -3512,16 +3769,19 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_DRAW_ASCII:
         {
             u32 virtual_screen;
+            vm->fault_address = vm->sp + 4u;
             if (!guest_read_u32(vm, vm->sp + 4u, &virtual_screen) ||
-                !legacy_draw_ascii_virtual(
+                (vm->fault_address = virtual_screen,
+                 !legacy_draw_ascii_virtual(
                     state,
                     virtual_screen,
                     (s32)vm->regs[7],
                     (s32)vm->regs[8],
                     (u8)vm->regs[9]
-                )) {
+                ))) {
                 return C33_VM_FAULT;
             }
+            vm->fault_address = 0u;
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
@@ -3558,6 +3818,28 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_CLEAR_RECT:
+        {
+            u32 bottom;
+            s32 left = (s32)vm->regs[7];
+            s32 top = (s32)vm->regs[8];
+            s32 right = (s32)vm->regs[9];
+            if (!guest_read_u32(vm, vm->sp + 4u, &bottom)) {
+                return C33_VM_FAULT;
+            }
+            if (right > left && (s32)bottom > top) {
+                fill_guest_rect(
+                    state,
+                    (u32)left,
+                    (u32)top,
+                    (u32)(right - left),
+                    (u32)((s32)bottom - top),
+                    state->background_color
+                );
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_GET_CURRENT_DATETIME:
         {
             static const u8 time_info[8] = {
@@ -3579,7 +3861,88 @@ static c33_vm_status_t dispatch_9588(
         }
     case COMPAT_GUI_SHOW_STATUS_AND_DESKTOP:
     case COMPAT_GUI_GET_BACKGROUND_PLAY_STATE:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_TIMER:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_LCD:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_LED:
     case COMPAT_GUI_TRACE_INIT:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_REVERSE_RECT:
+        {
+            u32 height;
+            if (!guest_read_u32(vm, vm->sp + 4u, &height)) {
+                return C33_VM_FAULT;
+            }
+            reverse_guest_rect(
+                state,
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                height
+            );
+            if (!state->instant_paint) {
+                present_framebuffer(state);
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_GET_SCREEN_WIDTH:
+        vm->regs[4] = GUEST_SCREEN_W;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_SCREEN_HEIGHT:
+        vm->regs[4] = GUEST_SCREEN_H;
+        return C33_VM_OK;
+    case COMPAT_GUI_MUSIC_VOLUME_SET:
+    case COMPAT_GUI_SPEECH_OUTPUT_SET:
+    case COMPAT_GUI_MUSIC_OUTPUT_SET:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_MUSIC_VOLUME_GET:
+        vm->regs[4] = 5u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SPEECH_OUTPUT_GET:
+    case COMPAT_GUI_MUSIC_OUTPUT_GET:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SCAN_GAME_COMBO_KEYS:
+        {
+            u32 index;
+            u32 pressed = 0u;
+            if (!c33_vm_write(
+                    vm,
+                    vm->regs[6],
+                    state->combo_keys,
+                    sizeof(state->combo_keys)
+                )) {
+                vm->fault_address = vm->regs[6];
+                return C33_VM_FAULT;
+            }
+            for (index = 0u;
+                 index < sizeof(state->combo_keys);
+                 ++index) {
+                if (state->combo_keys[index]) {
+                    pressed = 1u;
+                    break;
+                }
+            }
+            vm->regs[4] = pressed;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_SET_LANDSCAPE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_LANDSCAPE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_ATTACH_ENABLE:
+    case COMPAT_GUI_LED:
+    case COMPAT_GUI_DISPLAY_BACKLIGHT_STATUS:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_BACKLIGHT_STATUS:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_IS_SYSTEM_LOW_POWER:
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_HELP2:
@@ -4342,7 +4705,13 @@ static int run_selected_game(
     u8 *api_ram = 0;
     u8 *heap_ram = 0;
     u8 *code_ram = 0;
-    u32 code_size = GUEST_CODE_MIN_SIZE;
+    /*
+     * D300 images only report the initialized program length. 9288S
+     * executables also address zero-initialized globals above that range,
+     * so keep the entire application window mapped just like the original
+     * 9288S SDRAM layout.
+     */
+    u32 code_size = GUEST_CODE_MAX_SIZE;
     u16 *framebuffer = 0;
     compat_9588_runtime_t *runtime;
     d300_image_t *image;
@@ -4424,11 +4793,6 @@ static int run_selected_game(
         *reselect_out = 1;
         return 5;
     }
-    if (image->program_size > code_size) {
-        code_size =
-            (image->program_size + 0xffffu) & ~0xffffu;
-    }
-
     iram = (u8 *)bda_alloc(GUEST_IRAM_SIZE);
     api_ram = (u8 *)bda_alloc(GUEST_API_SIZE);
     heap_ram = (u8 *)bda_alloc(GUEST_HEAP_SIZE);

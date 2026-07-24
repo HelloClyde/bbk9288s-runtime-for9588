@@ -943,7 +943,11 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     uint32_t resume_sp;
     c33_vm_status_t status;
 
-    if (!vm || !budget || (target & 1u)) {
+    if (!vm || !budget) {
+        return C33_VM_FAULT;
+    }
+    if (target & 1u) {
+        vm->fault_address = target;
         return C33_VM_FAULT;
     }
     resume_pc = vm->pc;
@@ -976,9 +980,12 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
      * original stack position. The outer hostcall still has its own guest
      * return address below this boundary.
      */
-    if (status == C33_VM_DONE && vm->sp == resume_sp) {
-        vm->pc = resume_pc;
-        return C33_VM_OK;
+    if (status == C33_VM_DONE) {
+        if (vm->sp == resume_sp) {
+            vm->pc = resume_pc;
+            return C33_VM_OK;
+        }
+        vm->fault_address = vm->sp;
     }
     if (status == C33_VM_YIELD) {
         c33_vm_callback_t *callback;
