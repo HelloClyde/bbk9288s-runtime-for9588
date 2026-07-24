@@ -1,12 +1,16 @@
 /build/
 /local/
+/.venv/
 *.exe
 *.bda
 *.bin
 *.sav
+*.seed
 *.map
 *.o
 *.obj
 *.elf
 __pycache__/
 *.pyc
+.DS_Store
+Thumbs.db

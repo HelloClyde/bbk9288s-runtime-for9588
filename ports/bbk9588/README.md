@@ -10,7 +10,7 @@ The current QEMU-specific host adapter provides:
 
 - an unscaled 160×240 guest surface at the top center of the rotated 240×320
   RGB565 display;
-- side EXE/settings buttons and a bottom touch D-pad/A/B control area;
+- side EXE/settings buttons, a centered direction pad, and 取消/确认 actions;
 - row-aligned packed 2bpp image decoding;
 - a persistent 9288S GUI message loop and timer;
 - direction/confirm/exit key translation;
@@ -33,7 +33,7 @@ Start the LAN/touch-enabled 9588 frontend with:
 powershell -ExecutionPolicy Bypass -File .\scripts\start-9588-lan.ps1
 ```
 
-The public SDK at `C:\Users\ASUS\Documents\eebbk9588_native_sdk` is used only
-as a build dependency. The current direct scanout and diagnostic input mirrors
-are emulator interfaces; physical 9588 hardware would require a separate host
-adapter.
+The public SDK is pinned as the repository's `sdk` Git submodule and is used
+only as a build dependency. The current direct scanout and diagnostic input
+mirrors are emulator interfaces; physical 9588 hardware would require a
+separate host adapter.

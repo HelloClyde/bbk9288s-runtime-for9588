@@ -1,0 +1,108 @@
+name: Build and release BDA
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Build and run host runtime tests
+        run: |
+          mkdir -p build/host-tests
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I runtime/include \
+            runtime/src/d300.c \
+            runtime/src/c33vm.c \
+            runtime/src/compat_api.c \
+            tests/test_runtime.c \
+            -o build/host-tests/test-runtime
+          ./build/host-tests/test-runtime
+
+  package:
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - name: Check out source and SDK
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache the MIPS toolchain
+        uses: actions/cache@v4
+        with:
+          path: sdk/.toolchain
+          key: ${{ runner.os }}-bbk9588-toolchain-${{ hashFiles('sdk/scripts/setup_toolchain.ps1') }}
+
+      - name: Build BDA
+        shell: pwsh
+        run: .\scripts\build-bda.ps1
+
+      - name: Validate and checksum
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = (Resolve-Path .\sdk).Path
+          python -m bda_packer.validate .\build\bbk9588\9288SCompat.bda
+          if ($LASTEXITCODE -ne 0) {
+            throw "BDA validation failed with exit code $LASTEXITCODE"
+          }
+          $hash = (Get-FileHash `
+            -Algorithm SHA256 `
+            .\build\bbk9588\9288SCompat.bda).Hash.ToLowerInvariant()
+          "$hash *9288SCompat.bda" |
+            Set-Content `
+              .\build\bbk9588\SHA256SUMS.txt `
+              -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 9288SCompat-${{ github.ref_name }}
+          path: |
+            build/bbk9588/9288SCompat.bda
+            build/bbk9588/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag `
+              .\build\bbk9588\9288SCompat.bda `
+              .\build\bbk9588\SHA256SUMS.txt `
+              --clobber
+          } else {
+            gh release create $tag `
+              .\build\bbk9588\9288SCompat.bda `
+              .\build\bbk9588\SHA256SUMS.txt `
+              --title $tag `
+              --generate-notes
+          }

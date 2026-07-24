@@ -41,15 +41,22 @@ d300_status_t d300_parse(d300_image_t *out, const void *bytes, size_t size)
     out->resource_offset = read_u32le(data + 0xa0);
     out->resource_size = read_u32le(data + 0xa4);
 
-    if (out->declared_size != size) {
+    /*
+     * Some larger 9288S applications (notably 三国霸业) append their
+     * private asset archive after the declared D300 image.  The loader must
+     * validate the executable segments against the declared core size while
+     * retaining the physical file size so guest file I/O can reach the tail.
+     */
+    if (out->declared_size > size) {
         return D300_ERR_DECLARED_SIZE;
     }
-    if (out->header_size < 0x80 || out->header_size > size) {
+    if (out->header_size < 0x80 ||
+        out->header_size > out->declared_size) {
         return D300_ERR_HEADER;
     }
-    if (!valid_range(size, out->icon_offset, out->icon_size) ||
-        !valid_range(size, out->program_offset, out->program_size) ||
-        !valid_range(size, out->resource_offset, out->resource_size)) {
+    if (!valid_range(out->declared_size, out->icon_offset, out->icon_size) ||
+        !valid_range(out->declared_size, out->program_offset, out->program_size) ||
+        !valid_range(out->declared_size, out->resource_offset, out->resource_size)) {
         return D300_ERR_RANGE;
     }
     return D300_OK;
@@ -79,9 +86,9 @@ const char *d300_status_string(d300_status_t status)
     case D300_OK: return "ok";
     case D300_ERR_TOO_SHORT: return "too short";
     case D300_ERR_MAGIC: return "bad magic";
-    case D300_ERR_DECLARED_SIZE: return "declared size mismatch";
+    case D300_ERR_DECLARED_SIZE: return "declared size exceeds file";
     case D300_ERR_HEADER: return "invalid header";
-    case D300_ERR_RANGE: return "segment outside file";
+    case D300_ERR_RANGE: return "segment outside declared image";
     default: return "unknown";
     }
 }

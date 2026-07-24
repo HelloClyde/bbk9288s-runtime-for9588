@@ -28,7 +28,7 @@
 #define GUEST_IRAM_SIZE  0x00004000u
 #define GUEST_API_BASE   0x02000000u
 #define GUEST_API_SIZE   0x00010000u
-#define GUEST_HEAP_SIZE  0x00020000u
+#define GUEST_HEAP_SIZE  0x00080000u
 #define GUEST_CODE_BASE  0x02700000u
 #define GUEST_CODE_MIN_SIZE 0x00020000u
 #define GUEST_CODE_MAX_SIZE 0x00100000u
@@ -49,6 +49,10 @@
 #define HOST_TICK_MS     25u
 #define MAX_FILE_IO_SIZE 0x00020000u
 #define MAX_D300_FILE_SIZE 0x00400000u
+#define NATIVE_PATH_CAPACITY 320u
+#define HZK_GLYPH_SIZE     24u
+#define HZK_BASE_OFFSET    0x001a84b0u
+#define SAVED_BOX_SLOTS    8u
 
 #define VIRTUAL_ACTION_NONE     0u
 #define VIRTUAL_ACTION_UP       1u
@@ -70,6 +74,11 @@ static const char *const k_native_save_paths[5] = {
     "A:\\PIRATE5.SAV"
 };
 
+static const char *const k_sanguo_save_paths[2] = {
+    "A:\\SANGO0.SAV",
+    "A:\\SANGO1.SAV"
+};
+
 /* GBK filenames used by the original game, without the 9288S-only prefix. */
 static const char *const k_guest_save_names[5] = {
     "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xd2\xbb.sav",
@@ -89,9 +98,17 @@ typedef struct guest_message {
     u32 point_y;
 } guest_message_t;
 
+typedef struct saved_box {
+    u32 guest_buffer;
+    u32 width;
+    u32 height;
+    u16 *pixels;
+} saved_box_t;
+
 typedef struct compat_9588_state {
     c33_vm_t *vm;
     u16 *framebuffer;
+    char selected_path[NATIVE_PATH_CAPACITY];
     u32 guest_window_proc;
     u32 guest_hwnd;
     u32 parent_window_proc;
@@ -135,6 +152,10 @@ typedef struct compat_9588_state {
     u32 brush_color;
     u32 background_color;
     u32 text_color;
+    u32 legacy_font_type;
+    int hzk_file;
+    int hzk_attempted;
+    saved_box_t saved_boxes[SAVED_BOX_SLOTS];
     s32 current_x;
     s32 current_y;
     int instant_paint;
@@ -310,9 +331,76 @@ static int byte_string_contains(const char *text, const char *needle)
     return 0;
 }
 
-static const char *translate_save_path(const char *guest_path)
+static int ascii_byte_string_contains_case_insensitive(
+    const char *text,
+    const char *needle
+)
+{
+    const char *candidate;
+    if (!text || !needle || !*needle) {
+        return 0;
+    }
+    for (candidate = text; *candidate; ++candidate) {
+        const char *left = candidate;
+        const char *right = needle;
+        while (*left && *right) {
+            u8 a = (u8)*left;
+            u8 b = (u8)*right;
+            if (a >= 'A' && a <= 'Z') a = (u8)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = (u8)(b + ('a' - 'A'));
+            if (a != b) break;
+            ++left;
+            ++right;
+        }
+        if (!*right) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void copy_native_path(char *destination, const char *source)
+{
+    u32 index = 0u;
+    if (!destination) {
+        return;
+    }
+    if (source) {
+        while (source[index] && index + 1u < NATIVE_PATH_CAPACITY) {
+            destination[index] = source[index];
+            ++index;
+        }
+    }
+    destination[index] = 0;
+}
+
+static const char *translate_guest_path(
+    const compat_9588_state_t *state,
+    const char *guest_path
+)
 {
     u32 index;
+
+    /*
+     * Packed 9288S games commonly reopen their absolute installation path
+     * and read an asset archive appended to the D300 core. Map any requested
+     * EXE back to the file the user selected on the 9588.
+     */
+    if (state && state->selected_path[0] &&
+        (byte_string_contains(guest_path, ".exe") ||
+         byte_string_contains(guest_path, ".EXE"))) {
+        return state->selected_path;
+    }
+    if (ascii_byte_string_contains_case_insensitive(
+            guest_path, "sango0.sav"
+        )) {
+        return k_sanguo_save_paths[0];
+    }
+    if (ascii_byte_string_contains_case_insensitive(
+            guest_path, "sango1.sav"
+        )) {
+        return k_sanguo_save_paths[1];
+    }
     for (index = 0u; index < 5u; ++index) {
         if (byte_string_contains(guest_path, k_guest_save_names[index])) {
             return k_native_save_paths[index];
@@ -340,6 +428,13 @@ static u16 logical_color_to_rgb565(u32 color)
 }
 
 static u8 glyph_row(char ch, u32 row);
+static u8 legacy_small_glyph_row(char ch, u32 row);
+static int read_hzk_glyph(
+    compat_9588_state_t *state,
+    u8 high,
+    u8 low,
+    u8 glyph[HZK_GLYPH_SIZE]
+);
 
 static void fill_framebuffer(compat_9588_state_t *state, u16 color)
 {
@@ -440,15 +535,280 @@ static void draw_panel_text(
     }
 }
 
+static void draw_panel_hz_bitmap(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    const u8 glyph[24],
+    u16 color
+)
+{
+    u32 row;
+    for (row = 0u; row < 12u; ++row) {
+        u16 bits =
+            ((u16)glyph[row * 2u] << 8) |
+            glyph[row * 2u + 1u];
+        u32 column;
+        for (column = 0u; column < 12u; ++column) {
+            if (bits & (u16)(0x8000u >> column)) {
+                put_panel_pixel(
+                    state,
+                    x + (s32)column,
+                    y + (s32)row,
+                    color
+                );
+            }
+        }
+    }
+}
+
+static void fill_panel_rounded_rect(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u32 radius,
+    u16 color
+)
+{
+    u32 px;
+    u32 py;
+    if (!width || !height) {
+        return;
+    }
+    if (radius * 2u > width) {
+        radius = width / 2u;
+    }
+    if (radius * 2u > height) {
+        radius = height / 2u;
+    }
+    for (py = 0u; py < height; ++py) {
+        for (px = 0u; px < width; ++px) {
+            s32 dx = 0;
+            s32 dy = 0;
+            if (px < radius) {
+                dx = (s32)radius - (s32)px - 1;
+            } else if (px >= width - radius) {
+                dx = (s32)px - (s32)(width - radius);
+            }
+            if (py < radius) {
+                dy = (s32)radius - (s32)py - 1;
+            } else if (py >= height - radius) {
+                dy = (s32)py - (s32)(height - radius);
+            }
+            if (!dx || !dy ||
+                dx * dx + dy * dy <= (s32)(radius * radius)) {
+                put_panel_pixel(
+                    state, x + (s32)px, y + (s32)py, color
+                );
+            }
+        }
+    }
+}
+
+static void fill_panel_circle(
+    compat_9588_state_t *state,
+    s32 center_x,
+    s32 center_y,
+    s32 radius,
+    u16 color
+)
+{
+    s32 x;
+    s32 y;
+    for (y = -radius; y <= radius; ++y) {
+        for (x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radius * radius) {
+                put_panel_pixel(
+                    state, center_x + x, center_y + y, color
+                );
+            }
+        }
+    }
+}
+
+static int virtual_control_pressed(
+    const compat_9588_state_t *state,
+    u32 action
+)
+{
+    return state->touch_down &&
+           state->touch_region == 2u &&
+           state->virtual_action == action;
+}
+
+static void draw_rounded_key(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u32 radius,
+    u16 face,
+    u16 edge,
+    int pressed
+)
+{
+    const u16 shadow = 0x0841u;
+    s32 offset = pressed ? 2 : 0;
+    fill_panel_rounded_rect(
+        state, x, y + 2, width, height, radius, shadow
+    );
+    fill_panel_rounded_rect(
+        state, x, y + offset, width, height, radius, edge
+    );
+    if (width > 2u && height > 2u) {
+        fill_panel_rounded_rect(
+            state,
+            x + 1,
+            y + offset + 1,
+            width - 2u,
+            height - 2u,
+            radius > 1u ? radius - 1u : 0u,
+            face
+        );
+    }
+    if (!pressed && width > radius * 2u + 2u) {
+        draw_panel_line(
+            state,
+            x + (s32)radius + 1,
+            y + 1,
+            x + (s32)width - (s32)radius - 2,
+            y + 1,
+            0x8cd4u
+        );
+    }
+}
+
+static void draw_direction_arrow(
+    compat_9588_state_t *state,
+    s32 center_x,
+    s32 center_y,
+    u32 action,
+    u16 color
+)
+{
+    s32 step;
+    if (action == VIRTUAL_ACTION_UP ||
+        action == VIRTUAL_ACTION_DOWN) {
+        s32 direction =
+            action == VIRTUAL_ACTION_UP ? 1 : -1;
+        s32 tip_y =
+            center_y +
+            (action == VIRTUAL_ACTION_UP ? -6 : 6);
+        for (step = 0; step < 6; ++step) {
+            draw_panel_line(
+                state,
+                center_x - step,
+                tip_y + direction * step,
+                center_x + step,
+                tip_y + direction * step,
+                color
+            );
+        }
+        fill_panel_rect(
+            state,
+            center_x - 1,
+            center_y + (action == VIRTUAL_ACTION_UP ? 0 : -5),
+            3u,
+            6u,
+            color
+        );
+    } else {
+        s32 direction =
+            action == VIRTUAL_ACTION_LEFT ? 1 : -1;
+        s32 tip_x =
+            center_x +
+            (action == VIRTUAL_ACTION_LEFT ? -6 : 6);
+        for (step = 0; step < 6; ++step) {
+            draw_panel_line(
+                state,
+                tip_x + direction * step,
+                center_y - step,
+                tip_x + direction * step,
+                center_y + step,
+                color
+            );
+        }
+        fill_panel_rect(
+            state,
+            center_x + (action == VIRTUAL_ACTION_LEFT ? 0 : -5),
+            center_y - 1,
+            6u,
+            3u,
+            color
+        );
+    }
+}
+
+static void draw_text_action_button(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u32 action,
+    u16 face,
+    u16 pressed_face,
+    u16 edge,
+    const u8 first_glyph[24],
+    const u8 second_glyph[24]
+)
+{
+    int pressed = virtual_control_pressed(state, action);
+    s32 offset = pressed ? 2 : 0;
+    s32 text_x = x + ((s32)width - 24) / 2;
+    s32 text_y = y + ((s32)height - 12) / 2 + offset;
+    draw_rounded_key(
+        state,
+        x,
+        y,
+        width,
+        height,
+        8u,
+        pressed ? pressed_face : face,
+        edge,
+        pressed
+    );
+    draw_panel_hz_bitmap(
+        state, text_x, text_y, first_glyph, 0xef9eu
+    );
+    draw_panel_hz_bitmap(
+        state, text_x + 12, text_y, second_glyph, 0xef9eu
+    );
+}
+
 static void draw_virtual_controls(compat_9588_state_t *state)
 {
-    const u16 background = 0x18c3u;
-    const u16 panel = 0x3186u;
-    const u16 edge = 0x7befu;
-    const u16 ink = 0xffffu;
-    s32 dpad_x = state->controls_left ? 20 : 140;
-    s32 confirm_x = state->controls_left ? 138 : 8;
-    s32 back_x = state->controls_left ? 194 : 64;
+    static const u8 cancel_first[24] = {
+        0x00,0x00,0xfc,0x00,0x4b,0xc0,0x49,0x40,
+        0x79,0x40,0x49,0x40,0x79,0x40,0x49,0x40,
+        0x4c,0x80,0xf8,0x80,0x09,0x40,0x0a,0x20
+    };
+    static const u8 cancel_second[24] = {
+        0x01,0x00,0x49,0x20,0x25,0x40,0x01,0x00,
+        0x8f,0xe0,0x48,0x20,0x0f,0xe0,0x08,0x20,
+        0x2f,0xe0,0x48,0x20,0x88,0x20,0x08,0x60
+    };
+    static const u8 confirm_first[24] = {
+        0x02,0x00,0xf3,0xc0,0x24,0x40,0x20,0x80,
+        0x47,0xe0,0x75,0x20,0xd7,0xe0,0x55,0x20,
+        0x57,0xe0,0x75,0x20,0x55,0x20,0x08,0x60
+    };
+    static const u8 confirm_second[24] = {
+        0x08,0x00,0x04,0x00,0xff,0xe0,0x80,0x20,
+        0x00,0x00,0xff,0xe0,0x04,0x00,0x24,0x00,
+        0x27,0xc0,0x24,0x00,0x54,0x00,0x8f,0xe0
+    };
+    const u16 background = 0x10a2u;
+    const u16 surface = 0x2146u;
+    const u16 surface_pressed = 0x31a8u;
+    const u16 edge = 0x530du;
+    const u16 ink = 0xef9eu;
+    const u16 muted = 0xad97u;
+    const s32 dpad_x = 78;
+    int pressed;
 
     fill_panel_rect(
         state, 0, 0, GAME_VIEW_X, GAME_VIEW_H,
@@ -467,71 +827,139 @@ static void draw_virtual_controls(compat_9588_state_t *state)
         background
     );
     draw_panel_line(
-        state, 0, BOTTOM_BAR_TOP, SCREEN_W - 1, BOTTOM_BAR_TOP, edge
-    );
-    draw_panel_line(
-        state, GAME_VIEW_X, 0, GAME_VIEW_X, GAME_VIEW_H - 1, edge
+        state, 0, BOTTOM_BAR_TOP, SCREEN_W - 1, BOTTOM_BAR_TOP, 0x0841u
     );
     draw_panel_line(
         state,
+        GAME_VIEW_X,
+        BOTTOM_BAR_TOP + 1,
         GAME_VIEW_X + GAME_VIEW_W - 1,
-        0,
-        GAME_VIEW_X + GAME_VIEW_W - 1,
-        GAME_VIEW_H - 1,
+        BOTTOM_BAR_TOP + 1,
         edge
+    );
+    draw_panel_line(
+        state, GAME_VIEW_X - 1, 0, GAME_VIEW_X - 1, GAME_VIEW_H - 1,
+        0x0841u
+    );
+    draw_panel_line(
+        state,
+        GAME_VIEW_X + GAME_VIEW_W,
+        0,
+        GAME_VIEW_X + GAME_VIEW_W,
+        GAME_VIEW_H - 1,
+        0x0841u
     );
 
     /* Side function buttons leave the 160x240 guest view untouched. */
-    fill_panel_rect(state, 2, 82, 36, 52, panel);
-    draw_panel_line(state, 2, 82, 37, 82, edge);
-    draw_panel_line(state, 2, 133, 37, 133, edge);
-    draw_panel_line(state, 2, 82, 2, 133, edge);
-    draw_panel_line(state, 37, 82, 37, 133, edge);
-    draw_panel_text(state, 11, 105, "EXE", ink);
-
-    fill_panel_rect(state, 202, 82, 36, 52, panel);
-    draw_panel_line(state, 202, 82, 237, 82, edge);
-    draw_panel_line(state, 202, 133, 237, 133, edge);
-    draw_panel_line(state, 202, 82, 202, 133, edge);
-    draw_panel_line(state, 237, 82, 237, 133, edge);
-    draw_panel_text(state, 211, 105, "SET", ink);
-
-    /* Bottom virtual controls. Settings swaps left/right handed placement. */
-    fill_panel_rect(state, dpad_x + 28, 242, 28, 24, panel);
-    fill_panel_rect(state, dpad_x, 266, 28, 28, panel);
-    fill_panel_rect(state, dpad_x + 28, 266, 28, 28, panel);
-    fill_panel_rect(state, dpad_x + 56, 266, 28, 28, panel);
-    fill_panel_rect(state, dpad_x + 28, 294, 28, 24, panel);
-    draw_panel_line(
-        state, dpad_x + 42, 246, dpad_x + 34, 260, ink
+    pressed = virtual_control_pressed(
+        state, VIRTUAL_ACTION_SELECT
     );
-    draw_panel_line(
-        state, dpad_x + 42, 246, dpad_x + 50, 260, ink
+    draw_rounded_key(
+        state, 4, 84, 32u, 48u, 5u,
+        pressed ? surface_pressed : surface,
+        edge,
+        pressed
     );
-    draw_panel_line(
-        state, dpad_x + 4, 280, dpad_x + 18, 272, ink
+    fill_panel_rounded_rect(
+        state, 13, 89 + (pressed ? 2 : 0), 14u, 3u, 1u,
+        0x2697u
     );
-    draw_panel_line(
-        state, dpad_x + 4, 280, dpad_x + 18, 288, ink
-    );
-    draw_panel_line(
-        state, dpad_x + 80, 280, dpad_x + 66, 272, ink
-    );
-    draw_panel_line(
-        state, dpad_x + 80, 280, dpad_x + 66, 288, ink
-    );
-    draw_panel_line(
-        state, dpad_x + 42, 314, dpad_x + 34, 300, ink
-    );
-    draw_panel_line(
-        state, dpad_x + 42, 314, dpad_x + 50, 300, ink
+    draw_panel_text(
+        state, 11, 105 + (pressed ? 2 : 0), "EXE", ink
     );
 
-    /* Confirm/back buttons. */
-    fill_panel_rect(state, confirm_x, 246, 38, 32, 0x03efu);
-    fill_panel_rect(state, back_x, 286, 38, 32, 0xc986u);
-    draw_panel_text(state, confirm_x + 16, 258, "A", ink);
-    draw_panel_text(state, back_x + 16, 298, "B", ink);
+    pressed = virtual_control_pressed(
+        state, VIRTUAL_ACTION_SETTINGS
+    );
+    draw_rounded_key(
+        state, 204, 84, 32u, 48u, 5u,
+        pressed ? surface_pressed : surface,
+        edge,
+        pressed
+    );
+    fill_panel_rounded_rect(
+        state, 213, 89 + (pressed ? 2 : 0), 14u, 3u, 1u,
+        0xe549u
+    );
+    draw_panel_text(
+        state, 211, 105 + (pressed ? 2 : 0), "SET", ink
+    );
+
+    /* Bottom virtual controls follow the 9288S learning-device layout. */
+    pressed = virtual_control_pressed(state, VIRTUAL_ACTION_UP);
+    draw_rounded_key(
+        state, dpad_x + 29, 243, 26u, 22u, 6u,
+        pressed ? surface_pressed : surface, edge, pressed
+    );
+    draw_direction_arrow(
+        state, dpad_x + 42, 254 + (pressed ? 2 : 0),
+        VIRTUAL_ACTION_UP, pressed ? 0x2697u : muted
+    );
+
+    pressed = virtual_control_pressed(state, VIRTUAL_ACTION_LEFT);
+    draw_rounded_key(
+        state, dpad_x + 1, 267, 26u, 26u, 6u,
+        pressed ? surface_pressed : surface, edge, pressed
+    );
+    draw_direction_arrow(
+        state, dpad_x + 14, 280 + (pressed ? 2 : 0),
+        VIRTUAL_ACTION_LEFT, pressed ? 0x2697u : muted
+    );
+
+    fill_panel_circle(
+        state, dpad_x + 42, 280, 10, 0x0841u
+    );
+    fill_panel_circle(
+        state, dpad_x + 42, 280, 7, 0x31a8u
+    );
+
+    pressed = virtual_control_pressed(state, VIRTUAL_ACTION_RIGHT);
+    draw_rounded_key(
+        state, dpad_x + 57, 267, 26u, 26u, 6u,
+        pressed ? surface_pressed : surface, edge, pressed
+    );
+    draw_direction_arrow(
+        state, dpad_x + 70, 280 + (pressed ? 2 : 0),
+        VIRTUAL_ACTION_RIGHT, pressed ? 0x2697u : muted
+    );
+
+    pressed = virtual_control_pressed(state, VIRTUAL_ACTION_DOWN);
+    draw_rounded_key(
+        state, dpad_x + 29, 295, 26u, 21u, 6u,
+        pressed ? surface_pressed : surface, edge, pressed
+    );
+    draw_direction_arrow(
+        state, dpad_x + 42, 305 + (pressed ? 2 : 0),
+        VIRTUAL_ACTION_DOWN, pressed ? 0x2697u : muted
+    );
+
+    /* Text actions replace game-console-style A/B buttons. */
+    draw_text_action_button(
+        state,
+        4,
+        263,
+        56u,
+        44u,
+        VIRTUAL_ACTION_BACK,
+        surface,
+        surface_pressed,
+        0x9987u,
+        cancel_first,
+        cancel_second
+    );
+    draw_text_action_button(
+        state,
+        180,
+        263,
+        56u,
+        44u,
+        VIRTUAL_ACTION_CONFIRM,
+        0x0d32u,
+        0x0badu,
+        0x2697u,
+        confirm_first,
+        confirm_second
+    );
 }
 
 static void put_guest_pixel(
@@ -576,6 +1004,117 @@ static void fill_guest_rect(
             );
         }
     }
+}
+
+static saved_box_t *find_saved_box(
+    compat_9588_state_t *state,
+    u32 guest_buffer,
+    int create
+)
+{
+    saved_box_t *empty = 0;
+    u32 index;
+    for (index = 0u; index < SAVED_BOX_SLOTS; ++index) {
+        saved_box_t *box = &state->saved_boxes[index];
+        if (box->pixels && box->guest_buffer == guest_buffer) {
+            return box;
+        }
+        if (!box->pixels && !empty) {
+            empty = box;
+        }
+    }
+    if (create) {
+        if (empty) {
+            return empty;
+        }
+        /*
+         * The game uses these buffers as a short-lived stack. If all cache
+         * slots are occupied, recycle the oldest slot deterministically.
+         */
+        bda_free(state->saved_boxes[0].pixels);
+        bda_memset(
+            &state->saved_boxes[0], 0, sizeof(state->saved_boxes[0])
+        );
+        return &state->saved_boxes[0];
+    }
+    return 0;
+}
+
+static int save_guest_box(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height,
+    u32 guest_buffer
+)
+{
+    saved_box_t *box;
+    u32 pixel_count;
+    u32 row;
+    if (!guest_buffer || !width || !height ||
+        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H ||
+        width > GUEST_SCREEN_W - x ||
+        height > GUEST_SCREEN_H - y) {
+        return 0;
+    }
+    pixel_count = width * height;
+    box = find_saved_box(state, guest_buffer, 1);
+    if (!box) {
+        return 0;
+    }
+    if (box->pixels &&
+        (box->width != width || box->height != height)) {
+        bda_free(box->pixels);
+        box->pixels = 0;
+    }
+    if (!box->pixels) {
+        box->pixels = (u16 *)bda_alloc(pixel_count * sizeof(u16));
+        if (allocation_failed(box->pixels)) {
+            box->pixels = 0;
+            return 0;
+        }
+    }
+    box->guest_buffer = guest_buffer;
+    box->width = width;
+    box->height = height;
+    for (row = 0u; row < height; ++row) {
+        bda_memcpy(
+            box->pixels + row * width,
+            state->framebuffer +
+                (y + row) * SCREEN_W + GAME_VIEW_X + x,
+            width * sizeof(u16)
+        );
+    }
+    return 1;
+}
+
+static int restore_guest_box(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height,
+    u32 guest_buffer
+)
+{
+    saved_box_t *box = find_saved_box(state, guest_buffer, 0);
+    u32 row;
+    if (!box || box->width != width || box->height != height ||
+        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H ||
+        width > GUEST_SCREEN_W - x ||
+        height > GUEST_SCREEN_H - y) {
+        return 0;
+    }
+    for (row = 0u; row < height; ++row) {
+        bda_memcpy(
+            state->framebuffer +
+                (y + row) * SCREEN_W + GAME_VIEW_X + x,
+            box->pixels + row * width,
+            width * sizeof(u16)
+        );
+    }
+    return 1;
 }
 
 static void render_listbox_selection(compat_9588_state_t *state)
@@ -705,6 +1244,410 @@ static int draw_packed_2bpp(
     return 1;
 }
 
+static int legacy_blit_virtual_2bpp(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height,
+    u32 picture,
+    u32 virtual_screen,
+    u32 mode
+)
+{
+    c33_vm_t *vm = state->vm;
+    u32 source_stride;
+    u32 source_width = width;
+    u32 row;
+    u8 source[40];
+    u8 destination[40];
+
+    if (!virtual_screen || !width || !height ||
+        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
+        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H) {
+        return 0;
+    }
+    /*
+     * The 9288S SysShowPicV clips at the virtual-screen edge. 三国霸业
+     * deliberately draws a 160-pixel strip at x=2, so preserve the source
+     * row stride while discarding the two off-screen destination pixels.
+     */
+    if (width > GUEST_SCREEN_W - x) {
+        width = GUEST_SCREEN_W - x;
+    }
+    if (height > GUEST_SCREEN_H - y) {
+        height = GUEST_SCREEN_H - y;
+    }
+    source_stride = (source_width + 3u) / 4u;
+    if (source_stride > sizeof(source)) {
+        return 0;
+    }
+    for (row = 0u; row < height; ++row) {
+        u32 column;
+        u32 destination_address =
+            virtual_screen + (y + row) * (GUEST_SCREEN_W / 4u);
+        if (mode != 4u &&
+            !c33_vm_read(
+                vm,
+                picture + row * source_stride,
+                source,
+                source_stride
+            )) {
+            vm->fault_address = picture + row * source_stride;
+            return 0;
+        }
+        /*
+         * Most 三国霸业 assets are four-pixel-aligned tiles, including its
+         * 160x240 frames. Keep those operations byte-wise; doing a VM memory
+         * access and branch for every individual pixel makes the intro run
+         * hundreds of times slower under the 9588 CPU emulator.
+         */
+        if ((x & 3u) == 0u && (width & 3u) == 0u) {
+            u32 first_byte = x / 4u;
+            if (mode == 0u && x == 0u && width == GUEST_SCREEN_W) {
+                if (!c33_vm_write(
+                        vm,
+                        destination_address,
+                        source,
+                        source_stride
+                    )) {
+                    vm->fault_address = destination_address;
+                    return 0;
+                }
+                continue;
+            }
+            if (!c33_vm_read(
+                    vm,
+                    destination_address,
+                    destination,
+                    sizeof(destination)
+                )) {
+                vm->fault_address = destination_address;
+                return 0;
+            }
+            for (column = 0u; column < source_stride; ++column) {
+                u8 *destination_byte =
+                    &destination[first_byte + column];
+                if (mode == 1u) {
+                    *destination_byte &= source[column];
+                } else if (mode == 2u) {
+                    *destination_byte |= source[column];
+                } else if (mode == 3u) {
+                    *destination_byte ^= source[column];
+                } else if (mode == 4u) {
+                    *destination_byte = 0xffu;
+                } else {
+                    *destination_byte = source[column];
+                }
+            }
+            if (!c33_vm_write(
+                    vm,
+                    destination_address,
+                    destination,
+                    sizeof(destination)
+                )) {
+                vm->fault_address = destination_address;
+                return 0;
+            }
+            continue;
+        }
+        if (!c33_vm_read(
+                vm,
+                destination_address,
+                destination,
+                sizeof(destination)
+            )) {
+            vm->fault_address = destination_address;
+            return 0;
+        }
+        for (column = 0u; column < width; ++column) {
+            u32 destination_x = x + column;
+            u32 source_shift = 6u - ((column & 3u) * 2u);
+            u32 destination_shift =
+                6u - ((destination_x & 3u) * 2u);
+            u32 source_pixel =
+                mode == 4u ? 3u :
+                (source[column / 4u] >> source_shift) & 3u;
+            u8 *destination_byte =
+                &destination[destination_x / 4u];
+            u32 destination_pixel =
+                (*destination_byte >> destination_shift) & 3u;
+            u32 output_pixel;
+
+            if (mode == 1u) {
+                output_pixel = destination_pixel & source_pixel;
+            } else if (mode == 2u) {
+                output_pixel = destination_pixel | source_pixel;
+            } else if (mode == 3u) {
+                output_pixel = destination_pixel ^ source_pixel;
+            } else {
+                output_pixel = source_pixel;
+            }
+            *destination_byte =
+                (u8)((*destination_byte &
+                      (u8)~(u8)(3u << destination_shift)) |
+                     (u8)(output_pixel << destination_shift));
+        }
+        if (!c33_vm_write(
+                vm,
+                destination_address,
+                destination,
+                sizeof(destination)
+            )) {
+            vm->fault_address = destination_address;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int legacy_blit_screen_2bpp(
+    compat_9588_state_t *state,
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height,
+    u32 picture,
+    u32 mode
+)
+{
+    static const u16 gray_palette[4] = {
+        0x0000u, 0x52aau, 0xad55u, 0xffffu
+    };
+    c33_vm_t *vm = state->vm;
+    u32 row_bytes;
+    u32 row;
+    u8 packed[40];
+
+    if (!picture || !width || !height ||
+        width > GUEST_SCREEN_W ||
+        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H ||
+        width > GUEST_SCREEN_W - x ||
+        height > GUEST_SCREEN_H - y) {
+        return 0;
+    }
+    /*
+     * 9288S picture and virtual-screen buffers both use four-level grayscale:
+     * four pixels per byte, most-significant pair first.
+     */
+    row_bytes = (width + 3u) / 4u;
+    for (row = 0u; row < height; ++row) {
+        u32 column;
+        u32 address = picture + row * row_bytes;
+        if (!c33_vm_read(vm, address, packed, row_bytes)) {
+            vm->fault_address = address;
+            return 0;
+        }
+        for (column = 0u; column < width; ++column) {
+            u32 shift = 6u - ((column & 3u) * 2u);
+            u32 source = (packed[column / 4u] >> shift) & 3u;
+            u16 *destination =
+                state->framebuffer +
+                (y + row) * SCREEN_W + GAME_VIEW_X + x + column;
+            u32 output = source;
+            if (mode == 4u) {
+                output = 3u;
+            }
+            *destination = gray_palette[output];
+        }
+    }
+    return 1;
+}
+
+static int legacy_write_virtual_pixel_2bpp(
+    compat_9588_state_t *state,
+    u32 virtual_screen,
+    s32 x,
+    s32 y,
+    int set
+)
+{
+    u32 address;
+    u8 value;
+    u32 shift;
+    if (!virtual_screen ||
+        x < 0 || y < 0 ||
+        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H) {
+        return 1;
+    }
+    address =
+        virtual_screen +
+        (u32)y * (GUEST_SCREEN_W / 4u) +
+        (u32)x / 4u;
+    shift = 6u - (((u32)x & 3u) * 2u);
+    if (!c33_vm_read(state->vm, address, &value, 1u)) {
+        state->vm->fault_address = address;
+        return 0;
+    }
+    /*
+     * The 9288S packed grayscale convention is 0=black and 3=white.
+     * Glyph helpers receive a monochrome mask, so write black ink on a
+     * white cell instead of relying on the previously inverted palette.
+     */
+    value =
+        (u8)((value & (u8)~(u8)(3u << shift)) |
+             (u8)((set ? 0u : 3u) << shift));
+    if (!c33_vm_write(state->vm, address, &value, 1u)) {
+        state->vm->fault_address = address;
+        return 0;
+    }
+    return 1;
+}
+
+static int legacy_draw_ascii_virtual(
+    compat_9588_state_t *state,
+    u32 virtual_screen,
+    s32 x,
+    s32 y,
+    u8 character
+)
+{
+    u32 row;
+    for (row = 0u; row < 12u; ++row) {
+        u8 bits = legacy_small_glyph_row((char)character, row);
+        u32 column;
+        for (column = 0u; column < 5u; ++column) {
+            if (!legacy_write_virtual_pixel_2bpp(
+                    state,
+                    virtual_screen,
+                    x + (s32)column,
+                    y + (s32)row,
+                    (bits & (1u << (4u - column))) != 0u
+                )) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int legacy_draw_hz_virtual(
+    compat_9588_state_t *state,
+    u32 virtual_screen,
+    s32 x,
+    s32 y,
+    u8 high,
+    u8 low
+)
+{
+    u8 glyph[HZK_GLYPH_SIZE];
+    u32 row;
+    if (!read_hzk_glyph(state, high, low, glyph)) {
+        return 1;
+    }
+    for (row = 0u; row < 12u; ++row) {
+        u16 bits =
+            ((u16)glyph[row * 2u] << 8) |
+            glyph[row * 2u + 1u];
+        u32 column;
+        for (column = 0u; column < 12u; ++column) {
+            if (!legacy_write_virtual_pixel_2bpp(
+                    state,
+                    virtual_screen,
+                    x + (s32)column,
+                    y + (s32)row,
+                    (bits & (u16)(0x8000u >> column)) != 0u
+                )) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int legacy_print_string_virtual(
+    compat_9588_state_t *state,
+    u32 virtual_screen,
+    s32 x,
+    s32 y,
+    u32 guest_string
+)
+{
+    u32 index;
+    s32 cursor_x = x;
+    for (index = 0u; index < 256u;) {
+        u8 ch;
+        if (!c33_vm_read(
+                state->vm, guest_string + index, &ch, 1u
+            )) {
+            return 0;
+        }
+        if (!ch) {
+            return 1;
+        }
+        if (ch == '\r' || ch == '\n') {
+            cursor_x = x;
+            y += 12;
+            ++index;
+            continue;
+        }
+        if (ch >= 0x80u) {
+            u8 low;
+            if (!c33_vm_read(
+                    state->vm, guest_string + index + 1u, &low, 1u
+                ) ||
+                !legacy_draw_hz_virtual(
+                    state, virtual_screen, cursor_x, y, ch, low
+                )) {
+                return 0;
+            }
+            cursor_x += 12;
+            index += 2u;
+        } else {
+            if (!legacy_draw_ascii_virtual(
+                    state, virtual_screen, cursor_x, y, ch
+                )) {
+                return 0;
+            }
+            cursor_x += ch == ' ' ? 4 : 6;
+            ++index;
+        }
+    }
+    return 1;
+}
+
+static int legacy_present_virtual_2bpp(
+    compat_9588_state_t *state,
+    u32 virtual_screen
+)
+{
+    static const u16 gray_palette[4] = {
+        0x0000u, 0x52aau, 0xad55u, 0xffffu
+    };
+    c33_vm_t *vm = state->vm;
+    u32 row;
+    u8 packed[40];
+
+    if (!virtual_screen) {
+        return 0;
+    }
+    for (row = 0u; row < GUEST_SCREEN_H; ++row) {
+        u32 source_byte;
+        u32 address =
+            virtual_screen + row * (GUEST_SCREEN_W / 4u);
+        u16 *output =
+            state->framebuffer + row * SCREEN_W + GAME_VIEW_X;
+        if (!c33_vm_read(vm, address, packed, sizeof(packed))) {
+            vm->fault_address = address;
+            return 0;
+        }
+        for (source_byte = 0u;
+             source_byte < sizeof(packed);
+             ++source_byte) {
+            u8 bits = packed[source_byte];
+            u16 *pixels = output + source_byte * 4u;
+            pixels[0] = gray_palette[(bits >> 6) & 3u];
+            pixels[1] = gray_palette[(bits >> 4) & 3u];
+            pixels[2] = gray_palette[(bits >> 2) & 3u];
+            pixels[3] = gray_palette[bits & 3u];
+        }
+    }
+    if (!state->instant_paint) {
+        present_framebuffer(state);
+    }
+    return 1;
+}
+
 static void draw_line(
     compat_9588_state_t *state,
     s32 x0,
@@ -792,54 +1735,245 @@ static u8 glyph_row(char ch, u32 row)
     return 0;
 }
 
+static u8 legacy_small_glyph_row(char ch, u32 row)
+{
+    /*
+     * Font type 0 on the 9288S is a 6x12 ASCII cell.  These digit rows are
+     * the original bitmaps from the 9288S HZK library; the visible glyph is
+     * five pixels wide with one pixel of character spacing.
+     */
+    static const u8 digits[10][12] = {
+        {0,0,14,17,17,17,17,17,17,14,0,0},
+        {0,0,12,4,4,4,4,4,4,31,0,0},
+        {0,0,14,17,1,2,4,8,17,31,0,0},
+        {0,0,14,17,1,6,1,1,17,14,0,0},
+        {0,0,6,10,10,18,18,31,2,7,0,0},
+        {0,0,15,8,8,14,1,1,17,14,0,0},
+        {0,0,7,8,16,30,17,17,17,14,0,0},
+        {0,0,31,17,1,2,2,2,4,4,0,0},
+        {0,0,14,17,17,14,17,17,17,14,0,0},
+        {0,0,14,17,17,17,15,1,2,28,0,0}
+    };
+    if (row >= 12u) return 0u;
+    if (ch >= '0' && ch <= '9') {
+        return digits[ch - '0'][row];
+    }
+    if (row < 2u || row >= 9u) {
+        return 0u;
+    }
+    return glyph_row(ch, row - 2u);
+}
+
+static int read_hzk_glyph(
+    compat_9588_state_t *state,
+    u8 high,
+    u8 low,
+    u8 glyph[HZK_GLYPH_SIZE]
+)
+{
+    u32 index;
+    u32 offset;
+    int count;
+
+    if (high < 0xa1u || high > 0xf7u ||
+        low < 0x40u || low == 0x7fu || low == 0xffu) {
+        return 0;
+    }
+    if (!state->hzk_attempted) {
+        state->hzk_attempted = 1;
+        state->hzk_file = bda_fs_fopen_raw(
+            "A:\\\xcf\xb5\xcd\xb3\\\xca\xfd\xbe\xdd\\HZK_LIB.BIN",
+            "rb"
+        );
+        if (!bda_fs_file_is_valid(state->hzk_file)) {
+            state->hzk_file = bda_fs_fopen_raw(
+                "/\xcf\xb5\xcd\xb3/\xca\xfd\xbe\xdd/HZK_LIB.BIN",
+                "rb"
+            );
+        }
+    }
+    if (!bda_fs_file_is_valid(state->hzk_file)) {
+        return 0;
+    }
+
+    index =
+        (u32)high * 190u + (u32)low -
+        (low < 0x80u ? 0x5ffeu : 0x5fffu);
+    offset = HZK_BASE_OFFSET + index * HZK_GLYPH_SIZE;
+    /*
+     * Unlike ISO C fseek(), the verified 9588 SDK returns the new absolute
+     * position on success.  HZK glyphs all live at non-zero offsets.
+     */
+    if (bda_fs_seek_raw(state->hzk_file, (s32)offset, BDA_SEEK_SET) !=
+        (int)offset) {
+        return 0;
+    }
+    count = bda_fs_fread_raw(
+        glyph, 1u, HZK_GLYPH_SIZE, state->hzk_file
+    );
+    return count == (int)HZK_GLYPH_SIZE;
+}
+
+static void put_guest_text_pixel(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 color,
+    s32 clip_left,
+    s32 clip_top,
+    s32 clip_right,
+    s32 clip_bottom
+)
+{
+    if (x >= clip_left && x < clip_right &&
+        y >= clip_top && y < clip_bottom) {
+        put_guest_pixel(state, x, y, color);
+    }
+}
+
 static void draw_guest_text(
     compat_9588_state_t *state,
     s32 x,
     s32 y,
     u32 guest_text,
-    s32 length
+    s32 length,
+    s32 clip_left,
+    s32 clip_top,
+    s32 clip_right,
+    s32 clip_bottom
 )
 {
     u32 index;
-    u32 limit = length < 0 ? 32u : (u32)length;
-    if (limit > 32u) limit = 32u;
-    for (index = 0; index < limit; ++index) {
+    u32 limit = length < 0 ? 512u : (u32)length;
+    s32 cursor_x = x;
+    s32 cursor_y = y;
+    int small_font = state->legacy_font_type == 0u;
+    if (limit > 512u) limit = 512u;
+    for (index = 0; index < limit;) {
         u8 ch;
-        u32 row;
         if (!c33_vm_read(state->vm, guest_text + index, &ch, 1u) || !ch) {
             break;
         }
-        for (row = 0; row < 7u; ++row) {
-            u8 bits = glyph_row((char)ch, row);
-            u32 column;
-            for (column = 0; column < 5u; ++column) {
-                if (bits & (1u << (4u - column))) {
-                    put_guest_pixel(
-                        state,
-                        x + (s32)(index * 12u + column * 2u),
-                        y + (s32)(row * 2u),
-                        state->text_color
-                    );
-                    put_guest_pixel(
-                        state,
-                        x + (s32)(index * 12u + column * 2u + 1u),
-                        y + (s32)(row * 2u),
-                        state->text_color
-                    );
-                    put_guest_pixel(
-                        state,
-                        x + (s32)(index * 12u + column * 2u),
-                        y + (s32)(row * 2u + 1u),
-                        state->text_color
-                    );
-                    put_guest_pixel(
-                        state,
-                        x + (s32)(index * 12u + column * 2u + 1u),
-                        y + (s32)(row * 2u + 1u),
-                        state->text_color
-                    );
+        if (ch == '\r' || ch == '\n') {
+            u8 next = 0u;
+            if (ch == '\r' && index + 1u < limit) {
+                (void)c33_vm_read(
+                    state->vm, guest_text + index + 1u, &next, 1u
+                );
+            }
+            index += next == '\n' ? 2u : 1u;
+            cursor_x = x;
+            cursor_y += small_font ? 12 : 15;
+            if (cursor_y >= clip_bottom) {
+                break;
+            }
+            continue;
+        }
+        if (ch >= 0x80u && index + 1u < limit) {
+            u8 low;
+            u8 glyph[HZK_GLYPH_SIZE];
+            if (!c33_vm_read(
+                    state->vm, guest_text + index + 1u, &low, 1u
+                )) {
+                break;
+            }
+            if (read_hzk_glyph(state, ch, low, glyph)) {
+                u32 row;
+                for (row = 0u; row < 12u; ++row) {
+                    u16 bits =
+                        ((u16)glyph[row * 2u] << 8) |
+                        glyph[row * 2u + 1u];
+                    u32 column;
+                    u32 width = small_font ? 12u : 16u;
+                    for (column = 0u; column < width; ++column) {
+                        if (bits & (u16)(0x8000u >> column)) {
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)column,
+                                cursor_y + (s32)row,
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                        }
+                    }
                 }
             }
+            cursor_x += small_font ? 12 : 16;
+            index += 2u;
+            continue;
+        }
+        {
+            u32 row;
+            u32 row_count = small_font ? 12u : 7u;
+            u32 advance = small_font ? 6u : (ch == ' ' ? 6u : 12u);
+            for (row = 0; row < row_count; ++row) {
+                u8 bits = small_font
+                    ? legacy_small_glyph_row((char)ch, row)
+                    : glyph_row((char)ch, row);
+                u32 column;
+                for (column = 0; column < 5u; ++column) {
+                    if (bits & (1u << (4u - column))) {
+                        if (small_font) {
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)column,
+                                cursor_y + (s32)row,
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                        } else {
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)(column * 2u),
+                                cursor_y + (s32)(row * 2u),
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)(column * 2u + 1u),
+                                cursor_y + (s32)(row * 2u),
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)(column * 2u),
+                                cursor_y + (s32)(row * 2u + 1u),
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                            put_guest_text_pixel(
+                                state,
+                                cursor_x + (s32)(column * 2u + 1u),
+                                cursor_y + (s32)(row * 2u + 1u),
+                                state->text_color,
+                                clip_left,
+                                clip_top,
+                                clip_right,
+                                clip_bottom
+                            );
+                        }
+                    }
+                }
+            }
+            cursor_x += (s32)advance;
+            ++index;
         }
     }
     if (!state->instant_paint) {
@@ -955,9 +2089,8 @@ static u32 virtual_action_at(
     u32 y
 )
 {
-    s32 dpad_x = state->controls_left ? 20 : 140;
-    s32 confirm_x = state->controls_left ? 138 : 8;
-    s32 back_x = state->controls_left ? 194 : 64;
+    const s32 dpad_x = 78;
+    (void)state;
 
     if (x >= 2u && x < 38u && y >= 82u && y < 134u) {
         return VIRTUAL_ACTION_SELECT;
@@ -981,13 +2114,12 @@ static u32 virtual_action_at(
         y >= 294u && y < 318u) {
         return VIRTUAL_ACTION_DOWN;
     }
-    if ((s32)x >= confirm_x && (s32)x < confirm_x + 38 &&
-        y >= 246u && y < 278u) {
-        return VIRTUAL_ACTION_CONFIRM;
-    }
-    if ((s32)x >= back_x && (s32)x < back_x + 38 &&
-        y >= 286u && y < 318u) {
+    if (x >= 4u && x < 60u && y >= 263u && y < 309u) {
         return VIRTUAL_ACTION_BACK;
+    }
+    if (x >= 180u && x < 236u &&
+        y >= 263u && y < 309u) {
+        return VIRTUAL_ACTION_CONFIRM;
     }
     return VIRTUAL_ACTION_NONE;
 }
@@ -1199,6 +2331,7 @@ static void service_hardware_input(compat_9588_state_t *state)
         if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY && down) {
             u32 scancode = translate_native_key_value(key_code);
             if (scancode) {
+                int queued;
                 if (state->parent_hwnd && state->listbox_item_count) {
                     if (scancode == COMPAT_SCANCODE_UP &&
                         state->listbox_caret > 0u) {
@@ -1209,13 +2342,18 @@ static void service_hardware_input(compat_9588_state_t *state)
                         state->listbox_caret++;
                     }
                 }
-                queue_message(
+                queued = queue_message(
                     state,
                     state->guest_hwnd,
                     COMPAT_MSG_KEYDOWN,
                     scancode,
                     0u
                 );
+                g_diagnostic[10] = (u32)(queued != 0);
+                g_diagnostic[11] = state->event_count;
+                g_diagnostic[12] = scancode;
+                g_diagnostic[13] = scancode;
+                g_diagnostic[14] = scancode;
                 g_diagnostic[15] += 1u;
             }
         }
@@ -1409,7 +2547,7 @@ static c33_vm_status_t dispatch_9588_fs(
                 )) {
                 return C33_VM_FAULT;
             }
-            native_path = translate_save_path(guest_path);
+            native_path = translate_guest_path(state, guest_path);
             vm->regs[4] = (u32)bda_fs_fopen_raw(native_path, mode);
             return C33_VM_OK;
         }
@@ -1524,7 +2662,7 @@ static c33_vm_status_t dispatch_9588_fs(
                 (void)bda_fs_findclose(&state->native_find_data);
                 state->native_find_open = 0;
             }
-            native_path = translate_save_path(guest_path);
+            native_path = translate_guest_path(state, guest_path);
             bda_fs_find_data_init(&state->native_find_data);
             result = bda_fs_findfirst(
                 native_path,
@@ -1692,18 +2830,31 @@ static c33_vm_status_t dispatch_9588(
         return C33_VM_OK;
     case COMPAT_GUI_DISPATCH_MESSAGE:
         {
+            c33_vm_status_t status;
             guest_message_t event;
             if (!read_guest_message(vm, vm->regs[6], &event)) {
                 vm->fault_address = vm->regs[6];
                 return C33_VM_FAULT;
             }
-            return call_guest_window_proc(
+            if (event.message == COMPAT_MSG_KEYDOWN) {
+                g_diagnostic[10] = 2u;
+                g_diagnostic[11] = event.wparam;
+                g_diagnostic[12] = event.hwnd;
+                g_diagnostic[13] = event.message;
+                g_diagnostic[14] = state->guest_window_proc;
+            }
+            status = call_guest_window_proc(
                 state,
                 event.hwnd,
                 event.message,
                 event.wparam,
                 event.lparam
             );
+            if (event.message == COMPAT_MSG_KEYDOWN) {
+                g_diagnostic[10] =
+                    0x300u | ((u32)status & 0xffu);
+            }
+            return status;
         }
     case COMPAT_GUI_SET_INSTANT_PAINT:
         g_diagnostic[8] += 1u;
@@ -1837,6 +2988,19 @@ static c33_vm_status_t dispatch_9588(
         }
     case COMPAT_GUI_DEFAULT_MAIN_WIN_PROC:
     case COMPAT_GUI_MAIN_WINDOW_CLEANUP:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_INVALIDATE_RECT:
+        vm->regs[4] = queue_message(
+            state,
+            vm->regs[6],
+            COMPAT_MSG_PAINT,
+            0u,
+            0u
+        );
+        return C33_VM_OK;
+    case COMPAT_GUI_CLIENT_TO_SCREEN:
+        /* The compatibility window occupies the full 160x240 guest area. */
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_SET_TIMER:
@@ -2048,8 +3212,55 @@ static c33_vm_status_t dispatch_9588(
             return C33_VM_OK;
         }
     case COMPAT_GUI_SAVE_SCREEN_BOX:
-        vm->regs[4] = 0u;
-        return C33_VM_OK;
+        {
+            u32 guest_buffer;
+            if (!guest_read_u32(vm, vm->sp + 4u, &guest_buffer)) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = save_guest_box(
+                state,
+                vm->regs[6],
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                guest_buffer
+            ) ? 0u : 0xffffffffu;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_PUT_SAVED_BOX_ON_SCREEN:
+        {
+            u32 guest_buffer;
+            if (!guest_read_u32(vm, vm->sp + 4u, &guest_buffer)) {
+                return C33_VM_FAULT;
+            }
+            (void)restore_guest_box(
+                state,
+                vm->regs[6],
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                guest_buffer
+            );
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_FILL_BOX:
+        {
+            u32 height;
+            if (!guest_read_u32(vm, vm->sp + 4u, &height)) {
+                return C33_VM_FAULT;
+            }
+            fill_guest_rect(
+                state,
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                height,
+                state->brush_color
+            );
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_SET_RECT:
         {
             u32 bottom;
@@ -2106,7 +3317,39 @@ static c33_vm_status_t dispatch_9588(
                 (s32)vm->regs[7],
                 (s32)vm->regs[8],
                 vm->regs[9],
-                (s32)length
+                (s32)length,
+                0,
+                0,
+                GUEST_SCREEN_W,
+                GUEST_SCREEN_H
+            );
+            vm->regs[4] = 1u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_DRAW_TEXT_EX:
+        {
+            u32 left;
+            u32 top;
+            u32 right;
+            u32 bottom;
+            if (!guest_read_u32(vm, vm->regs[9] + 0u, &left) ||
+                !guest_read_u32(vm, vm->regs[9] + 4u, &top) ||
+                !guest_read_u32(vm, vm->regs[9] + 8u, &right) ||
+                !guest_read_u32(vm, vm->regs[9] + 12u, &bottom)) {
+                return C33_VM_FAULT;
+            }
+            (void)right;
+            (void)bottom;
+            draw_guest_text(
+                state,
+                (s32)left,
+                (s32)top,
+                vm->regs[7],
+                (s32)vm->regs[8],
+                (s32)left,
+                (s32)top,
+                (s32)right + 1,
+                (s32)bottom + 1
             );
             vm->regs[4] = 1u;
             return C33_VM_OK;
@@ -2140,6 +3383,17 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_SET_HDC_FONT:
+        state->legacy_font_type = vm->regs[7] & 0xffu;
+        vm->regs[4] = 3u;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_HDC_FONT:
+        vm->regs[4] = state->legacy_font_type;
+        return C33_VM_OK;
+    case COMPAT_GUI_SET_SYS_FONT:
+        state->legacy_font_type = vm->regs[6] & 0xffu;
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
     case COMPAT_GUI_CLEAR_SCREEN:
         fill_guest_rect(
             state, 0u, 0u, GUEST_SCREEN_W, GUEST_SCREEN_H, 15u
@@ -2147,6 +3401,106 @@ static c33_vm_status_t dispatch_9588(
         present_framebuffer(state);
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    case COMPAT_GUI_SHOW_PICTURE_VIRTUAL:
+        {
+            u32 picture;
+            u32 virtual_screen;
+            u32 mode;
+            if (!guest_read_u32(vm, vm->sp + 4u, &picture) ||
+                !guest_read_u32(vm, vm->sp + 8u, &virtual_screen) ||
+                !guest_read_u32(vm, vm->sp + 12u, &mode) ||
+                !legacy_blit_virtual_2bpp(
+                    state,
+                    vm->regs[6],
+                    vm->regs[7],
+                    vm->regs[8],
+                    vm->regs[9],
+                    picture,
+                    virtual_screen,
+                    mode
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = 1u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_SHOW_PICTURE_SCREEN:
+        {
+            u32 height;
+            u32 picture;
+            u32 mode;
+            if (!guest_read_u32(vm, vm->sp + 4u, &height) ||
+                !guest_read_u32(vm, vm->sp + 8u, &picture) ||
+                !guest_read_u32(vm, vm->sp + 12u, &mode) ||
+                !legacy_blit_screen_2bpp(
+                    state,
+                    vm->regs[7],
+                    vm->regs[8],
+                    vm->regs[9],
+                    height,
+                    picture,
+                    mode
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_BLIT_FRAME:
+        if (!legacy_present_virtual_2bpp(state, vm->regs[7])) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_DRAW_ASCII:
+        {
+            u32 virtual_screen;
+            if (!guest_read_u32(vm, vm->sp + 4u, &virtual_screen) ||
+                !legacy_draw_ascii_virtual(
+                    state,
+                    virtual_screen,
+                    (s32)vm->regs[7],
+                    (s32)vm->regs[8],
+                    (u8)vm->regs[9]
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_DRAW_HZ:
+        {
+            u32 virtual_screen;
+            if (!guest_read_u32(vm, vm->sp + 4u, &virtual_screen) ||
+                !legacy_draw_hz_virtual(
+                    state,
+                    virtual_screen,
+                    (s32)vm->regs[7],
+                    (s32)vm->regs[8],
+                    (u8)(vm->regs[9] >> 8),
+                    (u8)vm->regs[9]
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_PRINT_STRING:
+        {
+            u32 virtual_screen;
+            if (!guest_read_u32(vm, vm->sp + 4u, &virtual_screen) ||
+                !legacy_print_string_virtual(
+                    state,
+                    virtual_screen,
+                    (s32)vm->regs[7],
+                    (s32)vm->regs[8],
+                    vm->regs[9]
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_GET_CURRENT_DATETIME:
         {
             static const u8 time_info[8] = {
@@ -2213,7 +3567,12 @@ static void service_timer(compat_9588_state_t *state, u32 elapsed)
     }
 }
 
-static u8 *load_d300_file(const char *path, u32 *size_out)
+static u8 *load_d300_file(
+    const char *path,
+    u32 *size_out,
+    u32 *stage_out,
+    s32 *detail_out
+)
 {
     int file;
     int file_size;
@@ -2221,35 +3580,50 @@ static u8 *load_d300_file(const char *path, u32 *size_out)
     u8 *bytes;
 
     *size_out = 0u;
+    *stage_out = 1u;
+    *detail_out = 0;
     file = bda_fs_fopen_raw(path, "rb");
+    *detail_out = file;
     if (!bda_fs_file_is_valid(file)) {
         return 0;
     }
+    *stage_out = 2u;
     if (bda_fs_seek_raw(file, 0, BDA_SEEK_END) < 0) {
         (void)bda_fs_close_raw(file);
         return 0;
     }
+    *stage_out = 3u;
     file_size = bda_fs_tell_raw(file);
+    *detail_out = file_size;
     if (file_size < (int)D300_MIN_HEADER_SIZE ||
-        (u32)file_size > MAX_D300_FILE_SIZE ||
-        bda_fs_seek_raw(file, 0, BDA_SEEK_SET) < 0) {
+        (u32)file_size > MAX_D300_FILE_SIZE) {
         (void)bda_fs_close_raw(file);
         return 0;
     }
+    *stage_out = 4u;
+    if (bda_fs_seek_raw(file, 0, BDA_SEEK_SET) < 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    *stage_out = 5u;
     bytes = (u8 *)bda_alloc((u32)file_size);
+    *detail_out = (s32)(u32)bytes;
     if (allocation_failed(bytes)) {
         (void)bda_fs_close_raw(file);
         return 0;
     }
+    *stage_out = 6u;
     items_read = bda_fs_fread_raw(
         bytes, 1u, (u32)file_size, file
     );
+    *detail_out = items_read;
     (void)bda_fs_close_raw(file);
     if (items_read != file_size) {
         bda_free(bytes);
         return 0;
     }
     *size_out = (u32)file_size;
+    *stage_out = 0u;
     return bytes;
 }
 
@@ -2260,6 +3634,8 @@ static int run_selected_game(
 {
     u8 *file_bytes;
     u32 file_size;
+    u32 load_stage;
+    s32 load_detail;
     u8 *iram = 0;
     u8 *api_ram = 0;
     u8 *heap_ram = 0;
@@ -2277,9 +3653,21 @@ static int run_selected_game(
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
     *reselect_out = 0;
-    file_bytes = load_d300_file(selected_path, &file_size);
+    file_bytes = load_d300_file(
+        selected_path, &file_size, &load_stage, &load_detail
+    );
     if (!file_bytes) {
-        bda_msgbox("9288S", "Could not load selected EXE");
+        char text[192];
+        char *out = text;
+        char *end = text + sizeof(text);
+        append_text(&out, end, "Could not load selected EXE\nStage: ");
+        append_hex(&out, end, load_stage);
+        append_text(&out, end, "\nDetail: ");
+        append_hex(&out, end, (u32)load_detail);
+        append_text(&out, end, "\nPath: ");
+        append_text(&out, end, selected_path);
+        *out = 0;
+        bda_msgbox("9288S", text);
         *reselect_out = 1;
         return 3;
     }
@@ -2298,6 +3686,7 @@ static int run_selected_game(
     api = &runtime->api;
     state = &runtime->state;
     state->vm = vm;
+    copy_native_path(state->selected_path, selected_path);
     state->pen_color = 16u;
     state->brush_color = 15u;
     state->background_color = 15u;
@@ -2451,6 +3840,22 @@ static int run_selected_game(
         bda_msgbox("9288S compatibility", text);
     } else if (vm_status != C33_VM_DONE) {
         show_vm_status(vm, vm_status);
+    }
+    if (state->hzk_attempted &&
+        bda_fs_file_is_valid(state->hzk_file)) {
+        (void)bda_fs_close_raw(state->hzk_file);
+        state->hzk_file = -1;
+    }
+    {
+        u32 saved_index;
+        for (saved_index = 0u;
+             saved_index < SAVED_BOX_SLOTS;
+             ++saved_index) {
+            if (state->saved_boxes[saved_index].pixels) {
+                bda_free(state->saved_boxes[saved_index].pixels);
+                state->saved_boxes[saved_index].pixels = 0;
+            }
+        }
     }
     bda_free(code_ram);
     bda_free(heap_ram);

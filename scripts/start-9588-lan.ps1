@@ -1,11 +1,18 @@
 param(
-  [string]$ReleaseRoot = "E:\bbk9588-emulator-v0.1.5",
+  [string]$ReleaseRoot = $env:BBK9588_EMULATOR_ROOT,
   [string]$BindAddress = "0.0.0.0",
   [int]$Port = 8013
 )
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+  throw @"
+9588 emulator root is required. Pass -ReleaseRoot or set:
+  `$env:BBK9588_EMULATOR_ROOT = "C:\path\to\bbk9588-emulator"
+"@
+}
+$ReleaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $ReleaseRoot "python\python.exe"
 $Qemu = Join-Path $ReleaseRoot "bin\bbk9588-qemu-system-mipsel.exe"

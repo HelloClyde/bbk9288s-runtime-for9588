@@ -1,10 +1,17 @@
 param(
-  [string]$ReleaseRoot = "E:\bbk9588-emulator-v0.1.5",
+  [string]$ReleaseRoot = $env:BBK9588_EMULATOR_ROOT,
   [int]$Port = 8013
 )
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+  throw @"
+9588 emulator root is required. Pass -ReleaseRoot or set:
+  `$env:BBK9588_EMULATOR_ROOT = "C:\path\to\bbk9588-emulator"
+"@
+}
+$ReleaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
 $Principal = [Security.Principal.WindowsPrincipal](
   [Security.Principal.WindowsIdentity]::GetCurrent()
 )

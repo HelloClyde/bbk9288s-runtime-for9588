@@ -15,6 +15,9 @@ static uint32_t main_window_callback;
 static unsigned char listbox_items[5][64];
 static uint32_t listbox_item_count;
 static uint32_t listbox_caret;
+static const char *guest_image_path;
+static FILE *guest_image_file;
+static unsigned timer_message_sent;
 
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
@@ -134,6 +137,147 @@ static void inspect_put_image(c33_vm_t *vm)
     free(pixels);
 }
 
+static void inspect_show_picture_screen(c33_vm_t *vm)
+{
+    static unsigned dump_count;
+    uint32_t height = 0;
+    uint32_t picture = 0;
+    uint32_t mode = 0;
+    uint32_t width = vm->regs[9];
+    size_t pixels;
+    size_t bytes_1bpp;
+    size_t bytes_2bpp;
+    unsigned char *packed;
+    size_t index;
+    FILE *file;
+
+    if (++dump_count != 1u ||
+        !read_guest_u32(vm, vm->sp + 4u, &height) ||
+        !read_guest_u32(vm, vm->sp + 8u, &picture) ||
+        !read_guest_u32(vm, vm->sp + 12u, &mode) ||
+        !width || !height) {
+        return;
+    }
+    pixels = (size_t)width * height;
+    bytes_1bpp = (size_t)((width + 7u) / 8u) * height;
+    bytes_2bpp = (pixels + 3u) / 4u;
+    packed = (unsigned char *)malloc(
+        bytes_1bpp > bytes_2bpp ? bytes_1bpp : bytes_2bpp
+    );
+    if (!packed ||
+        !c33_vm_read(
+            vm,
+            picture,
+            packed,
+            (uint32_t)(bytes_1bpp > bytes_2bpp
+                ? bytes_1bpp : bytes_2bpp)
+        )) {
+        free(packed);
+        return;
+    }
+    printf(
+        "  SysShowPicS picture=0x%08lx w=%lu h=%lu mode=%lu bytes:",
+        (unsigned long)picture,
+        (unsigned long)width,
+        (unsigned long)height,
+        (unsigned long)mode
+    );
+    for (index = 0; index < 64u &&
+                    index < (bytes_1bpp > bytes_2bpp
+                        ? bytes_1bpp : bytes_2bpp); ++index) {
+        printf(" %02x", packed[index]);
+    }
+    printf("\n");
+
+    file = fopen("build/host-probe/sanguo-show-screen-1bpp.pgm", "wb");
+    if (file) {
+        fprintf(file, "P5\n%lu %lu\n255\n",
+                (unsigned long)width, (unsigned long)height);
+        for (index = 0; index < pixels; ++index) {
+            size_t row = index / width;
+            size_t column = index % width;
+            unsigned char gray =
+                packed[row * ((width + 7u) / 8u) + column / 8u] &
+                (0x80u >> (column & 7u)) ? 0u : 255u;
+            fwrite(&gray, 1, 1, file);
+        }
+        fclose(file);
+    }
+    file = fopen("build/host-probe/sanguo-show-screen-2bpp.pgm", "wb");
+    if (file) {
+        fprintf(file, "P5\n%lu %lu\n255\n",
+                (unsigned long)width, (unsigned long)height);
+        for (index = 0; index < pixels; ++index) {
+            unsigned value =
+                (packed[index / 4u] >> (6u - 2u * (index & 3u))) & 3u;
+            unsigned char gray = (unsigned char)(255u - value * 85u);
+            fwrite(&gray, 1, 1, file);
+        }
+        fclose(file);
+    }
+    free(packed);
+}
+
+static void inspect_show_picture_virtual(c33_vm_t *vm)
+{
+    static unsigned full_frame_dumped;
+    uint32_t width = vm->regs[8];
+    uint32_t height = vm->regs[9];
+    uint32_t picture = 0;
+    size_t pixels;
+    size_t bytes_2bpp;
+    unsigned char *packed;
+    size_t index;
+    FILE *file;
+
+    if (full_frame_dumped ||
+        width != 160u || height != 240u ||
+        !read_guest_u32(vm, vm->sp + 4u, &picture)) {
+        return;
+    }
+    pixels = (size_t)width * height;
+    bytes_2bpp = ((size_t)width + 3u) / 4u * height;
+    packed = (unsigned char *)malloc(bytes_2bpp);
+    if (!packed ||
+        !c33_vm_read(vm, picture, packed, (uint32_t)bytes_2bpp)) {
+        free(packed);
+        return;
+    }
+    full_frame_dumped = 1u;
+
+    file = fopen("build/host-probe/sanguo-show-virtual-1bpp.pgm", "wb");
+    if (file) {
+        fprintf(file, "P5\n%lu %lu\n255\n",
+                (unsigned long)width, (unsigned long)height);
+        for (index = 0; index < pixels; ++index) {
+            size_t row = index / width;
+            size_t column = index % width;
+            unsigned char gray =
+                packed[row * (width / 8u) + column / 8u] &
+                (0x80u >> (column & 7u)) ? 0u : 255u;
+            fwrite(&gray, 1, 1, file);
+        }
+        fclose(file);
+    }
+    file = fopen("build/host-probe/sanguo-show-virtual-2bpp.pgm", "wb");
+    if (file) {
+        fprintf(file, "P5\n%lu %lu\n255\n",
+                (unsigned long)width, (unsigned long)height);
+        for (index = 0; index < pixels; ++index) {
+            size_t row = index / width;
+            size_t column = index % width;
+            unsigned value =
+                (packed[row * (width / 4u) + column / 4u] >>
+                 (6u - 2u * (column & 3u))) & 3u;
+            unsigned char gray = (unsigned char)(255u - value * 85u);
+            fwrite(&gray, 1, 1, file);
+        }
+        fclose(file);
+    }
+    printf("  wrote virtual full-frame 1bpp/2bpp candidates\n");
+    free(packed);
+}
+
 static c33_vm_status_t report_api(
     compat_api_t *api,
     compat_api_group_t group,
@@ -205,6 +349,40 @@ static c33_vm_status_t report_api(
             printf(" %08lx", (unsigned long)value);
         }
         printf("\n");
+        if (slot == COMPAT_GUI_SHOW_PICTURE_VIRTUAL) {
+            uint32_t picture = 0;
+            uint32_t virtual_screen = 0;
+            uint32_t mode = 0;
+            unsigned char sample[64];
+            unsigned long nibbles[16];
+            uint32_t i;
+            memset(nibbles, 0, sizeof(nibbles));
+            if (read_guest_u32(vm, vm->sp + 4u, &picture) &&
+                read_guest_u32(vm, vm->sp + 8u, &virtual_screen) &&
+                read_guest_u32(vm, vm->sp + 12u, &mode) &&
+                c33_vm_read(vm, picture, sample, sizeof(sample))) {
+                printf(
+                    "  SysShowPicV picture=0x%08lx vscr=0x%08lx "
+                    "mode=%lu bytes:",
+                    (unsigned long)picture,
+                    (unsigned long)virtual_screen,
+                    (unsigned long)mode
+                );
+                for (i = 0; i < sizeof(sample); ++i) {
+                    printf(" %02x", sample[i]);
+                    nibbles[sample[i] >> 4]++;
+                    nibbles[sample[i] & 0x0fu]++;
+                }
+                printf("\n  sample nibble histogram:");
+                for (i = 0; i < 16u; ++i) {
+                    printf(" %lu", nibbles[i]);
+                }
+                printf("\n");
+            }
+            inspect_show_picture_virtual(vm);
+        } else if (slot == COMPAT_GUI_SHOW_PICTURE_SCREEN) {
+            inspect_show_picture_screen(vm);
+        }
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_TEXT_OUT_LEN) {
         uint32_t length = 0;
@@ -228,6 +406,33 @@ static c33_vm_status_t report_api(
                 printf("\n");
             }
         }
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_DRAW_TEXT_EX) {
+        uint32_t rect[4] = {0, 0, 0, 0};
+        uint32_t stack[3] = {0, 0, 0};
+        unsigned char text_bytes[64];
+        uint32_t i;
+        c33_vm_read(vm, vm->regs[9], rect, sizeof(rect));
+        for (i = 0; i < 3u; ++i) {
+            read_guest_u32(vm, vm->sp + 4u + i * 4u, &stack[i]);
+        }
+        memset(text_bytes, 0, sizeof(text_bytes));
+        c33_vm_read(vm, vm->regs[7], text_bytes, sizeof(text_bytes));
+        printf(
+            "  DrawTextEx count=%ld rect=%ld,%ld,%ld,%ld "
+            "indent=%lu format=0x%08lx bytes:",
+            (long)(int32_t)vm->regs[8],
+            (long)(int32_t)rect[0],
+            (long)(int32_t)rect[1],
+            (long)(int32_t)rect[2],
+            (long)(int32_t)rect[3],
+            (unsigned long)stack[0],
+            (unsigned long)stack[1]
+        );
+        for (i = 0; i < sizeof(text_bytes) && text_bytes[i]; ++i) {
+            printf(" %02x", text_bytes[i]);
+        }
+        printf("\n");
     }
     if (group == COMPAT_API_GUI && slot == 105u) {
         uint32_t i;
@@ -307,7 +512,8 @@ static c33_vm_status_t report_api(
          slot == COMPAT_GUI_LINE_TO ||
          slot == COMPAT_GUI_MOVE_TO ||
          slot == COMPAT_GUI_RECTANGLE ||
-         slot == COMPAT_GUI_TEXT_OUT_LEN)) {
+         slot == COMPAT_GUI_TEXT_OUT_LEN ||
+         slot == COMPAT_GUI_DRAW_TEXT_EX)) {
         vm->regs[4] = vm->regs[7];
         return C33_VM_OK;
     }
@@ -409,6 +615,26 @@ static c33_vm_status_t report_api(
             vm->regs[7],
             vm->regs[8],
             vm->regs[9],
+            1000000u
+        );
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_TRANSLATE_MESSAGE) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_DISPATCH_MESSAGE) {
+        uint32_t message[7];
+        if (!main_window_callback ||
+            !c33_vm_read(vm, vm->regs[6], message, sizeof(message))) {
+            return C33_VM_FAULT;
+        }
+        return c33_vm_call(
+            vm,
+            main_window_callback,
+            message[0],
+            message[1],
+            message[2],
+            message[3],
             1000000u
         );
     }
@@ -521,6 +747,84 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_FS && slot == 0u) {
+        unsigned char mode_bytes[8];
+        const char *mode = "rb";
+        if (c33_vm_read(
+                vm, vm->regs[7], mode_bytes, sizeof(mode_bytes)
+            )) {
+            mode_bytes[sizeof(mode_bytes) - 1u] = 0;
+            if (strchr((const char *)mode_bytes, 'w') ||
+                strchr((const char *)mode_bytes, 'a') ||
+                strchr((const char *)mode_bytes, '+')) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+        }
+        if (guest_image_file) {
+            fclose(guest_image_file);
+        }
+        guest_image_file = fopen(guest_image_path, mode);
+        vm->regs[4] = guest_image_file ? 4u : 0xffffffffu;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 1u) {
+        if (guest_image_file) {
+            fclose(guest_image_file);
+            guest_image_file = 0;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 2u) {
+        size_t size = vm->regs[7];
+        size_t count = vm->regs[8];
+        size_t byte_count;
+        unsigned char *buffer;
+        size_t items;
+        if (!guest_image_file || !size || !count ||
+            size > 0x100000u || count > 0x100000u / size) {
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+        byte_count = size * count;
+        buffer = (unsigned char *)malloc(byte_count);
+        if (!buffer) {
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+        items = fread(buffer, size, count, guest_image_file);
+        if (items &&
+            !c33_vm_write(vm, vm->regs[6], buffer, (uint32_t)(items * size))) {
+            free(buffer);
+            return C33_VM_FAULT;
+        }
+        free(buffer);
+        vm->regs[4] = (uint32_t)items;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 4u) {
+        vm->regs[4] = guest_image_file
+            ? (uint32_t)fseek(
+                guest_image_file, (long)(int32_t)vm->regs[7], (int)vm->regs[8]
+            )
+            : 0xffffffffu;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 5u) {
+        vm->regs[4] = guest_image_file
+            ? (uint32_t)ftell(guest_image_file) : 0xffffffffu;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 6u) {
+        vm->regs[4] = guest_image_file ? (uint32_t)feof(guest_image_file) : 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 7u) {
+        vm->regs[4] = guest_image_file
+            ? (uint32_t)ferror(guest_image_file) : 1u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_FS &&
         (slot == 15u || slot == 16u)) {
         vm->regs[4] = 0xffffffffu;
@@ -544,14 +848,6 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
-    if (group == COMPAT_API_FS && slot == 0u) {
-        vm->regs[4] = 4u;
-        return C33_VM_OK;
-    }
-    if (group == COMPAT_API_FS && slot == 1u) {
-        vm->regs[4] = 0u;
-        return C33_VM_OK;
-    }
     if (group == COMPAT_API_FS && slot == 3u) {
         vm->regs[4] = vm->regs[8];
         return C33_VM_OK;
@@ -565,11 +861,45 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_INVALIDATE_RECT) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLIENT_TO_SCREEN) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_SET_HDC_FONT &&
+        slot <= COMPAT_GUI_SET_SYS_FONT) {
+        vm->regs[4] = slot == COMPAT_GUI_GET_HDC_FONT
+            ? 0u : 1u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLEAR_SCREEN) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SAVE_SCREEN_BOX) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_PUT_SAVED_BOX_ON_SCREEN) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_FILL_BOX) {
+        uint32_t height = 0;
+        read_guest_u32(vm, vm->sp + 4u, &height);
+        printf(
+            "  FillBox hdc=%lu x=%ld y=%ld w=%lu h=%lu\n",
+            (unsigned long)vm->regs[6],
+            (long)(int32_t)vm->regs[7],
+            (long)(int32_t)vm->regs[8],
+            (unsigned long)vm->regs[9],
+            (unsigned long)height
+        );
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -593,9 +923,26 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_GET_MESSAGE) {
-        /* No queued messages in the headless probe: terminate the app loop. */
-        vm->regs[4] = 0u;
-        return C33_VM_OK;
+        if (timer_message_sent < 64u) {
+            uint32_t message[7] = {
+                1u, COMPAT_MSG_TIMER, 1u, 0u, 0u, 0u, 0u
+            };
+            if (timer_message_sent >= 32u &&
+                (timer_message_sent - 32u) % 8u == 0u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_ENTER;
+            }
+            if (!c33_vm_write(
+                    vm, vm->regs[6], message, sizeof(message)
+                )) {
+                return C33_VM_FAULT;
+            }
+            ++timer_message_sent;
+            vm->regs[4] = 1u;
+            return C33_VM_OK;
+        }
+        /* Stop once the scripted input/timer sequence is exhausted. */
+        return C33_VM_YIELD;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_MAIN_WINDOW_CLEANUP) {
         vm->regs[4] = 0u;
@@ -698,6 +1045,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "could not read %s\n", argv[1]);
         return 2;
     }
+    guest_image_path = argv[1];
     if (d300_parse(&image, file_bytes, file_size) != D300_OK) {
         fprintf(stderr, "invalid D300 image\n");
         free(file_bytes);
@@ -742,6 +1090,9 @@ int main(int argc, char **argv)
 
     free(sdram);
     free(iram);
+    if (guest_image_file) {
+        fclose(guest_image_file);
+    }
     free(file_bytes);
     return status == C33_VM_DONE ? 0 : 1;
 }

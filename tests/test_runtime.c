@@ -16,12 +16,12 @@ static void put_u32(unsigned char *p, unsigned value)
 
 static int test_d300(void)
 {
-    unsigned char image[0x330];
+    unsigned char image[0x350];
     d300_image_t parsed;
     memset(image, 0, sizeof(image));
     memcpy(image, "D300", 4);
     put_u32(image + 0x04, 0x80);
-    put_u32(image + 0x08, sizeof(image));
+    put_u32(image + 0x08, 0x330);
     put_u32(image + 0x88, 0x100);
     put_u32(image + 0x8c, 0x210);
     put_u32(image + 0x98, 0x310);
@@ -29,8 +29,15 @@ static int test_d300(void)
     if (d300_parse(&parsed, image, sizeof(image)) != D300_OK) {
         return 1;
     }
-    return parsed.program_size == 0x20 && d300_program(&parsed) == image + 0x310
-        ? 0 : 2;
+    if (parsed.program_size != 0x20 ||
+        parsed.size != sizeof(image) ||
+        parsed.declared_size != 0x330 ||
+        d300_program(&parsed) != image + 0x310) {
+        return 2;
+    }
+    put_u32(image + 0x08, sizeof(image) + 1u);
+    return d300_parse(&parsed, image, sizeof(image)) == D300_ERR_DECLARED_SIZE
+        ? 0 : 3;
 }
 
 static int test_vm_return(void)

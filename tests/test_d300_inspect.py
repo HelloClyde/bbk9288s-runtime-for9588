@@ -46,7 +46,28 @@ class D300InspectTests(unittest.TestCase):
         self.assertEqual(image.program_offset, 0x310)
         self.assertEqual(image.program_size, 0x20)
         self.assertEqual(image.icon_size, 0x210)
+        self.assertEqual(image.appended_size, 0)
         self.assertEqual(len(data), 0x330)
+
+    def test_accepts_appended_assets(self) -> None:
+        data = make_image() + b"APPENDED-ASSETS"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "packed.exe"
+            path.write_bytes(data)
+            image, parsed_data = D300.D300Image.parse(path)
+
+        self.assertEqual(image.declared_size, 0x330)
+        self.assertEqual(image.appended_size, len(b"APPENDED-ASSETS"))
+        self.assertEqual(parsed_data[0x330:], b"APPENDED-ASSETS")
+
+    def test_rejects_declared_size_beyond_file(self) -> None:
+        data = bytearray(make_image())
+        struct.pack_into("<I", data, 0x08, len(data) + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "truncated.exe"
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                D300.D300Image.parse(path)
 
     def test_strings(self) -> None:
         strings = dict(D300.iter_strings(make_image()))

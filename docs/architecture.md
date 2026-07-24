@@ -49,7 +49,8 @@ interpreter until the callback returns.
 9288S content is portrait and four-gray-level. The initial 9588 adapter keeps a
 160x240 guest surface, unscaled, at the top center of the rotated 240x320
 RGB565 display. The 40-pixel side areas hold EXE/settings actions, and the
-remaining 240x80 area below the guest holds a touch D-pad and A/B buttons.
+remaining 240x80 area below the guest holds a centered touch direction pad,
+with 取消 on the left and 确认 on the right.
 
 Direction, confirm, and exit input are translated to the original 9288S window
 messages. Touch inside the centered guest viewport is mapped back to 9288S

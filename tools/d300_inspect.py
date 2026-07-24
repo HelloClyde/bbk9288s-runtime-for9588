@@ -30,6 +30,7 @@ class D300Image:
     file_size: int
     header_size: int
     declared_size: int
+    appended_size: int
     category: str
     flags: int
     vendor: str
@@ -56,6 +57,7 @@ class D300Image:
             file_size=len(data),
             header_size=u32(data, 0x04),
             declared_size=u32(data, 0x08),
+            appended_size=len(data) - u32(data, 0x08),
             category=c_string(data, 0x0C, 0x14),
             flags=u32(data, 0x14),
             vendor=c_string(data, 0x40, 0x50, encoding="ascii"),
@@ -73,13 +75,13 @@ class D300Image:
         return image, data
 
     def validate(self) -> None:
-        if self.header_size < 0x80 or self.header_size > self.file_size:
-            raise ValueError(f"invalid header size 0x{self.header_size:x}")
-        if self.declared_size != self.file_size:
+        if self.declared_size > self.file_size:
             raise ValueError(
                 f"declared size 0x{self.declared_size:x} "
-                f"does not match file size 0x{self.file_size:x}"
+                f"exceeds file size 0x{self.file_size:x}"
             )
+        if self.header_size < 0x80 or self.header_size > self.declared_size:
+            raise ValueError(f"invalid header size 0x{self.header_size:x}")
         for name, offset, size in (
             ("icon", self.icon_offset, self.icon_size),
             ("program", self.program_offset, self.program_size),
@@ -87,9 +89,13 @@ class D300Image:
         ):
             if size == 0:
                 continue
-            if offset > self.file_size or size > self.file_size - offset:
+            if (
+                offset > self.declared_size
+                or size > self.declared_size - offset
+            ):
                 raise ValueError(
-                    f"{name} range 0x{offset:x}+0x{size:x} exceeds file"
+                    f"{name} range 0x{offset:x}+0x{size:x} "
+                    "exceeds declared image"
                 )
 
 
