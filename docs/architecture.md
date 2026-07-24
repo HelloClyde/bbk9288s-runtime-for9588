@@ -44,6 +44,14 @@ For the GNU S1C33 ABI used here, arguments one through four are in `R6` through
 called synchronously by pushing a private return sentinel and running the same
 interpreter until the callback returns.
 
+## Filesystem root
+
+The compatibility layer treats `A:\应用\数据\9288s\` on the 9588 as the
+complete 9288S filesystem root. Absolute and relative guest paths are
+normalized below that directory while preserving their original GBK path
+components. No game or save filename is special-cased, and parent traversal
+cannot escape the private root.
+
 ## Display/input policy
 
 9288S content is portrait and four-gray-level. The initial 9588 adapter keeps a

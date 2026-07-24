@@ -18,8 +18,8 @@ The current QEMU-specific host adapter provides:
 - the public SDK's firmware Help Page, confirmation, window-destruction, and
   clean-exit handling;
 - nested save/load window emulation with resumable guest callbacks;
-- five persistent NAND save slots at `A:\PIRATE1.SAV` through
-  `A:\PIRATE5.SAV`.
+- a generic 9288S filesystem root mapped to
+  `A:\应用\数据\9288s`, preserving the guest directory hierarchy.
 
 Build from the project root:
 

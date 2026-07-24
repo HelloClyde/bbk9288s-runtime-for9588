@@ -47,9 +47,10 @@ not game content. The title/board artwork is embedded in the program image.
 - Clean 9288S main-window destruction and quit-message handling.
 - Resumable nested callbacks for the save/load selectors' private
   `GetMessage` loops.
-- Five persistent save slots translated to `A:\PIRATE1.SAV` through
-  `A:\PIRATE5.SAV`, including find/stat, disk-space, read, write, seek, and
-  close operations.
+- Generic filesystem-root mapping from the 9288S `A:\` drive to
+  `A:\应用\数据\9288s\`, preserving the original
+  `系统\数据\海盗船存档*.sav` names and directory hierarchy for find/stat,
+  disk-space, read, write, seek, and close operations.
 - Wall-clock-paced guest timers using MiniGUI's 10 ms timer unit and the
   public SDK's verified 25 ms monotonic firmware clock.
 

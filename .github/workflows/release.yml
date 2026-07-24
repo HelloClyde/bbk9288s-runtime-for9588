@@ -32,6 +32,7 @@ jobs:
             runtime/src/d300.c \
             runtime/src/c33vm.c \
             runtime/src/compat_api.c \
+            runtime/src/compat_fs.c \
             tests/test_runtime.c \
             -o build/host-tests/test-runtime
           ./build/host-tests/test-runtime

@@ -20,6 +20,7 @@ gcc `
   (Join-Path $ProjectRoot "runtime\src\d300.c") `
   (Join-Path $ProjectRoot "runtime\src\c33vm.c") `
   (Join-Path $ProjectRoot "runtime\src\compat_api.c") `
+  (Join-Path $ProjectRoot "runtime\src\compat_fs.c") `
   (Join-Path $ProjectRoot "tests\test_runtime.c") `
   -o $TestExe
 if ($LASTEXITCODE -ne 0) {

@@ -3,6 +3,7 @@
 
 #include "c33vm.h"
 #include "compat_api.h"
+#include "compat_fs.h"
 #include "compat_gui.h"
 #include "d300.h"
 
@@ -38,6 +39,65 @@ static int test_d300(void)
     put_u32(image + 0x08, sizeof(image) + 1u);
     return d300_parse(&parsed, image, sizeof(image)) == D300_ERR_DECLARED_SIZE
         ? 0 : 3;
+}
+
+static int test_fs_path_mapping(void)
+{
+    char path[320];
+    char small[8];
+
+    if (!compat_fs_map_guest_path("A:\\", path, sizeof(path)) ||
+        strcmp(path, COMPAT_FS_NATIVE_ROOT) != 0) {
+        return 1;
+    }
+    if (!compat_fs_map_guest_path(
+            "A:\\\xcf\xb5\xcd\xb3\\\xca\xfd\xbe\xdd\\"
+            "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xd2\xbb.sav",
+            path,
+            sizeof(path)
+        ) ||
+        strcmp(
+            path,
+            COMPAT_FS_NATIVE_ROOT
+            "\\\xcf\xb5\xcd\xb3\\\xca\xfd\xbe\xdd\\"
+            "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xd2\xbb.sav"
+        ) != 0) {
+        return 2;
+    }
+    if (!compat_fs_map_guest_path(
+            "A:/SAVE0.DAT", path, sizeof(path)
+        ) ||
+        strcmp(path, COMPAT_FS_NATIVE_ROOT "\\SAVE0.DAT") != 0) {
+        return 3;
+    }
+    if (!compat_fs_map_guest_path(
+            "relative\\slot.sav", path, sizeof(path)
+        ) ||
+        strcmp(
+            path, COMPAT_FS_NATIVE_ROOT "\\relative\\slot.sav"
+        ) != 0) {
+        return 4;
+    }
+    if (!compat_fs_map_guest_path(
+            "A:\\foo\\.\\bar\\..\\save.dat", path, sizeof(path)
+        ) ||
+        strcmp(
+            path, COMPAT_FS_NATIVE_ROOT "\\foo\\save.dat"
+        ) != 0) {
+        return 5;
+    }
+    if (compat_fs_map_guest_path(
+            "A:\\..\\escape.dat", path, sizeof(path)
+        ) ||
+        path[0] != 0) {
+        return 6;
+    }
+    if (compat_fs_map_guest_path(
+            "A:\\file.dat", small, sizeof(small)
+        )) {
+        return 7;
+    }
+    return 0;
 }
 
 static int test_vm_return(void)
@@ -315,6 +375,11 @@ int main(void)
     rc = test_d300();
     if (rc) {
         fprintf(stderr, "test_d300 failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_fs_path_mapping();
+    if (rc) {
+        fprintf(stderr, "test_fs_path_mapping failed: %d\n", rc);
         return 1;
     }
     rc = test_vm_return();

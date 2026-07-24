@@ -66,28 +66,6 @@
 
 static const char k_native_help_title[] = "9288S";
 
-static const char *const k_native_save_paths[5] = {
-    "A:\\PIRATE1.SAV",
-    "A:\\PIRATE2.SAV",
-    "A:\\PIRATE3.SAV",
-    "A:\\PIRATE4.SAV",
-    "A:\\PIRATE5.SAV"
-};
-
-static const char *const k_sanguo_save_paths[2] = {
-    "A:\\SANGO0.SAV",
-    "A:\\SANGO1.SAV"
-};
-
-/* GBK filenames used by the original game, without the 9288S-only prefix. */
-static const char *const k_guest_save_names[5] = {
-    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xd2\xbb.sav",
-    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xb6\xfe.sav",
-    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xc8\xfd.sav",
-    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xcb\xc4.sav",
-    "\xba\xa3\xb5\xc1\xb4\xac\xb4\xe6\xb5\xb5\xce\xe5.sav"
-};
-
 typedef struct guest_message {
     u32 hwnd;
     u32 message;
@@ -331,32 +309,28 @@ static int byte_string_contains(const char *text, const char *needle)
     return 0;
 }
 
-static int ascii_byte_string_contains_case_insensitive(
-    const char *text,
-    const char *needle
-)
+static int file_mode_may_write(const char *mode)
 {
-    const char *candidate;
-    if (!text || !needle || !*needle) {
-        return 0;
-    }
-    for (candidate = text; *candidate; ++candidate) {
-        const char *left = candidate;
-        const char *right = needle;
-        while (*left && *right) {
-            u8 a = (u8)*left;
-            u8 b = (u8)*right;
-            if (a >= 'A' && a <= 'Z') a = (u8)(a + ('a' - 'A'));
-            if (b >= 'A' && b <= 'Z') b = (u8)(b + ('a' - 'A'));
-            if (a != b) break;
-            ++left;
-            ++right;
-        }
-        if (!*right) {
+    while (mode && *mode) {
+        if (*mode == 'w' || *mode == 'a' || *mode == '+') {
             return 1;
         }
+        ++mode;
     }
     return 0;
+}
+
+static int path_has_trailing_separator(const char *path)
+{
+    u32 length = 0u;
+    if (!path) {
+        return 0;
+    }
+    while (path[length]) {
+        ++length;
+    }
+    return length != 0u &&
+           (path[length - 1u] == '\\' || path[length - 1u] == '/');
 }
 
 static void copy_native_path(char *destination, const char *source)
@@ -374,44 +348,44 @@ static void copy_native_path(char *destination, const char *source)
     destination[index] = 0;
 }
 
-static const char *translate_guest_path(
-    const compat_9588_state_t *state,
-    const char *guest_path
-)
+static void ensure_native_parent_directories(const char *native_path)
 {
+    char partial[NATIVE_PATH_CAPACITY];
+    u32 length = 0u;
     u32 index;
 
+    if (!native_path) {
+        return;
+    }
+    while (native_path[length] &&
+           length + 1u < sizeof(partial)) {
+        partial[length] = native_path[length];
+        ++length;
+    }
+    if (native_path[length]) {
+        return;
+    }
+    partial[length] = 0;
+
     /*
-     * Packed 9288S games commonly reopen their absolute installation path
-     * and read an asset archive appended to the D300 core. Map any requested
-     * EXE back to the file the user selected on the 9588.
+     * Skip the drive-root separator, then create every path component up to
+     * but not including the final filename. Passing a trailing separator
+     * creates the complete directory itself.
      */
-    if (state && state->selected_path[0] &&
-        (byte_string_contains(guest_path, ".exe") ||
-         byte_string_contains(guest_path, ".EXE"))) {
-        return state->selected_path;
-    }
-    if (ascii_byte_string_contains_case_insensitive(
-            guest_path, "sango0.sav"
-        )) {
-        return k_sanguo_save_paths[0];
-    }
-    if (ascii_byte_string_contains_case_insensitive(
-            guest_path, "sango1.sav"
-        )) {
-        return k_sanguo_save_paths[1];
-    }
-    for (index = 0u; index < 5u; ++index) {
-        if (byte_string_contains(guest_path, k_guest_save_names[index])) {
-            return k_native_save_paths[index];
+    for (index = 3u; index < length; ++index) {
+        if (partial[index] == '\\' || partial[index] == '/') {
+            char separator = partial[index];
+            partial[index] = 0;
+            (void)bda_fs_mkdir(partial);
+            partial[index] = separator;
         }
     }
-    /*
-     * 海盗船 only opens the five paths above. Return a stable private
-     * fallback instead of allowing an incompatible 9288S absolute path to
-     * escape into the 9588 filesystem.
-     */
-    return "A:\\PIRATE0.DAT";
+}
+
+static void ensure_native_directory_tree(const char *native_path)
+{
+    ensure_native_parent_directories(native_path);
+    (void)bda_fs_mkdir(native_path);
 }
 
 static u16 logical_color_to_rgb565(u32 color)
@@ -2537,8 +2511,9 @@ static c33_vm_status_t dispatch_9588_fs(
     case COMPAT_FS_OPEN:
         {
             char guest_path[192];
+            char native_path[NATIVE_PATH_CAPACITY];
             char mode[8];
-            const char *native_path;
+            int file;
             if (!guest_read_c_string(
                     vm, vm->regs[6], guest_path, sizeof(guest_path)
                 ) ||
@@ -2547,8 +2522,30 @@ static c33_vm_status_t dispatch_9588_fs(
                 )) {
                 return C33_VM_FAULT;
             }
-            native_path = translate_guest_path(state, guest_path);
-            vm->regs[4] = (u32)bda_fs_fopen_raw(native_path, mode);
+            if (!compat_fs_map_guest_path(
+                    guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+            if (file_mode_may_write(mode)) {
+                ensure_native_parent_directories(native_path);
+            }
+            file = bda_fs_fopen_raw(native_path, mode);
+            /*
+             * Some packed D300 programs reopen their own EXE to read appended
+             * data. Keep the generic root mapping as the primary location,
+             * then attach only the currently selected bootstrap image as a
+             * read-only fallback. No application or filename is special-cased.
+             */
+            if (!bda_fs_file_is_valid(file) &&
+                !file_mode_may_write(mode) &&
+                state->selected_path[0] &&
+                (byte_string_contains(guest_path, ".exe") ||
+                 byte_string_contains(guest_path, ".EXE"))) {
+                file = bda_fs_fopen_raw(state->selected_path, mode);
+            }
+            vm->regs[4] = (u32)file;
             return C33_VM_OK;
         }
     case COMPAT_FS_CLOSE:
@@ -2651,7 +2648,7 @@ static c33_vm_status_t dispatch_9588_fs(
     case COMPAT_FS_FIND_FIRST:
         {
             char guest_path[192];
-            const char *native_path;
+            char native_path[NATIVE_PATH_CAPACITY];
             int result;
             if (!guest_read_c_string(
                     vm, vm->regs[6], guest_path, sizeof(guest_path)
@@ -2662,7 +2659,12 @@ static c33_vm_status_t dispatch_9588_fs(
                 (void)bda_fs_findclose(&state->native_find_data);
                 state->native_find_open = 0;
             }
-            native_path = translate_guest_path(state, guest_path);
+            if (!compat_fs_map_guest_path(
+                    guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
             bda_fs_find_data_init(&state->native_find_data);
             result = bda_fs_findfirst(
                 native_path,
@@ -2734,16 +2736,45 @@ static c33_vm_status_t dispatch_9588_fs(
     case COMPAT_FS_STAT:
         {
             char guest_path[192];
+            char native_path[NATIVE_PATH_CAPACITY];
+            bda_fs_find_data_t *find_data;
+            int result;
             if (!guest_read_c_string(
                     vm, vm->regs[6], guest_path, sizeof(guest_path)
                 )) {
                 return C33_VM_FAULT;
             }
+            if (!compat_fs_map_guest_path(
+                    guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
             /*
-             * The two legacy directories are virtual in this adapter. Exact
-             * save-file existence is handled by FIND_FIRST above.
+             * Original system directories already exist on a 9288S. Create
+             * their sandbox counterparts lazily when a guest probes a path
+             * explicitly written as a directory.
              */
-            vm->regs[4] = 0u;
+            if (path_has_trailing_separator(guest_path)) {
+                ensure_native_directory_tree(native_path);
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            find_data = (bda_fs_find_data_t *)bda_alloc(
+                sizeof(*find_data)
+            );
+            if (allocation_failed(find_data)) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+            bda_fs_find_data_init(find_data);
+            result = bda_fs_findfirst(native_path, 0x27u, find_data);
+            if (result != -1) {
+                (void)bda_fs_findclose(find_data);
+                result = 0;
+            }
+            bda_free(find_data);
+            vm->regs[4] = (u32)result;
             return C33_VM_OK;
         }
     default:
@@ -3881,10 +3912,11 @@ int bda_main(void)
         bda_msgbox("9288S", "Not enough memory for file selector");
         return 1;
     }
+    ensure_native_directory_tree(COMPAT_FS_NATIVE_ROOT);
     for (;;) {
         selector_result = bda_gui_select_file(
             selector,
-            "A:\\",
+            COMPAT_FS_NATIVE_ROOT_DIRECTORY,
             "exe",
             "Select 9288S EXE"
         );
@@ -3908,3 +3940,4 @@ int bda_main(void)
 #include "../../runtime/src/d300.c"
 #include "../../runtime/src/c33vm.c"
 #include "../../runtime/src/compat_api.c"
+#include "../../runtime/src/compat_fs.c"
