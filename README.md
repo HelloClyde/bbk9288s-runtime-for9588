@@ -1,184 +1,182 @@
-# BBK 9288S application compatibility runtime for BBK 9588
+# BBK 9288S 应用兼容运行时（9588 版）
 
-This is a standalone research project for running selected BBK 9288S `D300`
-applications inside a native BBK 9588 `BDA`.
+这是一个独立研究项目，用于在 BBK 9588 原生 `BDA` 中运行部分 BBK
+9288S `D300` 应用。
 
-It is intentionally separate from the full-system 9288S simulator and the
-9588 hardware-emulator project. The
-[public 9588 native BDA SDK](https://github.com/HelloClyde/bbk9588-bda-sdk)
-is pinned under `sdk/` as a Git submodule. No firmware or original application
-is stored here.
+本项目与 9288S 全系统模拟器、9588 硬件模拟器项目相互独立。
+[9588 原生 BDA SDK](https://github.com/HelloClyde/bbk9588-bda-sdk)
+以 Git 子模块形式固定在 `sdk/` 目录。本仓库不包含固件或原始应用程序。
 
-## Architecture
+## 工作原理
 
-The intended runtime is a user-mode compatibility layer, not another full
-machine emulator:
+本项目实现的是用户态兼容层，而不是另一套完整机器模拟器：
 
 ```text
 9288S D300 EXE
-    -> S1C33 instruction interpreter
-    -> 9288S relocation-table API traps
-    -> 9588 BDA GUI / input / timer / filesystem adapters
+    -> S1C33 指令解释器
+    -> 9288S 重定位表 API 陷阱
+    -> 9588 BDA 图形 / 输入 / 定时器 / 文件系统适配层
 ```
 
-The runtime emulates the 9288S application address space and C33 ABI. Calls
-through the 9288S relocation tables are intercepted and translated to 9588
-native services. NAND, LCDC, ADC, GPIO, and the 9288S kernel are not emulated.
+运行时模拟 9288S 应用地址空间及 C33 ABI。9288S 程序通过重定位表调用
+系统 API 时，兼容层会拦截调用并转换为 9588 原生服务。项目不模拟 NAND、
+LCDC、ADC、GPIO 或完整的 9288S 内核。
 
-The GNU S1C33 ABI used by these applications passes the first four arguments
-in `R6` through `R9` and returns scalar values in `R4`. Indirect relocation
-table calls commonly use `R4` as the call target before it is overwritten by
-the return value.
+这些应用采用的 GNU S1C33 ABI 使用 `R6` 至 `R9` 传递前四个参数，并通过
+`R4` 返回标量值。间接调用重定位表函数时，`R4` 通常先保存目标地址，再被
+函数返回值覆盖。
 
-## First target: 海盗船
+## 首个兼容目标：海盗船
 
-The locally inspected application has these properties:
+经检查，9288S 版《海盗船》具有以下特征：
 
-- `D300` container, 94,960 bytes total.
-- 528-byte application icon.
-- 92,936-byte program image linked at guest address `0x02700000`.
-- 1,240-byte appended build-log resource that is not needed at runtime.
-- Artwork and game data are embedded in the program image.
-- External data is limited to five optional `.sav` files under the system data
-  directory.
+- `D300` 容器总大小为 94,960 字节；
+- 应用图标占 528 字节；
+- 程序映像占 92,936 字节，加载地址为 `0x02700000`；
+- 尾部附带 1,240 字节构建日志，运行时不需要；
+- 美术和游戏数据均嵌入程序映像；
+- 外部数据仅为系统数据目录中的五个可选 `.sav` 存档文件。
 
-This makes it a good first compatibility target. The first milestone is title
-screen, board rendering, direction/confirm/exit input, timer ticks, and save
-files.
+因此它很适合作为第一个兼容目标。首阶段目标包括标题画面、棋盘绘制、方向/
+确认/退出输入、定时器以及存档。
 
-## Repository layout
+## 仓库结构
 
 ```text
-docs/                  design and per-application compatibility notes
-runtime/include/       portable D300 and C33 runtime interfaces
-runtime/src/           portable runtime implementation
-ports/bbk9588/         9588 BDA host adapter
-assets/sanguo/         non-executable save-container initialization fixtures
-scripts/               build, test, emulator install, and LAN helpers
-tests/                 host-side unit tests
-tools/                 local D300 inspection helpers
-sdk/                   pinned 9588 native SDK Git submodule
-local/                 local original EXE files (ignored)
-build/                 generated artifacts (ignored)
-.github/workflows/     tag build and GitHub release automation
+docs/                  架构设计及各应用兼容说明
+runtime/include/       可移植 D300/C33 运行时接口
+runtime/src/           可移植运行时实现
+ports/bbk9588/         9588 BDA 宿主适配层
+assets/sanguo/         非可执行的存档容器初始化数据
+scripts/               构建、测试、安装及局域网辅助脚本
+tests/                 宿主机单元测试
+tools/                 本地 D300 分析工具
+sdk/                   固定版本的 9588 SDK 子模块
+local/                 本地原始 EXE（Git 忽略）
+build/                 构建产物（Git 忽略）
+.github/workflows/     Tag 构建及 GitHub Release 自动化
 ```
 
-## Current status
+## 当前进度
 
-The original 9288S 海盗船 and 三国霸业 executables now run interactively in the
-QEMU-based 9588 emulator:
+原版 9288S《海盗船》和《三国霸业》已能在基于 QEMU 的 9588 模拟器中交互运行：
 
-- launching the BDA first opens the native 9588 file selector, filtered to
-  `.exe`, and loads the selected D300 image from NAND at runtime;
-- the portable S1C33 interpreter executes the unmodified D300 program image;
-- the 9288S relocation-table calls are handled by the compatibility runtime;
-- the title artwork and game board render to the 9588 RGB565 scanout;
-- confirm enters the game and the four direction keys change game state;
-- web-frontend touch input is translated to the 9288S pointer-message format;
-- the original 帮助说明 and 退出游戏 touch buttons work, including the
-  native 9588 confirmation dialogs;
-- the original save/load selectors support touch, render like the 9288S
-  screens, and persist all five slots in the 9588 NAND;
-- score, life, and level text uses the original black-on-white DC state;
-- the 160×240 guest view is centered at the top without scaling, with EXE and
-  settings buttons at its sides, a centered direction pad below it, 取消 on
-  the left, and 确认 on the right;
-- the timer and resumable 9288S message loops run inside the native 9588 BDA;
-- emulator key events are consumed directly, without re-entering the 9588
-  firmware GUI event dispatcher.
+- BDA 启动后先打开 9588 原生文件选择器，仅显示 `.exe`，并从 NAND 动态加载
+  选中的 D300 映像；
+- 可移植 S1C33 解释器直接执行未经修改的 D300 程序映像；
+- 兼容运行时承接 9288S 重定位表 API 调用；
+- 标题图、游戏棋盘和地图可以正确绘制到 9588 RGB565 帧缓冲；
+- 确认键可以进入游戏，四个方向键可以改变游戏状态；
+- Web 前端触摸输入会转换为 9288S 指针消息格式；
+- 原版“帮助说明”和“退出游戏”触摸按钮可用，并使用 9588 原生帮助页及
+  确认对话框承接；
+- 原版存档/读档界面支持触摸，以 9288S 样式绘制，并将五个槽位持久化到
+  9588 NAND；
+- 分数、生命和关卡文字使用原版黑字白底的 DC 状态；
+- 160×240 游戏画面不缩放，位于屏幕上方居中；左右为 EXE 和设置按钮，
+  下方中央为方向键，左侧为“取消”，右侧为“确认”；
+- 定时器及可恢复的 9288S 消息循环运行在原生 9588 BDA 内；
+- 模拟器按键事件由兼容层直接消费，不会重新进入 9588 固件 GUI 事件分发器。
 
-三国霸业 has additionally been checked against the real 9288S simulator:
+《三国霸业》还与真实 9288S 模拟器进行了逐项对照：
 
-- its native guest resolution is 160×240 and is displayed pixel-for-pixel;
-- the title, menu, 势力形势图, and strategic gameplay map render correctly;
-- `SysShowPicV` uses the 9288S clipping behavior when a source rectangle
-  extends two pixels past the right edge;
-- repeated movement leaves no stale pixels or screen trails;
-- the second main-menu item loads a saved session back into the strategic map;
-- the game writes `A:\SANGO0.SAV` and `A:\SANGO1.SAV`, and an in-game
-  overwrite survives a complete QEMU restart byte-for-byte.
+- 原生分辨率为 160×240，在 9588 上按像素原样显示；
+- 标题、菜单、势力形势图及战略地图能够正确绘制；
+- 当源矩形越过右边缘两个像素时，`SysShowPicV` 使用与 9288S 一致的裁剪行为；
+- 连续移动不会残留旧像素或产生拖影；
+- 主菜单第二项能够读取存档并返回战略地图；
+- 游戏写入 `A:\SANGO0.SAV` 和 `A:\SANGO1.SAV`，游戏内覆盖存档后，
+  完整重启 QEMU 仍能逐字节保持一致。
 
-The current port deliberately targets the project's QEMU 9588 emulator. It
-uses its diagnostic input queue and direct LCD scanout; physical 9588 hardware
-would need a different host adapter. Sound is not implemented, but it is not
-required to play or save a session. EXE selection/loading is generic; API
-coverage is still expanded application by application.
+当前移植主要面向本项目配套的 QEMU 9588 模拟器，使用了诊断输入队列和直接
+LCD 帧缓冲接口。要在真实 9588 硬件上运行，还需要实现不同的宿主适配层。
+声音尚未实现，但不影响游玩和存档。EXE 选择及加载流程是通用的，API 覆盖仍需
+按应用逐步扩充。
 
-## Build, install, and play
+## 构建、安装与运行
 
-Prerequisites:
+环境要求：
 
-- Windows PowerShell and Python 3.10 or newer;
-- the 9588 emulator frontend running at `http://127.0.0.1:8013`;
-- one or more authorized 9288S D300 executables.
+- Windows PowerShell；
+- Python 3.10 或更高版本；
+- 9588 模拟器前端运行在 `http://127.0.0.1:8013`；
+- 一个或多个你有权使用的 9288S D300 可执行文件。
 
-Clone and initialize the SDK submodule:
+克隆仓库并初始化 SDK 子模块：
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/HelloClyde/bbk9288s-compat9588.git
 cd bbk9288s-compat9588
 git submodule update --init sdk
 ```
 
-For an existing clone, initialize or update the SDK with:
+已有仓库只需执行：
 
 ```powershell
 git submodule update --init sdk
 ```
 
-The SDK's optional emulator submodule is not needed to build this project.
+SDK 自己附带的可选模拟器子模块不是本项目的构建依赖，无需初始化。
 
-Build the BDA:
+构建 BDA：
 
 ```powershell
 .\scripts\build-bda.ps1
 ```
 
-On the first build, the SDK downloads its checksum-pinned MIPS toolchain into
-the ignored `sdk/.toolchain/` directory. The generated file is
-`build/bbk9588/9288SCompat.bda`.
+第一次构建时，SDK 会下载带固定校验值的 MIPS 工具链，并存放到 Git 忽略的
+`sdk/.toolchain/` 目录。生成文件位于：
 
-Run the complete emulator install workflow:
+```text
+build/bbk9588/9288SCompat.bda
+```
+
+构建并安装到正在运行的 9588 模拟器：
 
 ```powershell
 .\scripts\install-and-play.ps1 -GamePath "C:\path\to\海盗船.exe"
 ```
 
-If the executable is stored as `local\pirate_ship.exe`, `-GamePath` can be
-omitted. The script builds the BDA, backs up the original `宠物单词.bda`,
-installs the compatibility runtime under that fixed launcher name, copies the
-optional EXE to the 9588 NAND root, resets the emulator, selects
-背单词/E-pets, and opens the native EXE selector. The BDA itself contains no
-game executable.
+如果 EXE 已保存为 `local\pirate_ship.exe`，可以省略 `-GamePath`。脚本会：
 
-The installer also creates the two 三国霸业 save containers through the
-9588 SDK/NAND file path when they are missing. Existing `SANGO0.SAV` and
-`SANGO1.SAV` files are always preserved. This is required because the 9588
-firmware can lose FAT metadata when a guest application creates those files
-for the first time; once pre-created, 三国霸业 can overwrite and reload them
-normally across cold starts.
+1. 构建兼容 BDA；
+2. 备份原来的 `宠物单词.bda`；
+3. 以固定启动器文件名安装兼容运行时；
+4. 将可选的 9288S EXE 复制到 9588 NAND 根目录；
+5. 重置模拟器并进入“背单词/E-pets”；
+6. 打开原生 EXE 文件选择器。
 
-Controls in the 9588 web frontend:
+BDA 本身不包含任何游戏可执行文件。
 
-| Game input | Keyboard | Frontend button |
+安装器还会在《三国霸业》存档文件不存在时，通过 9588 SDK/NAND 文件路径创建
+两个存档容器。已有的 `SANGO0.SAV` 和 `SANGO1.SAV` 始终会被保留，不会覆盖。
+这是因为 9588 固件在应用首次创建文件时可能丢失 FAT 元数据；预先建立容器后，
+《三国霸业》即可在游戏中正常覆盖、读取，并跨冷启动保存。
+
+## 操作方式
+
+9588 Web 前端控制：
+
+| 游戏操作 | 键盘 | 屏幕按钮 |
 | --- | --- | --- |
-| Move | `W` `A` `S` `D` | centered direction pad |
-| Confirm | `J` | right-side 确认 |
-| Exit/back | `K` | left-side 取消 |
+| 移动 | `W` `A` `S` `D` | 中央方向键 |
+| 确认 | `J` | 右侧“确认” |
+| 退出/返回 | `K` | 左侧“取消” |
 
-Tap the left-side `EXE` button to leave the current guest and reopen the
-firmware selector. Tap the right-side `SET` button to swap the bottom controls
-between left- and right-handed layouts.
+点击左侧 `EXE` 按钮可退出当前程序并重新打开固件文件选择器。点击右侧 `SET`
+按钮可切换底部控制区的左右手布局。
 
-The 9588 web display is also touch-enabled. On the game screen, tap
-`帮助说明` to open the firmware Help Page (including its scroll bar and return
-controls), `存储文档` / `读取文档` to use one of the five persistent slots, or
-`退出游戏` to open its yes/no confirmation.
+9588 Web 画面支持触摸。在《海盗船》游戏画面中：
 
-The original long GBK save names are translated to these persistent 9588 NAND
-files:
+- 点击“帮助说明”会打开 9588 固件 Help Page，包括滚动条和返回控件；
+- 点击“存储文档”或“读取文档”可使用五个持久化槽位；
+- 点击“退出游戏”会打开 9588 原生是/否确认对话框。
 
-| Original slot | 9588 NAND file |
+## 存档映射
+
+《海盗船》的原始 GBK 长文件名会映射到以下 9588 NAND 文件：
+
+| 原始槽位 | 9588 NAND 文件 |
 | --- | --- |
 | 海盗船存档一 | `A:\PIRATE1.SAV` |
 | 海盗船存档二 | `A:\PIRATE2.SAV` |
@@ -186,74 +184,77 @@ files:
 | 海盗船存档四 | `A:\PIRATE4.SAV` |
 | 海盗船存档五 | `A:\PIRATE5.SAV` |
 
-三国霸业 uses:
+《三国霸业》使用：
 
-| 9288S file | 9588 NAND file |
+| 9288S 文件 | 9588 NAND 文件 |
 | --- | --- |
 | `SANGO0.SAV` | `A:\SANGO0.SAV` |
 | `SANGO1.SAV` | `A:\SANGO1.SAV` |
 
-Restore the overwritten launcher BDA:
+恢复被替换的原始启动器 BDA：
 
 ```powershell
 .\scripts\restore-original-bda.ps1
 ```
 
-Expose the currently packaged 9588 emulator to the private LAN:
+## 局域网访问
+
+设置 9588 模拟器发行包路径并启动局域网前端：
 
 ```powershell
 $env:BBK9588_EMULATOR_ROOT = "C:\path\to\bbk9588-emulator"
 .\scripts\start-9588-lan.ps1
 ```
 
-This launcher also enables the QEMU touch-state mirror required by the
-compatibility BDA. The frontend listens on TCP 8013 on all IPv4 interfaces
-and prints the usable LAN URL. Run the firewall helper once from an elevated
-PowerShell prompt; its inbound rule is limited to the Private profile, the
-local subnet, TCP 8013, and the emulator's bundled Python executable:
+启动脚本会同时启用兼容 BDA 所需的 QEMU 触摸状态镜像。前端在所有 IPv4
+接口的 TCP 8013 端口监听，并输出可用的局域网 URL。
+
+首次使用时，请在管理员 PowerShell 中执行防火墙辅助脚本：
 
 ```powershell
 .\scripts\enable-9588-lan-firewall.ps1
 ```
 
-Both LAN helpers also accept `-ReleaseRoot` instead of the environment
-variable.
+该规则仅允许专用网络、本地子网、TCP 8013 及模拟器自带的 Python 可执行文件。
+两个局域网脚本也支持通过 `-ReleaseRoot` 参数直接传入模拟器目录。
 
-Inspect a local application:
+## 分析与测试
+
+检查本地 D300 应用：
 
 ```powershell
 python .\tools\d300_inspect.py .\local\pirate_ship.exe --strings
 ```
 
-Run host tests:
+运行宿主机测试：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\test-host.ps1
 ```
 
-Probe how far the portable core executes a local D300 image:
+探测可移植核心执行本地 D300 映像的进度：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\probe-d300.ps1 `
   -Image .\local\pirate_ship.exe
 ```
 
-## GitHub tag releases
+## 通过 Tag 自动发布
 
-The repository includes `.github/workflows/release.yml`. Every pushed tag:
+仓库包含 `.github/workflows/release.yml`。每次向 GitHub 推送 Tag 时，工作流会：
 
-1. runs the Python and portable C runtime tests;
-2. checks out the pinned `sdk` submodule;
-3. builds and validates `9288SCompat.bda` on Windows;
-4. uploads the BDA and `SHA256SUMS.txt` as workflow artifacts;
-5. creates or updates the matching GitHub Release.
+1. 运行 Python 测试及可移植 C 运行时测试；
+2. 检出固定版本的 `sdk` 子模块；
+3. 在 Windows 环境构建并校验 `9288SCompat.bda`；
+4. 上传 BDA 及 `SHA256SUMS.txt` 作为工作流产物；
+5. 创建或更新与 Tag 同名的 GitHub Release。
 
-For example:
+例如：
 
 ```powershell
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow can also be started manually from GitHub Actions; a manual run
-produces workflow artifacts but does not create a GitHub Release.
+也可以在 GitHub Actions 页面手动运行工作流。手动运行只生成工作流产物，
+不会创建 GitHub Release。
