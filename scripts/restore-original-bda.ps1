@@ -5,9 +5,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$BackupPath = Join-Path $ProjectRoot "build\bbk9588\backup\宠物单词.bda"
-$TargetDirectory = "/应用/程序"
-$TargetName = "宠物单词.bda"
+$AppsName = -join @([char]0x5e94, [char]0x7528)
+$ProgramsName = -join @([char]0x7a0b, [char]0x5e8f)
+$LauncherName = -join @(
+  [char]0x5ba0, [char]0x7269, [char]0x5355, [char]0x8bcd
+)
+$TargetDirectory = "/$AppsName/$ProgramsName"
+$TargetName = "$LauncherName.bda"
+$BackupPath = Join-Path $ProjectRoot "build\bbk9588\backup\$TargetName"
 
 if (-not (Test-Path -LiteralPath $BackupPath)) {
   throw "Original BDA backup not found at $BackupPath"

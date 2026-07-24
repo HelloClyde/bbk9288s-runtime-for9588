@@ -1,13 +1,16 @@
 # BBK 9588 port
 
-The adapter is a native BDA containing the authorized D300 application selected
-at build time. It allocates the guest address space, loads the original program
-at `0x02700000`, installs relocation-table traps, and runs the portable C33
-interpreter.
+The adapter is a native BDA that opens the public SDK's firmware file selector
+at startup. It reads the selected D300 EXE from the 9588 NAND, allocates the
+guest address space, loads the original program at `0x02700000`, installs
+relocation-table traps, and runs the portable C33 interpreter. No game bytes
+are embedded in the BDA.
 
 The current QEMU-specific host adapter provides:
 
-- a centered 160×240 guest surface on the rotated 240×320 RGB565 display;
+- an unscaled 160×240 guest surface at the top center of the rotated 240×320
+  RGB565 display;
+- side EXE/settings buttons and a bottom touch D-pad/A/B control area;
 - row-aligned packed 2bpp image decoding;
 - a persistent 9288S GUI message loop and timer;
 - direction/confirm/exit key translation;

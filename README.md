@@ -67,6 +67,8 @@ build/                 generated artifacts (ignored)
 The original 9288S 海盗船 executable now runs interactively in the QEMU-based
 9588 emulator:
 
+- launching the BDA first opens the native 9588 file selector, filtered to
+  `.exe`, and loads the selected D300 image from NAND at runtime;
 - the portable S1C33 interpreter executes the unmodified D300 program image;
 - the 9288S relocation-table calls are handled by the compatibility runtime;
 - the title artwork and game board render to the 9588 RGB565 scanout;
@@ -77,6 +79,8 @@ The original 9288S 海盗船 executable now runs interactively in the QEMU-based
 - the original save/load selectors support touch, render like the 9288S
   screens, and persist all five slots in the 9588 NAND;
 - score, life, and level text uses the original black-on-white DC state;
+- the 160×240 guest view is centered at the top without scaling, with EXE and
+  settings buttons at its sides and a touch D-pad/A/B area below it;
 - the timer and resumable 9288S message loops run inside the native 9588 BDA;
 - emulator key events are consumed directly, without re-entering the 9588
   firmware GUI event dispatcher.
@@ -84,7 +88,9 @@ The original 9288S 海盗船 executable now runs interactively in the QEMU-based
 The current port deliberately targets the project's QEMU 9588 emulator. It
 uses its diagnostic input queue and direct LCD scanout; physical 9588 hardware
 would need a different host adapter. Sound is not implemented, but it is not
-required to play or save a session.
+required to play or save a session. EXE selection/loading is generic; API
+coverage is still expanded application by application, with 海盗船 currently
+the fully verified target.
 
 ## Build, install, and play
 
@@ -93,7 +99,7 @@ Prerequisites:
 - the 9588 emulator frontend running at `http://127.0.0.1:8013`;
 - the 9588 native SDK at
   `C:\Users\ASUS\Documents\eebbk9588_native_sdk`;
-- an authorized copy of the original 海盗船 D300 executable.
+- one or more authorized 9288S D300 executables.
 
 Run the complete workflow:
 
@@ -105,16 +111,21 @@ cd E:\bbk9288s-compat9588
 If the executable is at `game\pirate.exe` or at the locally discovered
 original path, `-GamePath` can be omitted. The script builds the BDA, backs up
 the original `宠物单词.bda`, installs the compatibility runtime under that
-fixed launcher name, resets the emulator, selects 背单词/E-pets, and opens
-海盗船.
+fixed launcher name, copies the optional EXE to the 9588 NAND root, resets the
+emulator, selects 背单词/E-pets, and opens the native EXE selector. The BDA
+itself contains no game executable.
 
 Controls in the 9588 web frontend:
 
 | Game input | Keyboard | Frontend button |
 | --- | --- | --- |
-| Move | `W` `A` `S` `D` | direction pad |
-| Confirm | `J` | 确定 |
-| Exit/back | `K` | 退出 |
+| Move | `W` `A` `S` `D` | bottom touch D-pad |
+| Confirm | `J` | bottom `A` |
+| Exit/back | `K` | bottom `B` |
+
+Tap the left-side `EXE` button to leave the current guest and reopen the
+firmware selector. Tap the right-side `SET` button to swap the bottom controls
+between left- and right-handed layouts.
 
 The 9588 web display is also touch-enabled. On the game screen, tap
 `帮助说明` to open the firmware Help Page (including its scroll bar and return

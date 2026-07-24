@@ -6,17 +6,16 @@
 #include "../../runtime/include/compat_gui.h"
 #include "../../runtime/include/d300.h"
 
-#include "../../build/bbk9588/generated_game.inc"
-
-#define SCREEN_W         320
-#define SCREEN_H         240
+#define SCREEN_W         240
+#define SCREEN_H         320
 #define GUEST_SCREEN_W   160
 #define GUEST_SCREEN_H   240
-#define GUEST_SCREEN_X   ((SCREEN_W - GUEST_SCREEN_W) / 2)
 #define PHYSICAL_SCREEN_W 240
 #define PHYSICAL_SCREEN_H 320
-#define PHYSICAL_GUEST_X  ((PHYSICAL_SCREEN_W - GUEST_SCREEN_W) / 2)
-#define PHYSICAL_GUEST_Y  ((PHYSICAL_SCREEN_H - GUEST_SCREEN_H) / 2)
+#define GAME_VIEW_W      160
+#define GAME_VIEW_H      240
+#define GAME_VIEW_X      ((SCREEN_W - GAME_VIEW_W) / 2)
+#define BOTTOM_BAR_TOP   GAME_VIEW_H
 #define QEMU_FRAMEBUFFER  0xa1f82000u
 #define QEMU_EVENT_QUEUE  0xa9f00040u
 #define QEMU_EVENT_MAGIC  0x514b4242u
@@ -31,7 +30,8 @@
 #define GUEST_API_SIZE   0x00010000u
 #define GUEST_HEAP_SIZE  0x00020000u
 #define GUEST_CODE_BASE  0x02700000u
-#define GUEST_CODE_SIZE  0x00020000u
+#define GUEST_CODE_MIN_SIZE 0x00020000u
+#define GUEST_CODE_MAX_SIZE 0x00100000u
 #define GUEST_STACK_TOP  0x00003f80u
 #define GUEST_HEAP_BASE  0x02600000u
 #define GUEST_HEAP_END   (GUEST_HEAP_BASE + GUEST_HEAP_SIZE)
@@ -48,10 +48,19 @@
 #define LISTBOX_ITEM_STEP  19u
 #define HOST_TICK_MS     25u
 #define MAX_FILE_IO_SIZE 0x00020000u
+#define MAX_D300_FILE_SIZE 0x00400000u
 
-/* "海盗船" in the GBK encoding consumed by the 9588 firmware UI. */
-static const char k_native_help_title[] =
-    "\xba\xa3\xb5\xc1\xb4\xac";
+#define VIRTUAL_ACTION_NONE     0u
+#define VIRTUAL_ACTION_UP       1u
+#define VIRTUAL_ACTION_DOWN     2u
+#define VIRTUAL_ACTION_LEFT     3u
+#define VIRTUAL_ACTION_RIGHT    4u
+#define VIRTUAL_ACTION_CONFIRM  5u
+#define VIRTUAL_ACTION_BACK     6u
+#define VIRTUAL_ACTION_SELECT   7u
+#define VIRTUAL_ACTION_SETTINGS 8u
+
+static const char k_native_help_title[] = "9288S";
 
 static const char *const k_native_save_paths[5] = {
     "A:\\PIRATE1.SAV",
@@ -113,6 +122,10 @@ typedef struct compat_9588_state {
     int touch_captured;
     u32 touch_x;
     u32 touch_y;
+    u32 touch_region;
+    u32 virtual_action;
+    int controls_left;
+    int request_reselect;
     u32 timer_hwnd;
     u32 timer_id;
     u32 timer_interval;
@@ -326,12 +339,199 @@ static u16 logical_color_to_rgb565(u32 color)
     return (u16)color;
 }
 
+static u8 glyph_row(char ch, u32 row);
+
 static void fill_framebuffer(compat_9588_state_t *state, u16 color)
 {
     u32 i;
     for (i = 0; i < SCREEN_W * SCREEN_H; ++i) {
         state->framebuffer[i] = color;
     }
+}
+
+static void put_panel_pixel(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u16 color
+)
+{
+    if (!state->framebuffer ||
+        x < 0 || y < 0 ||
+        x >= SCREEN_W || y >= SCREEN_H) {
+        return;
+    }
+    state->framebuffer[(u32)y * SCREEN_W + (u32)x] = color;
+}
+
+static void fill_panel_rect(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u16 color
+)
+{
+    u32 px;
+    u32 py;
+    for (py = 0u; py < height; ++py) {
+        for (px = 0u; px < width; ++px) {
+            put_panel_pixel(state, x + (s32)px, y + (s32)py, color);
+        }
+    }
+}
+
+static void draw_panel_line(
+    compat_9588_state_t *state,
+    s32 x0,
+    s32 y0,
+    s32 x1,
+    s32 y1,
+    u16 color
+)
+{
+    s32 dx = x1 >= x0 ? x1 - x0 : x0 - x1;
+    s32 sx = x0 < x1 ? 1 : -1;
+    s32 dy = y1 >= y0 ? y0 - y1 : y1 - y0;
+    s32 sy = y0 < y1 ? 1 : -1;
+    s32 error = dx + dy;
+    for (;;) {
+        s32 twice;
+        put_panel_pixel(state, x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        twice = error * 2;
+        if (twice >= dy) {
+            error += dy;
+            x0 += sx;
+        }
+        if (twice <= dx) {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static void draw_panel_text(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    const char *text,
+    u16 color
+)
+{
+    u32 index;
+    for (index = 0u; text[index]; ++index) {
+        u32 row;
+        for (row = 0u; row < 7u; ++row) {
+            u8 bits = glyph_row(text[index], row);
+            u32 column;
+            for (column = 0u; column < 5u; ++column) {
+                if (bits & (1u << (4u - column))) {
+                    put_panel_pixel(
+                        state,
+                        x + (s32)(index * 6u + column),
+                        y + (s32)row,
+                        color
+                    );
+                }
+            }
+        }
+    }
+}
+
+static void draw_virtual_controls(compat_9588_state_t *state)
+{
+    const u16 background = 0x18c3u;
+    const u16 panel = 0x3186u;
+    const u16 edge = 0x7befu;
+    const u16 ink = 0xffffu;
+    s32 dpad_x = state->controls_left ? 20 : 140;
+    s32 confirm_x = state->controls_left ? 138 : 8;
+    s32 back_x = state->controls_left ? 194 : 64;
+
+    fill_panel_rect(
+        state, 0, 0, GAME_VIEW_X, GAME_VIEW_H,
+        background
+    );
+    fill_panel_rect(
+        state,
+        GAME_VIEW_X + GAME_VIEW_W,
+        0,
+        GAME_VIEW_X,
+        GAME_VIEW_H,
+        background
+    );
+    fill_panel_rect(
+        state, 0, BOTTOM_BAR_TOP, SCREEN_W, SCREEN_H - BOTTOM_BAR_TOP,
+        background
+    );
+    draw_panel_line(
+        state, 0, BOTTOM_BAR_TOP, SCREEN_W - 1, BOTTOM_BAR_TOP, edge
+    );
+    draw_panel_line(
+        state, GAME_VIEW_X, 0, GAME_VIEW_X, GAME_VIEW_H - 1, edge
+    );
+    draw_panel_line(
+        state,
+        GAME_VIEW_X + GAME_VIEW_W - 1,
+        0,
+        GAME_VIEW_X + GAME_VIEW_W - 1,
+        GAME_VIEW_H - 1,
+        edge
+    );
+
+    /* Side function buttons leave the 160x240 guest view untouched. */
+    fill_panel_rect(state, 2, 82, 36, 52, panel);
+    draw_panel_line(state, 2, 82, 37, 82, edge);
+    draw_panel_line(state, 2, 133, 37, 133, edge);
+    draw_panel_line(state, 2, 82, 2, 133, edge);
+    draw_panel_line(state, 37, 82, 37, 133, edge);
+    draw_panel_text(state, 11, 105, "EXE", ink);
+
+    fill_panel_rect(state, 202, 82, 36, 52, panel);
+    draw_panel_line(state, 202, 82, 237, 82, edge);
+    draw_panel_line(state, 202, 133, 237, 133, edge);
+    draw_panel_line(state, 202, 82, 202, 133, edge);
+    draw_panel_line(state, 237, 82, 237, 133, edge);
+    draw_panel_text(state, 211, 105, "SET", ink);
+
+    /* Bottom virtual controls. Settings swaps left/right handed placement. */
+    fill_panel_rect(state, dpad_x + 28, 242, 28, 24, panel);
+    fill_panel_rect(state, dpad_x, 266, 28, 28, panel);
+    fill_panel_rect(state, dpad_x + 28, 266, 28, 28, panel);
+    fill_panel_rect(state, dpad_x + 56, 266, 28, 28, panel);
+    fill_panel_rect(state, dpad_x + 28, 294, 28, 24, panel);
+    draw_panel_line(
+        state, dpad_x + 42, 246, dpad_x + 34, 260, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 42, 246, dpad_x + 50, 260, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 4, 280, dpad_x + 18, 272, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 4, 280, dpad_x + 18, 288, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 80, 280, dpad_x + 66, 272, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 80, 280, dpad_x + 66, 288, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 42, 314, dpad_x + 34, 300, ink
+    );
+    draw_panel_line(
+        state, dpad_x + 42, 314, dpad_x + 50, 300, ink
+    );
+
+    /* Confirm/back buttons. */
+    fill_panel_rect(state, confirm_x, 246, 38, 32, 0x03efu);
+    fill_panel_rect(state, back_x, 286, 38, 32, 0xc986u);
+    draw_panel_text(state, confirm_x + 16, 258, "A", ink);
+    draw_panel_text(state, back_x + 16, 298, "B", ink);
 }
 
 static void put_guest_pixel(
@@ -341,15 +541,18 @@ static void put_guest_pixel(
     u32 color
 )
 {
-    s32 host_x;
+    s32 panel_x;
+    s32 panel_y;
     if (!state->framebuffer ||
         x < 0 || y < 0 ||
         x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H) {
         return;
     }
-    host_x = x + GUEST_SCREEN_X;
-    state->framebuffer[y * SCREEN_W + host_x] =
-        logical_color_to_rgb565(color);
+    panel_x = GAME_VIEW_X + x;
+    panel_y = y;
+    put_panel_pixel(
+        state, panel_x, panel_y, logical_color_to_rgb565(color)
+    );
 }
 
 static void fill_guest_rect(
@@ -414,22 +617,13 @@ static void present_framebuffer(compat_9588_state_t *state)
         return;
     }
     render_listbox_selection(state);
+    draw_virtual_controls(state);
     for (y = 0; y < PHYSICAL_SCREEN_H; ++y) {
         for (x = 0; x < PHYSICAL_SCREEN_W; ++x) {
             u32 output_x = PHYSICAL_SCREEN_W - 1u - x;
             u32 output_y = PHYSICAL_SCREEN_H - 1u - y;
-            u16 color = 0x0000u;
-            if (x >= PHYSICAL_GUEST_X &&
-                x < PHYSICAL_GUEST_X + GUEST_SCREEN_W &&
-                y >= PHYSICAL_GUEST_Y &&
-                y < PHYSICAL_GUEST_Y + GUEST_SCREEN_H) {
-                color = state->framebuffer[
-                    (y - PHYSICAL_GUEST_Y) * SCREEN_W +
-                    GUEST_SCREEN_X +
-                    (x - PHYSICAL_GUEST_X)
-                ];
-            }
-            output[output_y * PHYSICAL_SCREEN_W + output_x] = color;
+            output[output_y * PHYSICAL_SCREEN_W + output_x] =
+                state->framebuffer[y * SCREEN_W + x];
         }
     }
 }
@@ -562,6 +756,38 @@ static u8 glyph_row(char ch, u32 row)
     if (ch == '/') {
         static const u8 slash[7] = {1,1,2,4,8,16,16};
         return slash[row];
+    }
+    if (ch == 'A') {
+        static const u8 glyph[7] = {14,17,17,31,17,17,17};
+        return glyph[row];
+    }
+    if (ch == 'B') {
+        static const u8 glyph[7] = {30,17,17,30,17,17,30};
+        return glyph[row];
+    }
+    if (ch == 'E') {
+        static const u8 glyph[7] = {31,16,16,30,16,16,31};
+        return glyph[row];
+    }
+    if (ch == 'O') {
+        static const u8 glyph[7] = {14,17,17,17,17,17,14};
+        return glyph[row];
+    }
+    if (ch == 'R') {
+        static const u8 glyph[7] = {30,17,17,30,20,18,17};
+        return glyph[row];
+    }
+    if (ch == 'S') {
+        static const u8 glyph[7] = {15,16,16,14,1,1,30};
+        return glyph[row];
+    }
+    if (ch == 'T') {
+        static const u8 glyph[7] = {31,4,4,4,4,4,4};
+        return glyph[row];
+    }
+    if (ch == 'X') {
+        static const u8 glyph[7] = {17,17,10,4,10,17,17};
+        return glyph[row];
     }
     return 0;
 }
@@ -704,6 +930,140 @@ static u32 touch_raw_to_panel_y(u32 raw_y)
     return (3660u - raw_y) * (PHYSICAL_SCREEN_H - 1u) / 3519u;
 }
 
+static int panel_to_guest(
+    const compat_9588_state_t *state,
+    u32 panel_x,
+    u32 panel_y,
+    u32 *guest_x,
+    u32 *guest_y
+)
+{
+    (void)state;
+    if (panel_y >= GAME_VIEW_H ||
+        panel_x < GAME_VIEW_X ||
+        panel_x >= GAME_VIEW_X + GAME_VIEW_W) {
+        return 0;
+    }
+    *guest_x = panel_x - GAME_VIEW_X;
+    *guest_y = panel_y;
+    return 1;
+}
+
+static u32 virtual_action_at(
+    const compat_9588_state_t *state,
+    u32 x,
+    u32 y
+)
+{
+    s32 dpad_x = state->controls_left ? 20 : 140;
+    s32 confirm_x = state->controls_left ? 138 : 8;
+    s32 back_x = state->controls_left ? 194 : 64;
+
+    if (x >= 2u && x < 38u && y >= 82u && y < 134u) {
+        return VIRTUAL_ACTION_SELECT;
+    }
+    if (x >= 202u && x < 238u && y >= 82u && y < 134u) {
+        return VIRTUAL_ACTION_SETTINGS;
+    }
+    if ((s32)x >= dpad_x + 28 && (s32)x < dpad_x + 56 &&
+        y >= 242u && y < 266u) {
+        return VIRTUAL_ACTION_UP;
+    }
+    if ((s32)x >= dpad_x && (s32)x < dpad_x + 28 &&
+        y >= 266u && y < 294u) {
+        return VIRTUAL_ACTION_LEFT;
+    }
+    if ((s32)x >= dpad_x + 56 && (s32)x < dpad_x + 84 &&
+        y >= 266u && y < 294u) {
+        return VIRTUAL_ACTION_RIGHT;
+    }
+    if ((s32)x >= dpad_x + 28 && (s32)x < dpad_x + 56 &&
+        y >= 294u && y < 318u) {
+        return VIRTUAL_ACTION_DOWN;
+    }
+    if ((s32)x >= confirm_x && (s32)x < confirm_x + 38 &&
+        y >= 246u && y < 278u) {
+        return VIRTUAL_ACTION_CONFIRM;
+    }
+    if ((s32)x >= back_x && (s32)x < back_x + 38 &&
+        y >= 286u && y < 318u) {
+        return VIRTUAL_ACTION_BACK;
+    }
+    return VIRTUAL_ACTION_NONE;
+}
+
+static u32 virtual_action_scancode(u32 action)
+{
+    switch (action) {
+    case VIRTUAL_ACTION_UP: return COMPAT_SCANCODE_UP;
+    case VIRTUAL_ACTION_DOWN: return COMPAT_SCANCODE_DOWN;
+    case VIRTUAL_ACTION_LEFT: return COMPAT_SCANCODE_LEFT;
+    case VIRTUAL_ACTION_RIGHT: return COMPAT_SCANCODE_RIGHT;
+    case VIRTUAL_ACTION_CONFIRM: return COMPAT_SCANCODE_ENTER;
+    case VIRTUAL_ACTION_BACK: return COMPAT_SCANCODE_ESCAPE;
+    default: return 0u;
+    }
+}
+
+static void toggle_control_layout(compat_9588_state_t *state)
+{
+    state->controls_left = !state->controls_left;
+}
+
+static void queue_guest_pointer_down(
+    compat_9588_state_t *state,
+    u32 guest_x,
+    u32 guest_y
+)
+{
+    if (state->parent_hwnd &&
+        guest_x >= 16u && guest_x < 142u &&
+        guest_y >= LISTBOX_SELECT_Y &&
+        guest_y <
+            LISTBOX_SELECT_Y +
+            LISTBOX_ITEM_COUNT * LISTBOX_ITEM_STEP) {
+        u32 item =
+            (guest_y - LISTBOX_SELECT_Y) / LISTBOX_ITEM_STEP;
+        if (item < state->listbox_item_count) {
+            state->listbox_caret = item;
+        }
+    }
+    queue_pointer_message(
+        state, COMPAT_MSG_LBUTTONDOWN, guest_x, guest_y, 4u
+    );
+}
+
+static void queue_guest_pointer_up(
+    compat_9588_state_t *state,
+    u32 guest_x,
+    u32 guest_y
+)
+{
+    queue_pointer_message(
+        state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
+    );
+    if (state->parent_hwnd && guest_y >= 190u) {
+        queue_message(
+            state,
+            state->guest_hwnd,
+            COMPAT_MSG_KEYDOWN,
+            guest_x < 80u
+                ? COMPAT_SCANCODE_ENTER
+                : COMPAT_SCANCODE_ESCAPE,
+            0u
+        );
+    } else if (state->parent_hwnd &&
+               guest_x >= 132u && guest_y < 24u) {
+        queue_message(
+            state,
+            state->guest_hwnd,
+            COMPAT_MSG_KEYDOWN,
+            COMPAT_SCANCODE_ESCAPE,
+            0u
+        );
+    }
+}
+
 static void service_touch_input(compat_9588_state_t *state)
 {
     volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
@@ -712,6 +1072,7 @@ static void service_touch_input(compat_9588_state_t *state)
     u32 panel_y;
     u32 guest_x;
     u32 guest_y;
+    u32 action;
 
     if (trace[0] != QEMU_TOUCH_MAGIC) {
         state->touch_ready = 0;
@@ -730,83 +1091,68 @@ static void service_touch_input(compat_9588_state_t *state)
         return;
     }
 
-    /*
-     * The 9288S game surface is centered inside the 9588 panel. Ignore the
-     * black border while retaining the last in-surface point for pen-up.
-     */
-    if (panel_x < PHYSICAL_GUEST_X ||
-        panel_x >= PHYSICAL_GUEST_X + GUEST_SCREEN_W ||
-        panel_y < PHYSICAL_GUEST_Y ||
-        panel_y >= PHYSICAL_GUEST_Y + GUEST_SCREEN_H) {
-        if (!down && state->touch_captured) {
-            guest_x = state->touch_x - PHYSICAL_GUEST_X;
-            guest_y = state->touch_y - PHYSICAL_GUEST_Y;
-            queue_pointer_message(
-                state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
-            );
-            state->touch_captured = 0;
+    if (down && !state->touch_down) {
+        if (panel_to_guest(
+                state, panel_x, panel_y, &guest_x, &guest_y
+            )) {
+            queue_guest_pointer_down(state, guest_x, guest_y);
+            state->touch_region = 1u;
+            state->touch_captured = 1;
+            g_diagnostic[14] += 1u;
+        } else {
+            state->virtual_action =
+                virtual_action_at(state, panel_x, panel_y);
+            state->touch_region = 2u;
         }
-        state->touch_down = down;
-        return;
-    }
-
-    guest_x = panel_x - PHYSICAL_GUEST_X;
-    guest_y = panel_y - PHYSICAL_GUEST_Y;
-    if (down && !state->touch_captured) {
-        if (state->parent_hwnd &&
-            guest_x >= 16u && guest_x < 142u &&
-            guest_y >= LISTBOX_SELECT_Y &&
-            guest_y <
-                LISTBOX_SELECT_Y +
-                LISTBOX_ITEM_COUNT * LISTBOX_ITEM_STEP) {
-            u32 item =
-                (guest_y - LISTBOX_SELECT_Y) / LISTBOX_ITEM_STEP;
-            if (item < state->listbox_item_count) {
-                state->listbox_caret = item;
-            }
-        }
-        queue_pointer_message(
-            state, COMPAT_MSG_LBUTTONDOWN, guest_x, guest_y, 4u
-        );
-        state->touch_captured = 1;
-        g_diagnostic[14] += 1u;
-    } else if (down &&
-               (panel_x != state->touch_x || panel_y != state->touch_y)) {
+    } else if (down && state->touch_region == 1u &&
+               (panel_x != state->touch_x ||
+                panel_y != state->touch_y) &&
+               panel_to_guest(
+                   state, panel_x, panel_y, &guest_x, &guest_y
+               )) {
         queue_pointer_message(
             state, COMPAT_MSG_MOUSEMOVE, guest_x, guest_y, 4u
         );
-    } else if (!down && state->touch_captured) {
-        queue_pointer_message(
-            state, COMPAT_MSG_LBUTTONUP, guest_x, guest_y, 0u
-        );
-        if (state->parent_hwnd && guest_y >= 190u) {
-            if (guest_x < 80u) {
-                queue_message(
+    } else if (!down && state->touch_down) {
+        if (state->touch_region == 1u) {
+            if (!panel_to_guest(
+                    state, panel_x, panel_y, &guest_x, &guest_y
+                )) {
+                (void)panel_to_guest(
                     state,
-                    state->guest_hwnd,
-                    COMPAT_MSG_KEYDOWN,
-                    COMPAT_SCANCODE_ENTER,
-                    0u
-                );
-            } else {
-                queue_message(
-                    state,
-                    state->guest_hwnd,
-                    COMPAT_MSG_KEYDOWN,
-                    COMPAT_SCANCODE_ESCAPE,
-                    0u
+                    panel_x < GAME_VIEW_X
+                        ? GAME_VIEW_X
+                        : (panel_x >= GAME_VIEW_X + GAME_VIEW_W
+                            ? GAME_VIEW_X + GAME_VIEW_W - 1u
+                            : panel_x),
+                    panel_y < GAME_VIEW_H
+                        ? panel_y : GAME_VIEW_H - 1u,
+                    &guest_x,
+                    &guest_y
                 );
             }
-        } else if (state->parent_hwnd &&
-                   guest_x >= 132u && guest_y < 24u) {
-            queue_message(
-                state,
-                state->guest_hwnd,
-                COMPAT_MSG_KEYDOWN,
-                COMPAT_SCANCODE_ESCAPE,
-                0u
-            );
+            queue_guest_pointer_up(state, guest_x, guest_y);
+        } else if (state->touch_region == 2u) {
+            action = virtual_action_at(state, panel_x, panel_y);
+            if (action == state->virtual_action) {
+                u32 scancode = virtual_action_scancode(action);
+                if (scancode) {
+                    queue_message(
+                        state,
+                        state->guest_hwnd,
+                        COMPAT_MSG_KEYDOWN,
+                        scancode,
+                        0u
+                    );
+                } else if (action == VIRTUAL_ACTION_SELECT) {
+                    state->request_reselect = 1;
+                } else if (action == VIRTUAL_ACTION_SETTINGS) {
+                    toggle_control_layout(state);
+                }
+            }
         }
+        state->touch_region = 0u;
+        state->virtual_action = VIRTUAL_ACTION_NONE;
         state->touch_captured = 0;
     }
     state->touch_down = down;
@@ -1787,15 +2133,17 @@ static c33_vm_status_t dispatch_9588(
             g_diagnostic[13] = buffer;
             g_diagnostic[14] =
                 state->framebuffer[
-                    (GUEST_SCREEN_H / 2) * SCREEN_W +
-                    GUEST_SCREEN_X +
-                    (GUEST_SCREEN_W / 2)
+                    (GAME_VIEW_H / 2) * SCREEN_W +
+                    GAME_VIEW_X +
+                    (GAME_VIEW_W / 2)
                 ];
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
     case COMPAT_GUI_CLEAR_SCREEN:
-        fill_framebuffer(state, 0xffffu);
+        fill_guest_rect(
+            state, 0u, 0u, GUEST_SCREEN_W, GUEST_SCREEN_H, 15u
+        );
         present_framebuffer(state);
         vm->regs[4] = 0u;
         return C33_VM_OK;
@@ -1865,15 +2213,58 @@ static void service_timer(compat_9588_state_t *state, u32 elapsed)
     }
 }
 
-__attribute__((section(".text.bda_main")))
-int bda_main(void)
+static u8 *load_d300_file(const char *path, u32 *size_out)
 {
-    const u8 *file_bytes = k_embedded_game;
-    u32 file_size = K_EMBEDDED_GAME_SIZE;
+    int file;
+    int file_size;
+    int items_read;
+    u8 *bytes;
+
+    *size_out = 0u;
+    file = bda_fs_fopen_raw(path, "rb");
+    if (!bda_fs_file_is_valid(file)) {
+        return 0;
+    }
+    if (bda_fs_seek_raw(file, 0, BDA_SEEK_END) < 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    file_size = bda_fs_tell_raw(file);
+    if (file_size < (int)D300_MIN_HEADER_SIZE ||
+        (u32)file_size > MAX_D300_FILE_SIZE ||
+        bda_fs_seek_raw(file, 0, BDA_SEEK_SET) < 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    bytes = (u8 *)bda_alloc((u32)file_size);
+    if (allocation_failed(bytes)) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    items_read = bda_fs_fread_raw(
+        bytes, 1u, (u32)file_size, file
+    );
+    (void)bda_fs_close_raw(file);
+    if (items_read != file_size) {
+        bda_free(bytes);
+        return 0;
+    }
+    *size_out = (u32)file_size;
+    return bytes;
+}
+
+static int run_selected_game(
+    const char *selected_path,
+    int *reselect_out
+)
+{
+    u8 *file_bytes;
+    u32 file_size;
     u8 *iram = 0;
     u8 *api_ram = 0;
     u8 *heap_ram = 0;
     u8 *code_ram = 0;
+    u32 code_size = GUEST_CODE_MIN_SIZE;
     u16 *framebuffer = 0;
     compat_9588_runtime_t *runtime;
     d300_image_t *image;
@@ -1885,10 +2276,19 @@ int bda_main(void)
     u32 host_tick;
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
+    *reselect_out = 0;
+    file_bytes = load_d300_file(selected_path, &file_size);
+    if (!file_bytes) {
+        bda_msgbox("9288S", "Could not load selected EXE");
+        *reselect_out = 1;
+        return 3;
+    }
+
     g_diagnostic[1] = 1u;
     runtime = (compat_9588_runtime_t *)bda_alloc(sizeof(*runtime));
     if (allocation_failed(runtime)) {
         bda_msgbox("9288S compatibility", "Not enough runtime memory");
+        bda_free(file_bytes);
         return 1;
     }
     g_diagnostic[1] = 2u;
@@ -1902,9 +2302,11 @@ int bda_main(void)
     state->brush_color = 15u;
     state->background_color = 15u;
     state->text_color = 16u;
+    state->controls_left = 1;
     framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * 2u);
     if (allocation_failed(framebuffer)) {
         bda_msgbox("9288S compatibility", "Not enough display memory");
+        bda_free(file_bytes);
         bda_free(runtime);
         return 2;
     }
@@ -1916,22 +2318,30 @@ int bda_main(void)
     image_status = d300_parse(image, file_bytes, file_size);
     if (image_status != D300_OK) {
         bda_msgbox("9288S compatibility", d300_status_string(image_status));
+        bda_free(file_bytes);
         bda_free(framebuffer);
         bda_free(runtime);
+        *reselect_out = 1;
         return 4;
     }
     g_diagnostic[1] = 4u;
-    if (image->program_size > GUEST_CODE_SIZE) {
+    if (image->program_size > GUEST_CODE_MAX_SIZE) {
         bda_msgbox("9288S compatibility", "D300 program is too large");
+        bda_free(file_bytes);
         bda_free(framebuffer);
         bda_free(runtime);
+        *reselect_out = 1;
         return 5;
+    }
+    if (image->program_size > code_size) {
+        code_size =
+            (image->program_size + 0xffffu) & ~0xffffu;
     }
 
     iram = (u8 *)bda_alloc(GUEST_IRAM_SIZE);
     api_ram = (u8 *)bda_alloc(GUEST_API_SIZE);
     heap_ram = (u8 *)bda_alloc(GUEST_HEAP_SIZE);
-    code_ram = (u8 *)bda_alloc(GUEST_CODE_SIZE);
+    code_ram = (u8 *)bda_alloc(code_size);
     if (allocation_failed(iram) ||
         allocation_failed(api_ram) ||
         allocation_failed(heap_ram) ||
@@ -1940,6 +2350,7 @@ int bda_main(void)
         if (!allocation_failed(api_ram)) bda_free(api_ram);
         if (!allocation_failed(heap_ram)) bda_free(heap_ram);
         if (!allocation_failed(code_ram)) bda_free(code_ram);
+        bda_free(file_bytes);
         bda_free(framebuffer);
         bda_free(runtime);
         bda_msgbox("9288S compatibility", "Not enough memory for guest RAM");
@@ -1949,18 +2360,20 @@ int bda_main(void)
     bda_memset(iram, 0, GUEST_IRAM_SIZE);
     bda_memset(api_ram, 0, GUEST_API_SIZE);
     bda_memset(heap_ram, 0, GUEST_HEAP_SIZE);
-    bda_memset(code_ram, 0, GUEST_CODE_SIZE);
+    bda_memset(code_ram, 0, code_size);
     bda_memcpy(
         code_ram,
         d300_program(image),
         image->program_size
     );
+    bda_free(file_bytes);
+    file_bytes = 0;
 
     c33_vm_init(vm);
     c33_vm_map(vm, 0, iram, GUEST_IRAM_SIZE, 1);
     c33_vm_map(vm, GUEST_API_BASE, api_ram, GUEST_API_SIZE, 1);
     c33_vm_map(vm, GUEST_HEAP_BASE, heap_ram, GUEST_HEAP_SIZE, 1);
-    c33_vm_map(vm, GUEST_CODE_BASE, code_ram, GUEST_CODE_SIZE, 1);
+    c33_vm_map(vm, GUEST_CODE_BASE, code_ram, code_size, 1);
     compat_api_init(api, vm, GUEST_HEAP_BASE, GUEST_HEAP_END);
     api->dispatch = dispatch_9588;
     api->dispatch_opaque = state;
@@ -2006,6 +2419,10 @@ int bda_main(void)
             u32 elapsed_ticks;
             bda_sys_delay(1u);
             service_hardware_input(state);
+            if (state->request_reselect) {
+                vm_status = C33_VM_DONE;
+                break;
+            }
             current_tick = bda_gui_tick_count_25ms();
             elapsed_ticks = current_tick - host_tick;
             if (elapsed_ticks) {
@@ -2016,7 +2433,9 @@ int bda_main(void)
         present_framebuffer(state);
     }
 
-    if (vm_status == C33_VM_DONE && !state->quit) {
+    if (vm_status == C33_VM_DONE &&
+        !state->quit &&
+        !state->request_reselect) {
         char text[128];
         char *out = text;
         char *end = text + sizeof(text);
@@ -2039,8 +2458,45 @@ int bda_main(void)
     bda_free(iram);
     bda_free(framebuffer);
     state->framebuffer = 0;
+    *reselect_out = state->request_reselect;
     bda_free(runtime);
     return vm_status == C33_VM_DONE ? 0 : 8;
+}
+
+__attribute__((section(".text.bda_main")))
+int bda_main(void)
+{
+    bda_file_selector_t *selector;
+    int selector_result;
+    int run_result = 0;
+    int reselect = 0;
+
+    selector = (bda_file_selector_t *)bda_alloc(sizeof(*selector));
+    if (allocation_failed(selector)) {
+        bda_msgbox("9288S", "Not enough memory for file selector");
+        return 1;
+    }
+    for (;;) {
+        selector_result = bda_gui_select_file(
+            selector,
+            "A:\\",
+            "exe",
+            "Select 9288S EXE"
+        );
+        if (selector_result != BDA_FILE_SELECTOR_SELECTED) {
+            if (selector_result == BDA_FILE_SELECTOR_ERROR) {
+                bda_msgbox("9288S", "File selector failed");
+                run_result = 2;
+            }
+            break;
+        }
+        run_result = run_selected_game(selector->path, &reselect);
+        if (!reselect) {
+            break;
+        }
+    }
+    bda_free(selector);
+    return run_result;
 }
 
 /* The existing one-source BDA builder compiles a single translation unit. */

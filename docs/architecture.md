@@ -47,15 +47,17 @@ interpreter until the callback returns.
 ## Display/input policy
 
 9288S content is portrait and four-gray-level. The initial 9588 adapter keeps a
-160x240 guest surface and presents it centered on the 320x240 RGB565 display.
-An optional horizontal 2x mode can be evaluated later.
+160x240 guest surface, unscaled, at the top center of the rotated 240x320
+RGB565 display. The 40-pixel side areas hold EXE/settings actions, and the
+remaining 240x80 area below the guest holds a touch D-pad and A/B buttons.
 
 Direction, confirm, and exit input are translated to the original 9288S window
-messages. Touch is mapped from the centered guest viewport.
+messages. Touch inside the centered guest viewport is mapped back to 9288S
+coordinates; touch outside it is reserved for the compatibility controls.
 
 ## Milestones
 
-1. Parse and load D300 images.
+1. Select, parse, and load D300 images from the 9588 NAND.
 2. Execute the standard application startup to the first API trap.
 3. Implement C runtime allocation/string/memory calls.
 4. Implement window creation, message queue, drawing surface, timer, and input.

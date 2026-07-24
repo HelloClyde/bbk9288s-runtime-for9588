@@ -84,30 +84,34 @@ VM completion.
 
 ## 9588 emulator verification
 
-The native BDA embeds the locally supplied D300 bytes at build time; generated
-game data stays under ignored `build/` and is never committed. The runtime maps
-the program at its original `0x02700000` address and executes it unchanged.
+The native BDA opens the firmware EXE selector at startup and reads the selected
+D300 bytes from NAND. It maps the program at its original `0x02700000` address
+and executes it unchanged; no original game bytes are packaged in the BDA.
 
 Verified in the 9588 emulator:
 
-1. Launching the BDA reaches the original 海盗船 title image.
-2. The confirm key enters the game board.
-3. Repeated direction input changes game state without scanline corruption or
+1. Launching the BDA opens the native 9588 `.exe` selector.
+2. Selecting 海盗船 loads it from NAND and reaches the original title image.
+3. The bottom touch `A` button enters the game board.
+4. Repeated direction input changes game state without scanline corruption or
    stale movement trails.
-4. Tapping `帮助说明` opens the original help text.
-5. Tapping `退出游戏` opens a yes/no dialog and confirming returns cleanly to
+5. Tapping `帮助说明` opens the original help text.
+6. Tapping `退出游戏` opens a yes/no dialog and confirming returns cleanly to
    the 9588 desktop.
-6. The save and load selectors match their original light/dark 9288S artwork,
+7. The save and load selectors match their original light/dark 9288S artwork,
    support touch selection and confirmation, and restore the board cleanly.
-7. All five 182-byte save files remain available after BDA rebuilds and
+8. All five 182-byte save files remain available after BDA rebuilds and
    emulator resets.
-8. The VM remains in the guest `GetMessage` loop between inputs, with timer
+9. `EXE` reopens the firmware selector, while `SET` swaps the virtual controls
+   between left- and right-handed layouts.
+10. The VM remains in the guest `GetMessage` loop between inputs, with timer
    messages serviced by the host adapter.
 
 Because starting a BDA occurs inside the firmware's own event dispatch stack,
 calling the native GUI poller recursively is unsafe. This port reads the
 emulator's uncached diagnostic event mirror at `0xA9F00040` and writes its
-160×240 output directly into the rotated 240×320 scanout at `0xA1F82000`.
+160×240 output unscaled at the top center of the rotated 240×320 scanout at
+`0xA1F82000`. Side and bottom pixels are used by compatibility controls.
 
 `PutImageArea` receives a 16-byte SDK image object header followed by its
 packed 2bpp payload. Most full-screen images record width 160, height 240, and
@@ -125,7 +129,8 @@ what prevents moving cells from becoming skewed or leaving corrupted trails.
 Touch does not appear in the regular QEMU key queue. The LAN launcher enables
 the `touch-trace=on` machine option, and the BDA polls the uncached touch mirror
 at `0xA9F00100`. Raw SADC coordinates are converted to the centered 160×240
-guest surface before pointer messages are queued.
+guest surface before pointer messages are queued; touches in the side and
+bottom control regions become compatibility actions instead.
 
 The original help action calls GUI slot 448, `Help2(hWnd, helpString)`.
 The adapter reads the zero-terminated GBK help text from guest memory and
