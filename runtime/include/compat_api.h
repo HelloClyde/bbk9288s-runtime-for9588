@@ -12,6 +12,7 @@
 #define COMPAT_AUDIO_TABLE_ADDR   0x02004000u
 #define COMPAT_CRTL_TABLE_ADDR    0x02005000u
 #define COMPAT_DICT_TABLE_ADDR    0x02006000u
+#define COMPAT_HEAP_MAX_BLOCKS    256u
 
 typedef enum compat_api_group {
     COMPAT_API_ROS33 = 0,
@@ -31,6 +32,12 @@ typedef c33_vm_status_t (*compat_api_dispatch_fn)(
     void *opaque
 );
 
+typedef struct compat_heap_block {
+    uint32_t address;
+    uint32_t size;
+    uint8_t used;
+} compat_heap_block_t;
+
 typedef struct compat_api {
     c33_vm_t *vm;
     compat_api_dispatch_fn dispatch;
@@ -38,6 +45,7 @@ typedef struct compat_api {
     uint32_t heap_base;
     uint32_t heap_next;
     uint32_t heap_end;
+    compat_heap_block_t heap_blocks[COMPAT_HEAP_MAX_BLOCKS];
     uint32_t last_group;
     uint32_t last_slot;
 } compat_api_t;
@@ -47,6 +55,11 @@ void compat_api_init(
     c33_vm_t *vm,
     uint32_t heap_base,
     uint32_t heap_end
+);
+uint32_t compat_api_heap_alloc(
+    compat_api_t *api,
+    uint32_t size,
+    int clear
 );
 int compat_api_install(compat_api_t *api);
 c33_vm_status_t compat_api_hostcall(

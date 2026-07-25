@@ -1,5 +1,6 @@
 param(
   [string]$ReleaseRoot = $env:BBK9588_EMULATOR_ROOT,
+  [string]$NandImage,
   [string]$BindAddress = "0.0.0.0",
   [int]$Port = 8013
 )
@@ -16,7 +17,11 @@ $ReleaseRoot = [System.IO.Path]::GetFullPath($ReleaseRoot)
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $ReleaseRoot "python\python.exe"
 $Qemu = Join-Path $ReleaseRoot "bin\bbk9588-qemu-system-mipsel.exe"
-$Nand = Join-Path $ReleaseRoot "runtime\bda_test\bbk9588_nand.bin"
+$Nand = if ([string]::IsNullOrWhiteSpace($NandImage)) {
+  Join-Path $ReleaseRoot "runtime\bda_test\bbk9588_nand.bin"
+} else {
+  [System.IO.Path]::GetFullPath($NandImage)
+}
 $LogDir = Join-Path $ProjectRoot "build\lan"
 $StdoutLog = Join-Path $LogDir "frontend.stdout.log"
 $StderrLog = Join-Path $LogDir "frontend.stderr.log"

@@ -23,6 +23,7 @@ static uint32_t listbox_caret;
 static const char *guest_image_path;
 static FILE *guest_image_file;
 static unsigned timer_message_sent;
+static int probe_five_options;
 
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
@@ -590,6 +591,11 @@ static c33_vm_status_t report_api(
             (int32_t)vm->regs[8] <= (int32_t)bottom;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_DRAW_3D_CONTROL_FRAME) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SEND_MESSAGE) {
         if (vm->regs[6] == 2u) {
             uint32_t message = vm->regs[7];
@@ -706,17 +712,19 @@ static c33_vm_status_t report_api(
         if (status != C33_VM_OK) {
             return status;
         }
-        status = c33_vm_call(
-            vm,
-            callback,
-            1u,
-            COMPAT_MSG_KEYDOWN,
-            COMPAT_SCANCODE_ENTER,
-            0u,
-            1000000u
-        );
-        if (status != C33_VM_OK) {
-            return status;
+        if (!probe_five_options) {
+            status = c33_vm_call(
+                vm,
+                callback,
+                1u,
+                COMPAT_MSG_KEYDOWN,
+                COMPAT_SCANCODE_ENTER,
+                0u,
+                1000000u
+            );
+            if (status != C33_VM_OK) {
+                return status;
+            }
         }
         status = c33_vm_call(
             vm, callback, 1u, COMPAT_MSG_TIMER, 1u, 0u, 1000000u
@@ -729,7 +737,7 @@ static c33_vm_status_t report_api(
             callback,
             1u,
             COMPAT_MSG_LBUTTONDOWN,
-            4u,
+            COMPAT_KEYSTATE_LEFT_BUTTON,
             120u | (170u << 16),
             1000000u
         );
@@ -776,6 +784,10 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == 294u) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SELECT_FONT) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -887,6 +899,21 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_FS && slot == 19u) {
+        static const unsigned char root_path[2] = {'\\', 0};
+        uint32_t buffer = vm->regs[6];
+        if (!buffer) {
+            buffer = compat_api_heap_alloc(api, sizeof(root_path), 0);
+        }
+        if (!buffer ||
+            vm->regs[7] < sizeof(root_path) ||
+            !c33_vm_write(vm, buffer, root_path, sizeof(root_path))) {
+            vm->regs[4] = 0u;
+        } else {
+            vm->regs[4] = buffer;
+        }
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_FS && slot == 27u) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
@@ -986,7 +1013,15 @@ static c33_vm_status_t report_api(
             uint32_t message[7] = {
                 1u, COMPAT_MSG_TIMER, 1u, 0u, 0u, 0u, 0u
             };
-            if (timer_message_sent >= 32u &&
+            if (probe_five_options && timer_message_sent == 8u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_DOWN;
+            } else if (probe_five_options &&
+                       timer_message_sent == 9u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_ENTER;
+            } else if (!probe_five_options &&
+                       timer_message_sent >= 32u &&
                 (timer_message_sent - 32u) % 8u == 0u) {
                 message[1] = COMPAT_MSG_KEYDOWN;
                 message[2] = COMPAT_SCANCODE_ENTER;
@@ -1154,8 +1189,16 @@ int main(int argc, char **argv)
     c33_vm_status_t status;
     unsigned char exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
+    if (argc == 3 && strcmp(argv[1], "--five-options") == 0) {
+        probe_five_options = 1;
+        ++argv;
+        --argc;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: d300-core-probe path-to-app.exe\n");
+        fprintf(
+            stderr,
+            "usage: d300-core-probe [--five-options] path-to-app.exe\n"
+        );
         return 2;
     }
     file_bytes = read_file(argv[1], &file_size);

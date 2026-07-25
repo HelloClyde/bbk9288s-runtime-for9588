@@ -93,18 +93,68 @@ int compat_api_install(compat_api_t *api)
 static uint32_t heap_alloc(compat_api_t *api, uint32_t size, int clear)
 {
     uint32_t result;
+    uint32_t candidate;
+    uint32_t end;
+    uint32_t record_index;
     uint8_t zero[32];
     uint32_t left;
     uint32_t at;
     unsigned i;
 
     size = align4(size ? size : 4);
-    if (api->heap_next > api->heap_end ||
-        size > api->heap_end - api->heap_next) {
+    if (size < 4u || api->heap_base > api->heap_end) {
         return 0;
     }
-    result = api->heap_next;
-    api->heap_next += size;
+    record_index = COMPAT_HEAP_MAX_BLOCKS;
+    for (i = 0u; i < COMPAT_HEAP_MAX_BLOCKS; ++i) {
+        if (!api->heap_blocks[i].used) {
+            record_index = i;
+            break;
+        }
+    }
+    if (record_index == COMPAT_HEAP_MAX_BLOCKS) {
+        return 0;
+    }
+
+    candidate = api->heap_base;
+    for (;;) {
+        uint32_t next_address = api->heap_end;
+        uint32_t next_size = 0u;
+        for (i = 0u; i < COMPAT_HEAP_MAX_BLOCKS; ++i) {
+            compat_heap_block_t *block = &api->heap_blocks[i];
+            if (block->used &&
+                block->address >= candidate &&
+                block->address < next_address) {
+                next_address = block->address;
+                next_size = block->size;
+            }
+        }
+        if (candidate <= next_address &&
+            size <= next_address - candidate) {
+            break;
+        }
+        if (!next_size ||
+            next_address > 0xffffffffu - next_size) {
+            return 0;
+        }
+        candidate = next_address + next_size;
+        if (candidate > api->heap_end) {
+            return 0;
+        }
+    }
+    if (candidate > api->heap_end ||
+        size > api->heap_end - candidate) {
+        return 0;
+    }
+
+    result = candidate;
+    api->heap_blocks[record_index].address = result;
+    api->heap_blocks[record_index].size = size;
+    api->heap_blocks[record_index].used = 1u;
+    end = result + size;
+    if (end > api->heap_next) {
+        api->heap_next = end;
+    }
     if (!clear) {
         return result;
     }
@@ -122,6 +172,120 @@ static uint32_t heap_alloc(compat_api_t *api, uint32_t size, int clear)
     return result;
 }
 
+uint32_t compat_api_heap_alloc(
+    compat_api_t *api,
+    uint32_t size,
+    int clear
+)
+{
+    if (!api) {
+        return 0u;
+    }
+    return heap_alloc(api, size, clear);
+}
+
+static compat_heap_block_t *heap_find_block(
+    compat_api_t *api,
+    uint32_t address
+)
+{
+    unsigned i;
+    for (i = 0u; i < COMPAT_HEAP_MAX_BLOCKS; ++i) {
+        compat_heap_block_t *block = &api->heap_blocks[i];
+        if (block->used && block->address == address) {
+            return block;
+        }
+    }
+    return 0;
+}
+
+static void heap_free(compat_api_t *api, uint32_t address)
+{
+    compat_heap_block_t *block;
+    if (!address) {
+        return;
+    }
+    block = heap_find_block(api, address);
+    if (block) {
+        block->address = 0u;
+        block->size = 0u;
+        block->used = 0u;
+    }
+}
+
+static uint32_t heap_realloc(
+    compat_api_t *api,
+    uint32_t address,
+    uint32_t requested_size
+)
+{
+    compat_heap_block_t *block;
+    uint32_t size;
+    uint32_t next_address;
+    uint32_t result;
+    uint32_t copied;
+    uint8_t buffer[64];
+    unsigned i;
+
+    if (!address) {
+        return heap_alloc(api, requested_size, 0);
+    }
+    if (!requested_size) {
+        heap_free(api, address);
+        return 0u;
+    }
+    block = heap_find_block(api, address);
+    if (!block) {
+        return 0u;
+    }
+    size = align4(requested_size);
+    if (size < 4u) {
+        return 0u;
+    }
+    if (size <= block->size) {
+        block->size = size;
+        return address;
+    }
+
+    next_address = api->heap_end;
+    for (i = 0u; i < COMPAT_HEAP_MAX_BLOCKS; ++i) {
+        compat_heap_block_t *other = &api->heap_blocks[i];
+        if (other->used &&
+            other->address > address &&
+            other->address < next_address) {
+            next_address = other->address;
+        }
+    }
+    if (address <= next_address &&
+        size <= next_address - address) {
+        block->size = size;
+        if (address + size > api->heap_next) {
+            api->heap_next = address + size;
+        }
+        return address;
+    }
+
+    result = heap_alloc(api, size, 0);
+    if (!result) {
+        return 0u;
+    }
+    copied = 0u;
+    while (copied < block->size) {
+        uint32_t chunk = block->size - copied;
+        if (chunk > sizeof(buffer)) {
+            chunk = sizeof(buffer);
+        }
+        if (!c33_vm_read(api->vm, address + copied, buffer, chunk) ||
+            !c33_vm_write(api->vm, result + copied, buffer, chunk)) {
+            heap_free(api, result);
+            return 0u;
+        }
+        copied += chunk;
+    }
+    heap_free(api, address);
+    return result;
+}
+
 static c33_vm_status_t dispatch_crtl(compat_api_t *api, uint32_t slot)
 {
     c33_vm_t *vm = api->vm;
@@ -132,7 +296,8 @@ static c33_vm_status_t dispatch_crtl(compat_api_t *api, uint32_t slot)
     case 0: /* malloc */
         vm->regs[4] = heap_alloc(api, vm->regs[6], 0);
         return C33_VM_OK;
-    case 1: /* free: bump allocator intentionally keeps the block */
+    case 1: /* free */
+        heap_free(api, vm->regs[6]);
         vm->regs[4] = 0;
         return C33_VM_OK;
     case 2: /* calloc */
@@ -143,14 +308,15 @@ static c33_vm_status_t dispatch_crtl(compat_api_t *api, uint32_t slot)
         }
         vm->regs[4] = heap_alloc(api, size, 1);
         return C33_VM_OK;
-    case 3: /* realloc: allocate and copy is added when allocation sizes are tracked */
-        result = heap_alloc(api, vm->regs[7], 0);
+    case 3: /* realloc */
+        result = heap_realloc(api, vm->regs[6], vm->regs[7]);
         vm->regs[4] = result;
         return C33_VM_OK;
     case 4: /* ansi_InitMalloc */
         api->heap_base = align4(vm->regs[6]);
         api->heap_next = api->heap_base;
         api->heap_end = vm->regs[7] & ~3u;
+        zero_struct(api->heap_blocks, sizeof(api->heap_blocks));
         vm->regs[4] = 0;
         return C33_VM_OK;
     default:

@@ -18,6 +18,7 @@ gcc `
   -I (Join-Path $ProjectRoot "runtime\include") `
   (Join-Path $ProjectRoot "runtime\src\d300.c") `
   (Join-Path $ProjectRoot "runtime\src\c33vm.c") `
+  (Join-Path $ProjectRoot "runtime\src\c33jit.c") `
   (Join-Path $ProjectRoot "runtime\src\compat_api.c") `
   (Join-Path $ProjectRoot "tools\d300_core_probe.c") `
   -o $ProbeExe

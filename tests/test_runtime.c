@@ -309,6 +309,9 @@ static int test_api_tables(void)
     compat_api_t api;
     unsigned char value[4];
     unsigned table;
+    unsigned first;
+    unsigned second;
+    unsigned moved;
 
     memset(sdram, 0, sizeof(sdram));
     c33_vm_init(&vm);
@@ -334,7 +337,55 @@ static int test_api_tables(void)
         ) != C33_VM_OK) {
         return 5;
     }
-    return vm.regs[4] == 0x02006100 ? 0 : 6;
+    first = vm.regs[4];
+    if (first != 0x02006100u) {
+        return 6;
+    }
+    vm.regs[6] = 16u;
+    if (compat_api_hostcall(
+            &vm, compat_api_trap(COMPAT_API_CRTL, 0), &api
+        ) != C33_VM_OK) {
+        return 7;
+    }
+    second = vm.regs[4];
+    if (second != first + 16u ||
+        !c33_vm_write(&vm, first, "heap-copy-check", 16u)) {
+        return 8;
+    }
+    vm.regs[6] = first;
+    vm.regs[7] = 32u;
+    if (compat_api_hostcall(
+            &vm, compat_api_trap(COMPAT_API_CRTL, 3), &api
+        ) != C33_VM_OK) {
+        return 9;
+    }
+    moved = vm.regs[4];
+    memset(value, 0, sizeof(value));
+    if (moved != second + 16u ||
+        !c33_vm_read(&vm, moved, value, sizeof(value)) ||
+        memcmp(value, "heap", sizeof(value)) != 0) {
+        return 10;
+    }
+    vm.regs[6] = second;
+    if (compat_api_hostcall(
+            &vm, compat_api_trap(COMPAT_API_CRTL, 1), &api
+        ) != C33_VM_OK) {
+        return 11;
+    }
+    vm.regs[6] = moved;
+    if (compat_api_hostcall(
+            &vm, compat_api_trap(COMPAT_API_CRTL, 1), &api
+        ) != C33_VM_OK) {
+        return 12;
+    }
+    vm.regs[6] = 48u;
+    if (compat_api_hostcall(
+            &vm, compat_api_trap(COMPAT_API_CRTL, 0), &api
+        ) != C33_VM_OK ||
+        vm.regs[4] != first) {
+        return 13;
+    }
+    return 0;
 }
 
 static int test_gui_image_header(void)
@@ -376,8 +427,9 @@ static int test_gui_image_header(void)
         compat_gui_packed_2bpp_shift(4) != 6u) {
         return 5;
     }
-    if (compat_gui_timer_interval_ms(20) != 200u ||
-        compat_gui_timer_interval_ms(0) != 10u) {
+    if (compat_gui_timer_interval_ms(20) != 50u ||
+        compat_gui_timer_interval_ms(500) != 1250u ||
+        compat_gui_timer_interval_ms(0) != 3u) {
         return 6;
     }
     return 0;

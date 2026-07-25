@@ -7,6 +7,7 @@
  * _ToUnic_SUPPORT enabled.
  */
 enum compat_gui_slot {
+    COMPAT_GUI_DRAW_3D_CONTROL_FRAME = 10,
     COMPAT_GUI_GET_MESSAGE = 12,
     COMPAT_GUI_HAVE_PENDING_MESSAGE = 13,
     COMPAT_GUI_PEEK_POST_MESSAGE = 14,
@@ -66,6 +67,7 @@ enum compat_gui_slot {
     COMPAT_GUI_POINT_IN_RECT = 283,
     COMPAT_GUI_CREATE_LOG_FONT = 292,
     COMPAT_GUI_DESTROY_LOG_FONT = 294,
+    COMPAT_GUI_SELECT_FONT = 298,
     COMPAT_GUI_TEXT_OUT_LEN = 316,
     COMPAT_GUI_DRAW_TEXT_EX = 318,
     COMPAT_GUI_PUT_IMAGE_AREA = 336,
@@ -142,13 +144,18 @@ enum compat_gui_scancode {
     COMPAT_SCANCODE_DOWN = 108
 };
 
+#define COMPAT_KEYSTATE_LEFT_BUTTON 0x00001000u
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
 #define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
-#define COMPAT_GUI_TIMER_TICK_MS 10u
-
 static inline unsigned compat_gui_timer_interval_ms(unsigned speed)
 {
-    return (speed ? speed : 1u) * COMPAT_GUI_TIMER_TICK_MS;
+    /*
+     * The original guiExt.h defines GUI_TIMER_TICK=25 and
+     * TIME_MS(ms)=ms*10/GUI_TIMER_TICK. Therefore one SetTimer "speed"
+     * unit is 25/10 ms (2.5 ms). Round up so a nonzero legacy period
+     * never collapses to zero milliseconds.
+     */
+    return (((speed ? speed : 1u) * 25u) + 9u) / 10u;
 }
 
 static inline unsigned compat_gui_packed_2bpp_stride(unsigned width)

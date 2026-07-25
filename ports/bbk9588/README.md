@@ -10,12 +10,14 @@ are embedded in the BDA.
 
 The current 9588 host adapter provides:
 
-- an unscaled 160×240 guest surface at the top center of the rotated 240×320
+- an unscaled 160×240 guest surface at the top center of the portrait 240×320
   RGB565 display;
 - side EXE/settings buttons, a centered direction pad, and 取消/确认 actions;
 - row-aligned packed 2bpp image decoding;
 - a persistent 9288S GUI message loop and timer;
-- native Frame presentation through the public 9588 drawing APIs;
+- native Frame presentation through the public 9588 drawing APIs, including
+  aspect-preserving bilinear RGB565 213x320 portrait fullscreen scaling
+  for the 160x240 guest surface;
 - physical direction/confirm/exit input through the six-byte input packet;
 - touch down, move, and up translation through the public raw-input stream
   and calibrated logical-coordinate API, matching the GBA 9588 port;
