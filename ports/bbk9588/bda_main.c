@@ -63,6 +63,9 @@
 #define PROGRAM_ICON_FRAME_SIZE 256u
 #define PROGRAM_ICON_PAYLOAD_SIZE 512u
 #define PROGRAM_TITLE_CAPACITY 17u
+#define COMPAT_LOG_PATH \
+    COMPAT_FS_NATIVE_ROOT "\\9288LOG.TXT"
+#define COMPAT_LOG_HEARTBEAT_TICKS 80u
 
 #define VIRTUAL_ACTION_NONE     0u
 #define VIRTUAL_ACTION_UP       1u
@@ -149,6 +152,8 @@ typedef struct compat_9588_state {
     s32 current_y;
     int instant_paint;
     int quit;
+    u32 api_call_count;
+    u32 heartbeat_tick;
 } compat_9588_state_t;
 
 typedef struct compat_9588_runtime {
@@ -196,6 +201,116 @@ static void append_hex(char **out, char *end, u32 value)
     for (shift = 28; shift >= 0 && *out + 1 < end; shift -= 4) {
         *(*out)++ = digits[(value >> shift) & 0xf];
     }
+}
+
+static u32 native_text_length(const char *text)
+{
+    u32 length = 0u;
+    while (text && text[length]) {
+        ++length;
+    }
+    return length;
+}
+
+static void compat_log_write(const char *text, int truncate)
+{
+    int file = bda_fs_fopen_raw(
+        COMPAT_LOG_PATH, truncate ? "wb" : "rb+"
+    );
+    u32 length;
+    if (!bda_fs_file_is_valid(file) && !truncate) {
+        file = bda_fs_fopen_raw(COMPAT_LOG_PATH, "wb");
+    }
+    if (!bda_fs_file_is_valid(file)) {
+        return;
+    }
+    if (!truncate) {
+        (void)bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    }
+    length = native_text_length(text);
+    if (length) {
+        (void)bda_fs_fwrite_raw(text, 1u, length, file);
+    }
+    (void)bda_fs_close_raw(file);
+}
+
+static void compat_log_record(
+    const char *event,
+    const char *detail,
+    u32 value0,
+    u32 value1,
+    u32 value2,
+    u32 value3
+)
+{
+    char line[256];
+    char *out = line;
+    char *end = line + sizeof(line);
+    append_text(&out, end, "T=");
+    append_hex(&out, end, bda_gui_tick_count_25ms());
+    append_text(&out, end, " ");
+    append_text(&out, end, event ? event : "EVENT");
+    if (detail && *detail) {
+        append_text(&out, end, " detail=");
+        append_text(&out, end, detail);
+    }
+    append_text(&out, end, " v0=");
+    append_hex(&out, end, value0);
+    append_text(&out, end, " v1=");
+    append_hex(&out, end, value1);
+    append_text(&out, end, " v2=");
+    append_hex(&out, end, value2);
+    append_text(&out, end, " v3=");
+    append_hex(&out, end, value3);
+    append_text(&out, end, "\r\n");
+    *out = 0;
+    compat_log_write(line, 0);
+}
+
+static void compat_log_vm(
+    const char *event,
+    const c33_vm_t *vm,
+    const compat_api_t *api,
+    const compat_9588_state_t *state,
+    c33_vm_status_t status
+)
+{
+    char line[320];
+    char *out = line;
+    char *end = line + sizeof(line);
+    append_text(&out, end, "T=");
+    append_hex(&out, end, bda_gui_tick_count_25ms());
+    append_text(&out, end, " ");
+    append_text(&out, end, event ? event : "VM");
+    append_text(&out, end, " status=");
+    append_hex(&out, end, (u32)status);
+    append_text(&out, end, " pc=");
+    append_hex(&out, end, vm ? vm->pc : 0u);
+    append_text(&out, end, " sp=");
+    append_hex(&out, end, vm ? vm->sp : 0u);
+    append_text(&out, end, " ins=");
+    append_hex(
+        &out, end, vm ? (u32)(vm->instructions >> 32) : 0u
+    );
+    append_text(&out, end, ":");
+    append_hex(&out, end, vm ? (u32)vm->instructions : 0u);
+    append_text(&out, end, " api=");
+    append_hex(&out, end, api ? api->last_group : 0u);
+    append_text(&out, end, "/");
+    append_hex(&out, end, api ? api->last_slot : 0u);
+    append_text(&out, end, " calls=");
+    append_hex(&out, end, state ? state->api_call_count : 0u);
+    append_text(&out, end, " hwnd=");
+    append_hex(&out, end, state ? state->guest_hwnd : 0u);
+    append_text(&out, end, " proc=");
+    append_hex(&out, end, state ? state->guest_window_proc : 0u);
+    append_text(&out, end, " events=");
+    append_hex(&out, end, state ? state->event_count : 0u);
+    append_text(&out, end, " timer=");
+    append_hex(&out, end, state ? state->timer_id : 0u);
+    append_text(&out, end, "\r\n");
+    *out = 0;
+    compat_log_write(line, 0);
 }
 
 static void show_vm_status(c33_vm_t *vm, c33_vm_status_t status)
@@ -3041,6 +3156,7 @@ static c33_vm_status_t dispatch_9588(
     if (!state) {
         return C33_VM_UNSUPPORTED;
     }
+    state->api_call_count += 1u;
     if (group == COMPAT_API_FS) {
         return dispatch_9588_fs(api, slot, state);
     }
@@ -3152,8 +3268,24 @@ static c33_vm_status_t dispatch_9588(
                     vm->regs[6] + COMPAT_MAIN_WIN_CREATE_PROC_OFFSET;
                 return C33_VM_FAULT;
             }
+            compat_log_record(
+                "CREATE_MAIN_ENTER",
+                state->selected_path,
+                vm->regs[6],
+                callback,
+                state->guest_hwnd,
+                state->parent_hwnd
+            );
             if (state->guest_hwnd) {
                 if (state->parent_hwnd) {
+                    compat_log_record(
+                        "CREATE_MAIN_NESTING_LIMIT",
+                        state->selected_path,
+                        state->guest_hwnd,
+                        state->parent_hwnd,
+                        callback,
+                        0u
+                    );
                     return C33_VM_UNSUPPORTED;
                 }
                 state->parent_window_proc = state->guest_window_proc;
@@ -3173,9 +3305,15 @@ static c33_vm_status_t dispatch_9588(
             status = call_guest_window_proc(
                 state, state->guest_hwnd, COMPAT_MSG_CREATE, 0u, 0u
             );
+            compat_log_vm(
+                "CREATE_MAIN_AFTER_CREATE", vm, api, state, status
+            );
             if (status != C33_VM_OK) return status;
             status = call_guest_window_proc(
                 state, state->guest_hwnd, COMPAT_MSG_PAINT, 0u, 0u
+            );
+            compat_log_vm(
+                "CREATE_MAIN_AFTER_PAINT", vm, api, state, status
             );
             if (status != C33_VM_OK) return status;
             vm->regs[4] = state->guest_hwnd;
@@ -4724,6 +4862,9 @@ static int run_selected_game(
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
     *reselect_out = 0;
+    compat_log_record(
+        "RUN_BEGIN", selected_path, 0u, 0u, 0u, 0u
+    );
     file_bytes = load_d300_file(
         selected_path, &file_size, &load_stage, &load_detail
     );
@@ -4738,14 +4879,33 @@ static int run_selected_game(
         append_text(&out, end, "\nPath: ");
         append_text(&out, end, selected_path);
         *out = 0;
+        compat_log_record(
+            "LOAD_FAILED",
+            selected_path,
+            load_stage,
+            (u32)load_detail,
+            0u,
+            0u
+        );
         bda_msgbox("9288S", text);
         *reselect_out = 1;
         return 3;
     }
+    compat_log_record(
+        "LOAD_OK", selected_path, file_size, 0u, 0u, 0u
+    );
 
     g_diagnostic[1] = 1u;
     runtime = (compat_9588_runtime_t *)bda_alloc(sizeof(*runtime));
     if (allocation_failed(runtime)) {
+        compat_log_record(
+            "ALLOC_RUNTIME_FAILED",
+            selected_path,
+            sizeof(*runtime),
+            (u32)runtime,
+            0u,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Not enough runtime memory");
         bda_free(file_bytes);
         return 1;
@@ -4765,6 +4925,14 @@ static int run_selected_game(
     state->controls_left = 1;
     framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * 2u);
     if (allocation_failed(framebuffer)) {
+        compat_log_record(
+            "ALLOC_FRAMEBUFFER_FAILED",
+            selected_path,
+            SCREEN_W * SCREEN_H * 2u,
+            (u32)framebuffer,
+            (u32)runtime,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Not enough display memory");
         bda_free(file_bytes);
         bda_free(runtime);
@@ -4776,6 +4944,14 @@ static int run_selected_game(
     present_framebuffer(state);
 
     image_status = d300_parse(image, file_bytes, file_size);
+    compat_log_record(
+        "D300_PARSED",
+        selected_path,
+        (u32)image_status,
+        image->program_size,
+        image->resource_offset,
+        image->resource_size
+    );
     if (image_status != D300_OK) {
         bda_msgbox("9288S compatibility", d300_status_string(image_status));
         bda_free(file_bytes);
@@ -4808,9 +4984,25 @@ static int run_selected_game(
         bda_free(file_bytes);
         bda_free(framebuffer);
         bda_free(runtime);
+        compat_log_record(
+            "ALLOC_GUEST_FAILED",
+            selected_path,
+            (u32)iram,
+            (u32)api_ram,
+            (u32)heap_ram,
+            (u32)code_ram
+        );
         bda_msgbox("9288S compatibility", "Not enough memory for guest RAM");
         return 6;
     }
+    compat_log_record(
+        "ALLOC_GUEST_OK",
+        selected_path,
+        (u32)iram,
+        (u32)api_ram,
+        (u32)heap_ram,
+        (u32)code_ram
+    );
     g_diagnostic[1] = 5u;
     bda_memset(iram, 0, GUEST_IRAM_SIZE);
     bda_memset(api_ram, 0, GUEST_API_SIZE);
@@ -4833,6 +5025,14 @@ static int run_selected_game(
     api->dispatch = dispatch_9588;
     api->dispatch_opaque = state;
     if (!compat_api_install(api)) {
+        compat_log_record(
+            "API_INSTALL_FAILED",
+            selected_path,
+            api->heap_next,
+            api->heap_end,
+            0u,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Could not install API tables");
         bda_free(code_ram);
         bda_free(heap_ram);
@@ -4848,7 +5048,9 @@ static int run_selected_game(
     vm->sp -= 4u;
     c33_vm_write(vm, vm->sp, exit_pc, sizeof(exit_pc));
     host_tick = bda_gui_tick_count_25ms();
+    state->heartbeat_tick = host_tick;
     g_diagnostic[1] = 7u;
+    compat_log_vm("VM_START", vm, api, state, C33_VM_OK);
 
     for (;;) {
         vm_status = c33_vm_run(vm, VM_SLICE);
@@ -4860,6 +5062,7 @@ static int run_selected_game(
         g_diagnostic[6] = api->last_group;
         g_diagnostic[7] = api->last_slot;
         if (vm_status != C33_VM_YIELD) {
+            compat_log_vm("VM_STOP", vm, api, state, vm_status);
             break;
         }
 
@@ -4883,6 +5086,13 @@ static int run_selected_game(
             if (elapsed_ticks) {
                 service_timer(state, elapsed_ticks * HOST_TICK_MS);
                 host_tick = current_tick;
+            }
+            if (current_tick - state->heartbeat_tick >=
+                COMPAT_LOG_HEARTBEAT_TICKS) {
+                compat_log_vm(
+                    "VM_HEARTBEAT", vm, api, state, vm_status
+                );
+                state->heartbeat_tick = current_tick;
             }
         }
         present_framebuffer(state);
@@ -4930,6 +5140,14 @@ static int run_selected_game(
     bda_free(framebuffer);
     state->framebuffer = 0;
     *reselect_out = state->request_reselect;
+    compat_log_record(
+        "RUN_END",
+        selected_path,
+        (u32)vm_status,
+        (u32)state->request_reselect,
+        (u32)state->quit,
+        state->api_call_count
+    );
     bda_free(runtime);
     return vm_status == C33_VM_DONE ? 0 : 8;
 }
@@ -4948,8 +5166,30 @@ int bda_main(void)
         return 1;
     }
     ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
+    compat_log_write(
+        "9288S compatibility real-device log v1\r\n", 1
+    );
+    compat_log_record(
+        "BDA_START",
+        COMPAT_FS_NATIVE_ROOT,
+        (u32)selected_path,
+        sizeof(compat_9588_runtime_t),
+        VM_SLICE,
+        CALLBACK_BUDGET
+    );
     for (;;) {
+        compat_log_record(
+            "SELECTOR_ENTER", 0, 0u, 0u, 0u, 0u
+        );
         selector_result = select_9288s_program(selected_path);
+        compat_log_record(
+            "SELECTOR_RESULT",
+            selector_result == 1 ? selected_path : 0,
+            (u32)selector_result,
+            0u,
+            0u,
+            0u
+        );
         if (selector_result != 1) {
             if (selector_result < 0) run_result = 2;
             break;
@@ -4959,6 +5199,9 @@ int bda_main(void)
             break;
         }
     }
+    compat_log_record(
+        "BDA_END", 0, (u32)run_result, (u32)reselect, 0u, 0u
+    );
     bda_free(selected_path);
     return run_result;
 }
