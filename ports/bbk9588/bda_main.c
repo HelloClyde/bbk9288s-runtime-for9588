@@ -125,7 +125,6 @@ typedef struct compat_9588_state {
     bda_handle_t native_frame;
     bda_handle_t native_draw;
     bda_handle_t native_draw_owner;
-    bda_handle_t native_back;
     void *native_draw_object;
     bda_gui_picture_t native_picture;
     bda_gui_message_t native_message;
@@ -1299,11 +1298,6 @@ static void release_native_draw_context(
         return;
     }
     draw = state->native_draw;
-    if (state->native_back &&
-        (s32)state->native_back != -1) {
-        bda_gui_compatible_context_free(state->native_back);
-    }
-    state->native_back = 0;
     state->native_draw = 0;
     state->native_draw_owner = 0;
     if (draw && (s32)draw != -1) {
@@ -1321,16 +1315,7 @@ static int acquire_native_draw_context(
     }
     if (state->native_draw &&
         state->native_draw_owner == owner) {
-        if (state->native_back &&
-            (s32)state->native_back != -1) {
-            return 1;
-        }
-        state->native_back =
-            bda_gui_compatible_context_create(
-                state->native_draw
-            );
-        return state->native_back &&
-            (s32)state->native_back != -1;
+        return 1;
     }
     release_native_draw_context(state);
     state->native_draw = bda_gui_current_draw(owner);
@@ -1340,16 +1325,6 @@ static int acquire_native_draw_context(
         return 0;
     }
     state->native_draw_owner = owner;
-    state->native_back =
-        bda_gui_compatible_context_create(state->native_draw);
-    if (!state->native_back ||
-        (s32)state->native_back == -1) {
-        state->native_back = 0;
-        bda_gui_end_draw(state->native_draw);
-        state->native_draw = 0;
-        state->native_draw_owner = 0;
-        return 0;
-    }
     return 1;
 }
 
@@ -1359,19 +1334,23 @@ static int present_native_framebuffer(
 {
     void *old_object;
     int draw_result;
-    int copy_result;
     if (!state || !state->framebuffer ||
         !state->native_draw ||
-        !state->native_back ||
         !state->native_draw_object) {
         return 0;
     }
+    /*
+     * Match the proven gba-for9588 path: render the complete RGB565 frame
+     * straight into the Frame draw context.  A compatible-context copy
+     * loses rapidly changing guest regions on both the emulator and device.
+     */
     state->native_picture.source_pixels = state->framebuffer;
+    (void)bda_gui_draw_guard_begin();
     old_object = bda_gui_select_draw_object(
-        state->native_back, state->native_draw_object
+        state->native_draw, state->native_draw_object
     );
     draw_result = bda_gui_render_picture(
-        state->native_back,
+        state->native_draw,
         0,
         0,
         SCREEN_W,
@@ -1379,35 +1358,13 @@ static int present_native_framebuffer(
         &state->native_picture
     );
     (void)bda_gui_select_draw_object(
-        state->native_back, old_object
-    );
-    g_diagnostic[8] = (u32)draw_result;
-    if (draw_result != 0) {
-        g_diagnostic[10] += 1u;
-        return 0;
-    }
-    (void)bda_gui_draw_guard_begin();
-    old_object = bda_gui_select_draw_object(
-        state->native_draw, state->native_draw_object
-    );
-    copy_result = bda_gui_context_copy(
-        state->native_back,
-        0,
-        0,
-        SCREEN_W,
-        SCREEN_H,
-        state->native_draw,
-        0,
-        0,
-        BDA_GUI_COLOR_KEY_NONE
-    );
-    (void)bda_gui_select_draw_object(
         state->native_draw, old_object
     );
     (void)bda_gui_draw_guard_end();
-    g_diagnostic[9] = (u32)copy_result;
+    g_diagnostic[8] = (u32)draw_result;
+    g_diagnostic[9] = 0u;
     g_diagnostic[10] += 1u;
-    if (copy_result == 0) {
+    if (draw_result == 0) {
         state->native_redraw = 0;
         return 1;
     }
@@ -5103,7 +5060,7 @@ static int select_9288s_program(
         0,
         (u32)state->native_frame,
         (u32)state->native_draw,
-        (u32)state->native_back,
+        0u,
         (u32)state->native_draw_object
     );
     heartbeat_tick = bda_gui_tick_count_25ms();
