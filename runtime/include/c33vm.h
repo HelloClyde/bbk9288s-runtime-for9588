@@ -65,6 +65,7 @@ typedef struct c33_vm {
     uint32_t fault_pc;
     uint32_t fault_address;
     uint16_t fault_opcode;
+    uint32_t jit_value;
     uint64_t instructions;
 } c33_vm_t;
 

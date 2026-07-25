@@ -1,4 +1,5 @@
 /build/
+/dist/
 /local/
 /.venv/
 *.exe

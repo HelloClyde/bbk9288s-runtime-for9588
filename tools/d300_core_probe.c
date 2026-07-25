@@ -4,12 +4,17 @@
 
 #include "c33vm.h"
 #include "compat_api.h"
+#include "compat_fs.h"
 #include "compat_gui.h"
 #include "d300.h"
 
 #define IRAM_SIZE  0x00004000u
-#define SDRAM_SIZE 0x00800000u
-#define SDRAM_BASE 0x02000000u
+#define API_BASE   0x02000000u
+#define API_SIZE   0x00010000u
+#define HEAP_BASE  0x02600000u
+#define HEAP_SIZE  0x00080000u
+#define CODE_BASE  0x02700000u
+#define CODE_SIZE  0x00100000u
 
 static uint32_t main_window_callback;
 static unsigned char listbox_items[5][64];
@@ -18,6 +23,7 @@ static uint32_t listbox_caret;
 static const char *guest_image_path;
 static FILE *guest_image_file;
 static unsigned timer_message_sent;
+static int probe_five_options;
 
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
@@ -46,6 +52,7 @@ static int write_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t value)
 static void inspect_put_image(c33_vm_t *vm)
 {
     static unsigned full_frame_count;
+    static unsigned unusual_count;
     uint32_t height;
     uint32_t buffer_address;
     uint32_t width = vm->regs[9];
@@ -62,8 +69,38 @@ static void inspect_put_image(c33_vm_t *vm)
     uint32_t pixel_address;
 
     if (!read_guest_u32(vm, vm->sp + 4u, &height) ||
-        !read_guest_u32(vm, vm->sp + 8u, &buffer_address) ||
-        width != 160u || height != 240u) {
+        !read_guest_u32(vm, vm->sp + 8u, &buffer_address)) {
+        return;
+    }
+    if ((int32_t)width <= 0 || (int32_t)height <= 0 ||
+        width > 160u || height > 240u) {
+        size_t header_index;
+        if (unusual_count++ < 40u) {
+            printf(
+                "  PutImageArea unusual x=%ld y=%ld sp=0x%08lx "
+                "w=%ld h=%ld buffer=0x%08lx header:",
+                (long)(int32_t)vm->regs[7],
+                (long)(int32_t)vm->regs[8],
+                (unsigned long)vm->sp,
+                (long)(int32_t)width,
+                (long)(int32_t)height,
+                (unsigned long)buffer_address
+            );
+            if (c33_vm_read(
+                    vm, buffer_address, header, sizeof(header)
+                )) {
+                for (header_index = 0;
+                     header_index < sizeof(header);
+                     ++header_index) {
+                    printf(" %02x", header[header_index]);
+                }
+            } else {
+                printf(" unmapped");
+            }
+            printf("\n");
+        }
+    }
+    if (width != 160u || height != 240u) {
         return;
     }
     pixel_count = (size_t)width * height;
@@ -554,6 +591,11 @@ static c33_vm_status_t report_api(
             (int32_t)vm->regs[8] <= (int32_t)bottom;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_DRAW_3D_CONTROL_FRAME) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SEND_MESSAGE) {
         if (vm->regs[6] == 2u) {
             uint32_t message = vm->regs[7];
@@ -670,17 +712,19 @@ static c33_vm_status_t report_api(
         if (status != C33_VM_OK) {
             return status;
         }
-        status = c33_vm_call(
-            vm,
-            callback,
-            1u,
-            COMPAT_MSG_KEYDOWN,
-            COMPAT_SCANCODE_ENTER,
-            0u,
-            1000000u
-        );
-        if (status != C33_VM_OK) {
-            return status;
+        if (!probe_five_options) {
+            status = c33_vm_call(
+                vm,
+                callback,
+                1u,
+                COMPAT_MSG_KEYDOWN,
+                COMPAT_SCANCODE_ENTER,
+                0u,
+                1000000u
+            );
+            if (status != C33_VM_OK) {
+                return status;
+            }
         }
         status = c33_vm_call(
             vm, callback, 1u, COMPAT_MSG_TIMER, 1u, 0u, 1000000u
@@ -693,7 +737,7 @@ static c33_vm_status_t report_api(
             callback,
             1u,
             COMPAT_MSG_LBUTTONDOWN,
-            4u,
+            COMPAT_KEYSTATE_LEFT_BUTTON,
             120u | (170u << 16),
             1000000u
         );
@@ -743,13 +787,16 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SELECT_FONT) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI && slot == 77u) {
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == 0u) {
         unsigned char mode_bytes[8];
-        const char *mode = "rb";
         if (c33_vm_read(
                 vm, vm->regs[7], mode_bytes, sizeof(mode_bytes)
             )) {
@@ -761,11 +808,15 @@ static c33_vm_status_t report_api(
                 return C33_VM_OK;
             }
         }
+        /*
+         * The probe starts with an empty 9288S data root. Returning the EXE
+         * bytes for every requested save/config file hid first-run paths.
+         */
         if (guest_image_file) {
             fclose(guest_image_file);
+            guest_image_file = 0;
         }
-        guest_image_file = fopen(guest_image_path, mode);
-        vm->regs[4] = guest_image_file ? 4u : 0xffffffffu;
+        vm->regs[4] = 0xffffffffu;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == 1u) {
@@ -830,6 +881,10 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0xffffffffu;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_FS && slot == COMPAT_FS_MKDIR) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_FS && slot == 17u) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
@@ -842,6 +897,21 @@ static c33_vm_status_t report_api(
             return C33_VM_FAULT;
         }
         vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == 19u) {
+        static const unsigned char root_path[2] = {'\\', 0};
+        uint32_t buffer = vm->regs[6];
+        if (!buffer) {
+            buffer = compat_api_heap_alloc(api, sizeof(root_path), 0);
+        }
+        if (!buffer ||
+            vm->regs[7] < sizeof(root_path) ||
+            !c33_vm_write(vm, buffer, root_path, sizeof(root_path))) {
+            vm->regs[4] = 0u;
+        } else {
+            vm->regs[4] = buffer;
+        }
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == 27u) {
@@ -857,12 +927,24 @@ static c33_vm_status_t report_api(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_UPDATE_WINDOW) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SET_INSTANT_PAINT) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_INVALIDATE_RECT) {
         vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_BEGIN_PAINT) {
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_END_PAINT) {
+        vm->regs[4] = 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLIENT_TO_SCREEN) {
@@ -877,6 +959,10 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLEAR_SCREEN) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_CLEAR_RECT) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -927,7 +1013,15 @@ static c33_vm_status_t report_api(
             uint32_t message[7] = {
                 1u, COMPAT_MSG_TIMER, 1u, 0u, 0u, 0u, 0u
             };
-            if (timer_message_sent >= 32u &&
+            if (probe_five_options && timer_message_sent == 8u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_DOWN;
+            } else if (probe_five_options &&
+                       timer_message_sent == 9u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_ENTER;
+            } else if (!probe_five_options &&
+                       timer_message_sent >= 32u &&
                 (timer_message_sent - 32u) % 8u == 0u) {
                 message[1] = COMPAT_MSG_KEYDOWN;
                 message[2] = COMPAT_SCANCODE_ENTER;
@@ -960,6 +1054,16 @@ static c33_vm_status_t report_api(
     if (group == COMPAT_API_GUI &&
         slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
         slot <= COMPAT_GUI_PRINT_STRING) {
+        if (slot == COMPAT_GUI_DRAW_ASCII) {
+            uint32_t virtual_screen = 0u;
+            printf(
+                "  SysAscii sp=0x%08lx stack5=%s0x%08lx\n",
+                (unsigned long)vm->sp,
+                read_guest_u32(vm, vm->sp + 4u, &virtual_screen)
+                    ? "" : "unmapped/",
+                (unsigned long)virtual_screen
+            );
+        }
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
@@ -970,8 +1074,55 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_RESET_AUTO_CLOSE_TIMER &&
+        slot <= COMPAT_GUI_RESET_AUTO_CLOSE_LED) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
         slot == COMPAT_GUI_SHOW_STATUS_AND_DESKTOP) {
         vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_REVERSE_RECT) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_GET_SCREEN_WIDTH) {
+        vm->regs[4] = 160u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_GET_SCREEN_HEIGHT) {
+        vm->regs[4] = 240u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_MUSIC_VOLUME_SET &&
+        slot <= COMPAT_GUI_MUSIC_OUTPUT_GET) {
+        vm->regs[4] =
+            slot == COMPAT_GUI_MUSIC_VOLUME_GET ? 5u : 1u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_SCAN_GAME_COMBO_KEYS) {
+        static const unsigned char keys[6] = {0, 0, 0, 0, 0, 0};
+        if (!c33_vm_write(vm, vm->regs[6], keys, sizeof(keys))) {
+            return C33_VM_FAULT;
+        }
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        (slot == COMPAT_GUI_SET_LANDSCAPE ||
+         slot == COMPAT_GUI_GET_LANDSCAPE)) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot >= COMPAT_GUI_ATTACH_ENABLE &&
+        slot <= COMPAT_GUI_DISPLAY_BACKLIGHT_STATUS) {
+        vm->regs[4] =
+            slot == COMPAT_GUI_GET_BACKLIGHT_STATUS ? 1u : 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI &&
@@ -1028,7 +1179,9 @@ int main(int argc, char **argv)
 {
     unsigned char *file_bytes;
     unsigned char *iram;
-    unsigned char *sdram;
+    unsigned char *api_ram;
+    unsigned char *heap_ram;
+    unsigned char *code_ram;
     size_t file_size;
     d300_image_t image;
     c33_vm_t vm;
@@ -1036,8 +1189,16 @@ int main(int argc, char **argv)
     c33_vm_status_t status;
     unsigned char exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
+    if (argc == 3 && strcmp(argv[1], "--five-options") == 0) {
+        probe_five_options = 1;
+        ++argv;
+        --argc;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: d300-core-probe path-to-app.exe\n");
+        fprintf(
+            stderr,
+            "usage: d300-core-probe [--five-options] path-to-app.exe\n"
+        );
         return 2;
     }
     file_bytes = read_file(argv[1], &file_size);
@@ -1052,23 +1213,29 @@ int main(int argc, char **argv)
         return 2;
     }
     iram = (unsigned char *)calloc(1, IRAM_SIZE);
-    sdram = (unsigned char *)calloc(1, SDRAM_SIZE);
-    if (!iram || !sdram) {
+    api_ram = (unsigned char *)calloc(1, API_SIZE);
+    heap_ram = (unsigned char *)calloc(1, HEAP_SIZE);
+    code_ram = (unsigned char *)calloc(1, CODE_SIZE);
+    if (!iram || !api_ram || !heap_ram || !code_ram) {
         fprintf(stderr, "allocation failed\n");
         free(iram);
-        free(sdram);
+        free(api_ram);
+        free(heap_ram);
+        free(code_ram);
         free(file_bytes);
         return 2;
     }
     memcpy(
-        sdram + (D300_GUEST_LOAD_BASE - SDRAM_BASE),
+        code_ram,
         d300_program(&image),
         image.program_size
     );
     c33_vm_init(&vm);
     c33_vm_map(&vm, 0, iram, IRAM_SIZE, 1);
-    c33_vm_map(&vm, SDRAM_BASE, sdram, SDRAM_SIZE, 1);
-    compat_api_init(&api, &vm, 0x02600000, 0x026f0000);
+    c33_vm_map(&vm, API_BASE, api_ram, API_SIZE, 1);
+    c33_vm_map(&vm, HEAP_BASE, heap_ram, HEAP_SIZE, 1);
+    c33_vm_map(&vm, CODE_BASE, code_ram, CODE_SIZE, 1);
+    compat_api_init(&api, &vm, HEAP_BASE, HEAP_BASE + HEAP_SIZE);
     api.dispatch = report_api;
     compat_api_install(&api);
     c33_vm_reset(&vm, D300_GUEST_LOAD_BASE, 0x3f80, 0);
@@ -1088,7 +1255,9 @@ int main(int argc, char **argv)
         (unsigned long)api.last_slot
     );
 
-    free(sdram);
+    free(code_ram);
+    free(heap_ram);
+    free(api_ram);
     free(iram);
     if (guest_image_file) {
         fclose(guest_image_file);

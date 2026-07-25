@@ -9,12 +9,13 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BuildScript = Join-Path $PSScriptRoot "build-bda.ps1"
 $OutputDir = Join-Path $ProjectRoot "build\bbk9588"
-$BdaPath = Join-Path $OutputDir "9288SCompat.bda"
+$BdaPath = Join-Path $OutputDir "9288S.bda"
 $BackupDir = Join-Path $OutputDir "backup"
-$ScreenshotPath = Join-Path $OutputDir "file-selector.png"
+$ScreenshotPath = Join-Path $OutputDir "program-list.png"
 $ProjectGame = Join-Path $ProjectRoot "local\pirate_ship.exe"
 $AppsName = -join @([char]0x5e94, [char]0x7528)
 $DataName = -join @([char]0x6570, [char]0x636e)
+$SystemName = -join @([char]0x7cfb, [char]0x7edf)
 $ProgramsName = -join @([char]0x7a0b, [char]0x5e8f)
 $LauncherName = -join @(
   [char]0x5ba0, [char]0x7269, [char]0x5355, [char]0x8bcd
@@ -24,6 +25,8 @@ $TargetName = "$LauncherName.bda"
 $TargetPath = "$TargetDirectory/$TargetName"
 $BackupPath = Join-Path $BackupDir $TargetName
 $GuestRootDirectory = "/$AppsName/$DataName/9288s"
+$GuestSystemDirectory = "$GuestRootDirectory/$SystemName"
+$GuestProgramDirectory = "$GuestSystemDirectory/$ProgramsName"
 
 function Invoke-EmulatorCommand {
   param([hashtable]$Command)
@@ -62,23 +65,32 @@ function Ensure-EmulatorDirectory {
     [string]$Name
   )
   $EncodedParent = [uri]::EscapeDataString($Parent)
-  $Directory = Invoke-RestMethod `
-    -Uri "$EmulatorUrl/api/files?path=$EncodedParent" `
-    -TimeoutSec 30
-  $Exists = $Directory.entries |
-    Where-Object { $_.is_dir -and [string]$_.name -eq $Name } |
-    Select-Object -First 1
-  if ($Exists) {
-    return
+  for ($Attempt = 1; $Attempt -le 5; $Attempt++) {
+    try {
+      $Directory = Invoke-RestMethod `
+        -Uri "$EmulatorUrl/api/files?path=$EncodedParent" `
+        -TimeoutSec 30
+      $Exists = $Directory.entries |
+        Where-Object { $_.is_dir -and [string]$_.name -eq $Name } |
+        Select-Object -First 1
+      if ($Exists) {
+        return
+      }
+      Invoke-RestMethod `
+        -Method Post `
+        -Uri "$EmulatorUrl/api/files/mkdir" `
+        -ContentType "application/json" `
+        -Body (@{ path = $Parent; name = $Name } | ConvertTo-Json -Compress) `
+        -TimeoutSec 90 | Out-Null
+      Start-Sleep -Seconds 2
+      return
+    } catch {
+      if ($Attempt -eq 5) {
+        throw
+      }
+      Start-Sleep -Seconds 2
+    }
   }
-  Invoke-RestMethod `
-    -Method Post `
-    -Uri "$EmulatorUrl/api/files/mkdir" `
-    -ContentType "application/json" `
-    -Body (@{ path = $Parent; name = $Name } | ConvertTo-Json -Compress) `
-    -TimeoutSec 90 | Out-Null
-  Invoke-EmulatorCommand @{ op = "force-stop" } | Out-Null
-  Start-Sleep -Seconds 1
 }
 
 try {
@@ -120,13 +132,15 @@ if ($Status.running) {
 }
 
 Ensure-EmulatorDirectory "/$AppsName/$DataName" "9288s"
+Ensure-EmulatorDirectory $GuestRootDirectory $SystemName
+Ensure-EmulatorDirectory $GuestSystemDirectory $ProgramsName
 
 if (-not [string]::IsNullOrWhiteSpace($GamePath)) {
   if (-not (Test-Path -LiteralPath $GamePath -PathType Leaf)) {
     throw "9288S EXE not found: $GamePath"
   }
   $GameName = [System.IO.Path]::GetFileName($GamePath)
-  $EncodedGameDirectory = [uri]::EscapeDataString($GuestRootDirectory)
+  $EncodedGameDirectory = [uri]::EscapeDataString($GuestProgramDirectory)
   $EncodedGameName = [uri]::EscapeDataString($GameName)
   Invoke-WebRequest `
     -Method Post `
@@ -134,7 +148,7 @@ if (-not [string]::IsNullOrWhiteSpace($GamePath)) {
     -ContentType "application/octet-stream" `
     -InFile $GamePath `
     -TimeoutSec 90 | Out-Null
-  Write-Output "available in selector: A:\应用\数据\9288s\$GameName"
+  Write-Output "available in program list: A:\应用\数据\9288s\系统\程序\$GameName"
   Invoke-EmulatorCommand @{ op = "force-stop" } | Out-Null
   Start-Sleep -Seconds 2
 }
@@ -149,8 +163,8 @@ Invoke-WebRequest `
   -TimeoutSec 90 | Out-Null
 
 Write-Output "installed: $TargetPath"
-Write-Output "waiting for the 9588 desktop..."
-Start-Sleep -Seconds 12
+Write-Output "waiting 45 seconds for the 9588 desktop..."
+Start-Sleep -Seconds 45
 
 # The reset desktop selects 查询典. One Right selects 背单词/E-pets, whose
 # fixed launcher filename is replaced by this compatibility BDA.
@@ -168,6 +182,6 @@ if (-not $NoBrowser) {
   Start-Process "$EmulatorUrl/"
 }
 
-Write-Output "running: 9288S EXE file selector"
+Write-Output "running: 9288S program list"
 Write-Output "screen: $ScreenshotPath"
-Write-Output "select an EXE, then use 取消 / direction / 确认 controls"
+Write-Output "tap a program or select it with direction / 确认"

@@ -1,6 +1,7 @@
 #include "bda_sdk.h"
 
 #include "../../runtime/include/c33vm.h"
+#include "../../runtime/include/c33jit.h"
 #include "../../runtime/include/compat_api.h"
 #include "../../runtime/include/compat_fs.h"
 #include "../../runtime/include/compat_gui.h"
@@ -10,20 +11,32 @@
 #define SCREEN_H         320
 #define GUEST_SCREEN_W   160
 #define GUEST_SCREEN_H   240
-#define PHYSICAL_SCREEN_W 240
-#define PHYSICAL_SCREEN_H 320
 #define GAME_VIEW_W      160
 #define GAME_VIEW_H      240
 #define GAME_VIEW_X      ((SCREEN_W - GAME_VIEW_W) / 2)
 #define BOTTOM_BAR_TOP   GAME_VIEW_H
-#define QEMU_FRAMEBUFFER  0xa1f82000u
-#define QEMU_EVENT_QUEUE  0xa9f00040u
-#define QEMU_EVENT_MAGIC  0x514b4242u
-#define QEMU_EVENT_SLOTS  8u
-#define QEMU_EVENT_WORDS  5u
-#define QEMU_EVENT_KIND_KEY 1u
-#define QEMU_TOUCH_TRACE  0xa9f00100u
-#define QEMU_TOUCH_MAGIC  0x54434b42u
+#define FULLSCREEN_W     SCREEN_W
+#define FULLSCREEN_H     SCREEN_H
+#define FULLSCREEN_VIEW_W 213
+#define FULLSCREEN_VIEW_H FULLSCREEN_H
+#define FULLSCREEN_VIEW_X \
+    ((FULLSCREEN_W - FULLSCREEN_VIEW_W) / 2)
+#define FULLSCREEN_VIEW_Y 0
+#define FULLSCREEN_FLOAT_W 42
+#define FULLSCREEN_FLOAT_H 32
+#define FULLSCREEN_FLOAT_DEFAULT_X \
+    (FULLSCREEN_W - FULLSCREEN_FLOAT_W - 8)
+#define FULLSCREEN_FLOAT_DEFAULT_Y 8
+#define FULLSCREEN_DRAG_THRESHOLD 3
+#define C200_GUI_SCREEN_BUFFER 0x6b0u
+#define C200_GUI_SCREEN_ORIENTATION 0x738u
+#define C200_FRAMEBUFFER_PHYS 0x01f82000u
+#define MIPS_PHYS_MASK 0x1fffffffu
+#define MIPS_SEGMENT_MASK 0xe0000000u
+#define MIPS_KSEG0_BASE 0x80000000u
+#define MIPS_KSEG1_BASE 0xa0000000u
+#define RAW_EVENT_MAX_PER_POLL 8u
+#define COMPAT_LOG_VERBOSE 0
 
 #define GUEST_IRAM_SIZE  0x00004000u
 #define GUEST_API_BASE   0x02000000u
@@ -37,7 +50,9 @@
 #define GUEST_HEAP_END   (GUEST_HEAP_BASE + GUEST_HEAP_SIZE)
 #define VM_SLICE         100000u
 #define CALLBACK_BUDGET  1000000u
+#define C33_JIT_CODE_CACHE_SIZE 0x00100000u
 #define EVENT_QUEUE_SIZE 16u
+#define GUEST_TIMER_COUNT 16u
 #define LISTBOX_ITEM_COUNT 5u
 #define LISTBOX_ITEM_SIZE  64u
 #define GUEST_CONTROL_HWND 0x100u
@@ -46,13 +61,32 @@
 #define LISTBOX_SELECT_W   88u
 #define LISTBOX_SELECT_H   16u
 #define LISTBOX_ITEM_STEP  19u
-#define HOST_TICK_MS     25u
 #define MAX_FILE_IO_SIZE 0x00020000u
 #define MAX_D300_FILE_SIZE 0x00400000u
 #define NATIVE_PATH_CAPACITY 320u
+#define GUEST_PATH_CAPACITY  192u
 #define HZK_GLYPH_SIZE     24u
 #define HZK_BASE_OFFSET    0x001a84b0u
-#define SAVED_BOX_SLOTS    8u
+#define PROGRAM_MAX_ENTRIES 32u
+#define PROGRAMS_PER_PAGE   5u
+#define PROGRAM_ROW_TOP     40u
+#define PROGRAM_ROW_HEIGHT  46u
+#define PROGRAM_ICON_HEADER_SIZE 16u
+#define PROGRAM_ICON_WIDTH  32u
+#define PROGRAM_ICON_HEIGHT 32u
+#define PROGRAM_ICON_FRAME_SIZE 256u
+#define PROGRAM_ICON_PAYLOAD_SIZE 512u
+#define PROGRAM_TITLE_CAPACITY 17u
+#define COMPAT_LOG_PATH \
+    COMPAT_FS_NATIVE_ROOT "\\9288LOG.TXT"
+#define COMPAT_LOG_HEARTBEAT_TICKS 200u
+
+#define PICV_FAULT_INVALID_ARGUMENT 1u
+#define PICV_FAULT_SOURCE_STRIDE    2u
+#define PICV_FAULT_SOURCE_READ      3u
+#define PICV_FAULT_DESTINATION_READ 4u
+#define PICV_FAULT_DESTINATION_WRITE 5u
+#define PICV_FAULT_STACK_ARGUMENTS  0x100u
 
 #define VIRTUAL_ACTION_NONE     0u
 #define VIRTUAL_ACTION_UP       1u
@@ -63,6 +97,7 @@
 #define VIRTUAL_ACTION_BACK     6u
 #define VIRTUAL_ACTION_SELECT   7u
 #define VIRTUAL_ACTION_SETTINGS 8u
+#define VIRTUAL_ACTION_FULLSCREEN 9u
 
 static const char k_native_help_title[] = "9288S";
 
@@ -76,17 +111,20 @@ typedef struct guest_message {
     u32 point_y;
 } guest_message_t;
 
-typedef struct saved_box {
-    u32 guest_buffer;
-    u32 width;
-    u32 height;
-    u16 *pixels;
-} saved_box_t;
+typedef struct guest_timer {
+    u32 hwnd;
+    u32 id;
+    u32 interval;
+    u32 elapsed;
+    int active;
+} guest_timer_t;
 
 typedef struct compat_9588_state {
     c33_vm_t *vm;
     u16 *framebuffer;
+    u16 *fullscreen_buffer;
     char selected_path[NATIVE_PATH_CAPACITY];
+    char guest_cwd[GUEST_PATH_CAPACITY];
     u32 guest_window_proc;
     u32 guest_hwnd;
     u32 parent_window_proc;
@@ -94,9 +132,11 @@ typedef struct compat_9588_state {
     u32 parent_pen_color;
     u32 parent_brush_color;
     u32 parent_background_color;
+    u32 parent_background_mode;
     s32 parent_current_x;
     s32 parent_current_y;
     int parent_instant_paint;
+    u32 guest_paint_depth;
     u32 next_hwnd;
     u32 guest_control_hwnd;
     char listbox_items[LISTBOX_ITEM_COUNT][LISTBOX_ITEM_SIZE];
@@ -110,34 +150,57 @@ typedef struct compat_9588_state {
     u32 event_read;
     u32 event_write;
     u32 event_count;
-    u32 hardware_event_cursor;
     int hardware_events_ready;
-    int touch_ready;
     int touch_down;
     int touch_captured;
     u32 touch_x;
     u32 touch_y;
     u32 touch_region;
+    int touch_escape_suppressed;
+    int native_escape_pending;
+    bda_handle_t native_frame;
+    bda_handle_t native_draw;
+    bda_handle_t native_draw_owner;
+    void *native_draw_object;
+    bda_gui_picture_t native_picture;
+    int native_frame_detached;
+    int native_redraw;
+    u32 raw_event_count;
+    u32 raw_touch_count;
     u32 virtual_action;
+    int fullscreen_mode;
+    s32 fullscreen_float_x;
+    s32 fullscreen_float_y;
+    s32 fullscreen_touch_start_x;
+    s32 fullscreen_touch_start_y;
+    s32 fullscreen_float_start_x;
+    s32 fullscreen_float_start_y;
+    int fullscreen_dragged;
+    u8 combo_keys[6];
     int controls_left;
     int request_reselect;
-    u32 timer_hwnd;
-    u32 timer_id;
-    u32 timer_interval;
-    u32 timer_elapsed;
+    guest_timer_t timers[GUEST_TIMER_COUNT];
+    u32 timer_last_id;
+    u32 timer_service_count;
+    u32 timer_fire_count;
     u32 message_time;
     u32 pen_color;
     u32 brush_color;
     u32 background_color;
+    u32 background_mode;
     u32 text_color;
     u32 legacy_font_type;
+    u32 selected_log_font;
+    u32 created_log_font;
+    u32 created_log_font_size;
     int hzk_file;
     int hzk_attempted;
-    saved_box_t saved_boxes[SAVED_BOX_SLOTS];
     s32 current_x;
     s32 current_y;
     int instant_paint;
     int quit;
+    u32 api_call_count;
+    u32 heartbeat_tick;
 } compat_9588_state_t;
 
 typedef struct compat_9588_runtime {
@@ -147,6 +210,14 @@ typedef struct compat_9588_runtime {
     compat_9588_state_t state;
 } compat_9588_runtime_t;
 
+typedef struct program_entry {
+    char path[NATIVE_PATH_CAPACITY];
+    char file_name[NATIVE_PATH_CAPACITY];
+    char title[PROGRAM_TITLE_CAPACITY];
+    u8 icon[PROGRAM_ICON_PAYLOAD_SIZE];
+    int has_icon;
+} program_entry_t;
+
 /*
  * Keep this in the packaged .data section.  The minimal BDA loader copies the
  * file-backed image but does not reserve a separate trailing .bss range.
@@ -155,6 +226,25 @@ static volatile u32 g_diagnostic[16] = {
     0x44473932u, 0x13579bdfu, 0x2468ace0u,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
+
+static compat_9588_state_t *g_native_input_state
+    __attribute__((section(".data"))) = 0;
+static bda_handle_t g_native_shared_frame
+    __attribute__((section(".data"))) = 0;
+static bda_handle_t g_native_shared_draw
+    __attribute__((section(".data"))) = 0;
+static bda_handle_t g_native_shared_draw_owner
+    __attribute__((section(".data"))) = 0;
+static void *g_native_shared_draw_object
+    __attribute__((section(".data"))) = 0;
+static volatile u16 *g_native_direct_framebuffer
+    __attribute__((section(".data"))) = 0;
+static int g_native_direct_framebuffer_rotate_180
+    __attribute__((section(".data"))) = 0;
+static int g_native_direct_framebuffer_initialized
+    __attribute__((section(".data"))) = 0;
+static int g_compat_log_file
+    __attribute__((section(".data"))) = -1;
 
 static int allocation_failed(const void *pointer)
 {
@@ -179,6 +269,173 @@ static void append_hex(char **out, char *end, u32 value)
     }
 }
 
+static u32 native_text_length(const char *text)
+{
+    u32 length = 0u;
+    while (text && text[length]) {
+        ++length;
+    }
+    return length;
+}
+
+static int native_text_equal(
+    const char *left,
+    const char *right
+)
+{
+    if (!left || !right) {
+        return left == right;
+    }
+    while (*left && *right && *left == *right) {
+        ++left;
+        ++right;
+    }
+    return *left == *right;
+}
+
+static int native_text_starts_with(
+    const char *text,
+    const char *prefix
+)
+{
+    if (!text || !prefix) {
+        return 0;
+    }
+    while (*prefix && *text == *prefix) {
+        ++text;
+        ++prefix;
+    }
+    return *prefix == 0;
+}
+
+static int compat_log_event_is_verbose(const char *event)
+{
+    return native_text_equal(event, "SELECTOR_ALLOC") ||
+           native_text_starts_with(event, "SELECTOR_META_") ||
+           native_text_starts_with(event, "SELECTOR_FIND") ||
+           native_text_equal(event, "SELECTOR_SCAN_ITEM") ||
+           native_text_equal(event, "SELECTOR_DRAW_BEGIN") ||
+           native_text_equal(event, "SELECTOR_PRESENT_BEGIN") ||
+           native_text_equal(event, "SELECTOR_PRESENT_END") ||
+           native_text_equal(event, "SELECTOR_READY") ||
+           native_text_equal(event, "SELECTOR_KEY") ||
+           native_text_equal(event, "SELECTOR_TOUCH");
+}
+
+static void compat_log_close(void)
+{
+    if (bda_fs_file_is_valid(g_compat_log_file)) {
+        (void)bda_fs_close_raw(g_compat_log_file);
+    }
+    g_compat_log_file = -1;
+}
+
+static void compat_log_write(const char *text, int truncate)
+{
+    u32 length;
+    if (truncate) {
+        compat_log_close();
+    }
+    if (!bda_fs_file_is_valid(g_compat_log_file)) {
+        g_compat_log_file = bda_fs_fopen_raw(
+            COMPAT_LOG_PATH, truncate ? "wb" : "ab"
+        );
+    }
+    if (!bda_fs_file_is_valid(g_compat_log_file)) {
+        return;
+    }
+    length = native_text_length(text);
+    if (length) {
+        (void)bda_fs_fwrite_raw(
+            text, 1u, length, g_compat_log_file
+        );
+    }
+}
+
+static void compat_log_record(
+    const char *event,
+    const char *detail,
+    u32 value0,
+    u32 value1,
+    u32 value2,
+    u32 value3
+)
+{
+    char line[256];
+    char *out = line;
+    char *end = line + sizeof(line);
+#if !COMPAT_LOG_VERBOSE
+    if (compat_log_event_is_verbose(event)) {
+        return;
+    }
+#endif
+    append_text(&out, end, "T=");
+    append_hex(&out, end, bda_gui_tick_count_25ms());
+    append_text(&out, end, " ");
+    append_text(&out, end, event ? event : "EVENT");
+    if (detail && *detail) {
+        append_text(&out, end, " detail=");
+        append_text(&out, end, detail);
+    }
+    append_text(&out, end, " v0=");
+    append_hex(&out, end, value0);
+    append_text(&out, end, " v1=");
+    append_hex(&out, end, value1);
+    append_text(&out, end, " v2=");
+    append_hex(&out, end, value2);
+    append_text(&out, end, " v3=");
+    append_hex(&out, end, value3);
+    append_text(&out, end, "\r\n");
+    *out = 0;
+    compat_log_write(line, 0);
+}
+
+static void compat_log_vm(
+    const char *event,
+    const c33_vm_t *vm,
+    const compat_api_t *api,
+    const compat_9588_state_t *state,
+    c33_vm_status_t status
+)
+{
+    char line[320];
+    char *out = line;
+    char *end = line + sizeof(line);
+    append_text(&out, end, "T=");
+    append_hex(&out, end, bda_gui_tick_count_25ms());
+    append_text(&out, end, " ");
+    append_text(&out, end, event ? event : "VM");
+    append_text(&out, end, " status=");
+    append_hex(&out, end, (u32)status);
+    append_text(&out, end, " pc=");
+    append_hex(&out, end, vm ? vm->pc : 0u);
+    append_text(&out, end, " sp=");
+    append_hex(&out, end, vm ? vm->sp : 0u);
+    append_text(&out, end, " ins=");
+    append_hex(
+        &out, end, vm ? (u32)(vm->instructions >> 32) : 0u
+    );
+    append_text(&out, end, ":");
+    append_hex(&out, end, vm ? (u32)vm->instructions : 0u);
+    append_text(&out, end, " api=");
+    append_hex(&out, end, api ? api->last_group : 0u);
+    append_text(&out, end, "/");
+    append_hex(&out, end, api ? api->last_slot : 0u);
+    append_text(&out, end, " calls=");
+    append_hex(&out, end, state ? state->api_call_count : 0u);
+    append_text(&out, end, " hwnd=");
+    append_hex(&out, end, state ? state->guest_hwnd : 0u);
+    append_text(&out, end, " proc=");
+    append_hex(&out, end, state ? state->guest_window_proc : 0u);
+    append_text(&out, end, " events=");
+    append_hex(&out, end, state ? state->event_count : 0u);
+    append_text(&out, end, " timer=");
+    append_hex(&out, end, state ? state->timer_last_id : 0u);
+    append_text(&out, end, "\r\n");
+    *out = 0;
+    compat_log_write(line, 0);
+}
+
 static void show_vm_status(c33_vm_t *vm, c33_vm_status_t status)
 {
     char text[192];
@@ -188,15 +445,25 @@ static void show_vm_status(c33_vm_t *vm, c33_vm_status_t status)
     append_text(&out, end, c33_vm_status_string(status));
     append_text(&out, end, "\nPC: ");
     append_hex(&out, end, vm->fault_pc ? vm->fault_pc : vm->pc);
-    append_text(&out, end, "\nOpcode: ");
-    append_hex(&out, end, vm->fault_opcode);
-    append_text(&out, end, "\nLast API: ");
+    append_text(&out, end, "\nAPI: ");
     if (vm->hostcall_opaque) {
         compat_api_t *api = (compat_api_t *)vm->hostcall_opaque;
         append_hex(&out, end, api->last_group);
         append_text(&out, end, "/");
         append_hex(&out, end, api->last_slot);
     }
+    append_text(&out, end, "\nAddress: ");
+    append_hex(&out, end, vm->fault_address);
+    append_text(&out, end, "\nSP: ");
+    append_hex(&out, end, vm->sp);
+    append_text(&out, end, "\nR6: ");
+    append_hex(&out, end, vm->regs[6]);
+    append_text(&out, end, "\nR7: ");
+    append_hex(&out, end, vm->regs[7]);
+    append_text(&out, end, "\nR8: ");
+    append_hex(&out, end, vm->regs[8]);
+    append_text(&out, end, "\nR9: ");
+    append_hex(&out, end, vm->regs[9]);
     *out = 0;
     bda_msgbox("9288S compatibility", text);
 }
@@ -205,6 +472,7 @@ static int guest_read_u32(c33_vm_t *vm, u32 address, u32 *value)
 {
     u8 bytes[4];
     if (!c33_vm_read(vm, address, bytes, sizeof(bytes))) {
+        vm->fault_address = address;
         return 0;
     }
     *value = (u32)bytes[0] |
@@ -222,6 +490,14 @@ static int guest_write_u32(c33_vm_t *vm, u32 address, u32 value)
         (u8)(value >> 16),
         (u8)(value >> 24)
     };
+    return c33_vm_write(vm, address, bytes, sizeof(bytes));
+}
+
+static int guest_write_u16(c33_vm_t *vm, u32 address, u16 value)
+{
+    u8 bytes[2];
+    bytes[0] = (u8)value;
+    bytes[1] = (u8)(value >> 8);
     return c33_vm_write(vm, address, bytes, sizeof(bytes));
 }
 
@@ -320,17 +596,128 @@ static int file_mode_may_write(const char *mode)
     return 0;
 }
 
-static int path_has_trailing_separator(const char *path)
+static int guest_path_is_absolute(const char *path)
 {
-    u32 length = 0u;
     if (!path) {
         return 0;
     }
-    while (path[length]) {
-        ++length;
+    return path[0] == '\\' || path[0] == '/' ||
+           (((path[0] >= 'A' && path[0] <= 'Z') ||
+             (path[0] >= 'a' && path[0] <= 'z')) &&
+            path[1] == ':');
+}
+
+static int map_guest_path_for_state(
+    const compat_9588_state_t *state,
+    const char *guest_path,
+    char *native_path,
+    u32 native_capacity
+)
+{
+    char combined[NATIVE_PATH_CAPACITY];
+    u32 at = 0u;
+    u32 index = 0u;
+    if (!state || !guest_path) {
+        return 0;
     }
-    return length != 0u &&
-           (path[length - 1u] == '\\' || path[length - 1u] == '/');
+    if (guest_path_is_absolute(guest_path) ||
+        state->guest_cwd[0] == 0 ||
+        (state->guest_cwd[0] == '\\' &&
+         state->guest_cwd[1] == 0)) {
+        return compat_fs_map_guest_path(
+            guest_path, native_path, native_capacity
+        );
+    }
+    while (state->guest_cwd[index]) {
+        if (at + 1u >= sizeof(combined)) return 0;
+        combined[at++] = state->guest_cwd[index++];
+    }
+    if (at && combined[at - 1u] != '\\') {
+        if (at + 1u >= sizeof(combined)) return 0;
+        combined[at++] = '\\';
+    }
+    index = 0u;
+    while (guest_path[index]) {
+        if (at + 1u >= sizeof(combined)) return 0;
+        combined[at++] = guest_path[index++];
+    }
+    combined[at] = 0;
+    return compat_fs_map_guest_path(
+        combined, native_path, native_capacity
+    );
+}
+
+static int set_guest_cwd_from_native(
+    compat_9588_state_t *state,
+    const char *native_path
+)
+{
+    const char *root = COMPAT_FS_NATIVE_ROOT;
+    u32 root_length = 0u;
+    u32 index = 0u;
+    while (root[root_length]) ++root_length;
+    while (index < root_length &&
+           native_path[index] == root[index]) {
+        ++index;
+    }
+    if (index != root_length) {
+        return 0;
+    }
+    index = 0u;
+    if (!native_path[root_length]) {
+        state->guest_cwd[index++] = '\\';
+    } else {
+        while (native_path[root_length] &&
+               index + 1u < sizeof(state->guest_cwd)) {
+            state->guest_cwd[index++] = native_path[root_length++];
+        }
+        if (native_path[root_length]) {
+            return 0;
+        }
+    }
+    state->guest_cwd[index] = 0;
+    return 1;
+}
+
+static int native_path_info(
+    const char *native_path,
+    bda_fs_find_data_t *find_data
+)
+{
+    int result;
+    bda_fs_find_data_init(find_data);
+    result = bda_fs_findfirst(native_path, 0x27u, find_data);
+    if (result != -1) {
+        (void)bda_fs_findclose(find_data);
+    }
+    return result;
+}
+
+static int bda_fs_remove_compat(const char *path)
+{
+    return bda_sdk_internal_call1(
+        bda_sdk_internal_fs(), 0x024u, (u32)path
+    );
+}
+
+static int bda_fs_rename_compat(
+    const char *old_path,
+    const char *new_path
+)
+{
+    return bda_sdk_internal_call2(
+        bda_sdk_internal_fs(),
+        0x028u,
+        (u32)old_path,
+        (u32)new_path
+    );
+}
+
+static int bda_fs_rmdir_compat(const char *path)
+{
+    return bda_sdk_internal_call1(
+        bda_sdk_internal_fs(), 0x034u, (u32)path
+    );
 }
 
 static void copy_native_path(char *destination, const char *source)
@@ -753,6 +1140,27 @@ static void draw_text_action_button(
     );
 }
 
+static void draw_expand_icon(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u16 color
+)
+{
+    draw_panel_line(state, x, y + 5, x, y, color);
+    draw_panel_line(state, x, y, x + 5, y, color);
+    draw_panel_line(state, x + 11, y, x + 16, y, color);
+    draw_panel_line(state, x + 16, y, x + 16, y + 5, color);
+    draw_panel_line(state, x, y + 11, x, y + 16, color);
+    draw_panel_line(state, x, y + 16, x + 5, y + 16, color);
+    draw_panel_line(
+        state, x + 11, y + 16, x + 16, y + 16, color
+    );
+    draw_panel_line(
+        state, x + 16, y + 11, x + 16, y + 16, color
+    );
+}
+
 static void draw_virtual_controls(compat_9588_state_t *state)
 {
     static const u8 cancel_first[24] = {
@@ -857,6 +1265,23 @@ static void draw_virtual_controls(compat_9588_state_t *state)
     );
     draw_panel_text(
         state, 211, 105 + (pressed ? 2 : 0), "SET", ink
+    );
+
+    pressed = virtual_control_pressed(
+        state, VIRTUAL_ACTION_FULLSCREEN
+    );
+    draw_rounded_key(
+        state, 4, 150, 32u, 44u, 5u,
+        pressed ? surface_pressed : surface,
+        edge,
+        pressed
+    );
+    draw_expand_icon(
+        state, 12, 156 + (pressed ? 2 : 0),
+        pressed ? 0x2697u : muted
+    );
+    draw_panel_text(
+        state, 14, 179 + (pressed ? 2 : 0), "FS", ink
     );
 
     /* Bottom virtual controls follow the 9288S learning-device layout. */
@@ -980,38 +1405,42 @@ static void fill_guest_rect(
     }
 }
 
-static saved_box_t *find_saved_box(
+static void reverse_guest_rect(
     compat_9588_state_t *state,
-    u32 guest_buffer,
-    int create
+    u32 x,
+    u32 y,
+    u32 width,
+    u32 height
 )
 {
-    saved_box_t *empty = 0;
-    u32 index;
-    for (index = 0u; index < SAVED_BOX_SLOTS; ++index) {
-        saved_box_t *box = &state->saved_boxes[index];
-        if (box->pixels && box->guest_buffer == guest_buffer) {
-            return box;
-        }
-        if (!box->pixels && !empty) {
-            empty = box;
+    u32 px;
+    u32 py;
+    for (py = 0u; py < height && y + py < GUEST_SCREEN_H; ++py) {
+        for (px = 0u; px < width && x + px < GUEST_SCREEN_W; ++px) {
+            u32 panel_x = GAME_VIEW_X + x + px;
+            u32 panel_y = y + py;
+            state->framebuffer[panel_y * SCREEN_W + panel_x] ^= 0xffffu;
         }
     }
-    if (create) {
-        if (empty) {
-            return empty;
-        }
-        /*
-         * The game uses these buffers as a short-lived stack. If all cache
-         * slots are occupied, recycle the oldest slot deterministically.
-         */
-        bda_free(state->saved_boxes[0].pixels);
-        bda_memset(
-            &state->saved_boxes[0], 0, sizeof(state->saved_boxes[0])
-        );
-        return &state->saved_boxes[0];
-    }
-    return 0;
+}
+
+static u32 guest_gray_from_rgb565(u16 pixel)
+{
+    u32 red;
+    u32 green;
+    u32 blue;
+    u32 luminance;
+
+    if (pixel == 0x0000u) return 0u;
+    if (pixel == 0x52aau) return 1u;
+    if (pixel == 0xad55u) return 2u;
+    if (pixel == 0xffffu) return 3u;
+
+    red = ((pixel >> 11) & 31u) * 255u / 31u;
+    green = ((pixel >> 5) & 63u) * 255u / 63u;
+    blue = (pixel & 31u) * 255u / 31u;
+    luminance = (red * 30u + green * 59u + blue * 11u) / 100u;
+    return (luminance * 3u + 127u) / 255u;
 }
 
 static int save_guest_box(
@@ -1023,8 +1452,7 @@ static int save_guest_box(
     u32 guest_buffer
 )
 {
-    saved_box_t *box;
-    u32 pixel_count;
+    u32 stride;
     u32 row;
     if (!guest_buffer || !width || !height ||
         x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H ||
@@ -1032,33 +1460,36 @@ static int save_guest_box(
         height > GUEST_SCREEN_H - y) {
         return 0;
     }
-    pixel_count = width * height;
-    box = find_saved_box(state, guest_buffer, 1);
-    if (!box) {
-        return 0;
-    }
-    if (box->pixels &&
-        (box->width != width || box->height != height)) {
-        bda_free(box->pixels);
-        box->pixels = 0;
-    }
-    if (!box->pixels) {
-        box->pixels = (u16 *)bda_alloc(pixel_count * sizeof(u16));
-        if (allocation_failed(box->pixels)) {
-            box->pixels = 0;
-            return 0;
-        }
-    }
-    box->guest_buffer = guest_buffer;
-    box->width = width;
-    box->height = height;
+    stride = compat_gui_packed_2bpp_stride(width);
     for (row = 0u; row < height; ++row) {
-        bda_memcpy(
-            box->pixels + row * width,
-            state->framebuffer +
-                (y + row) * SCREEN_W + GAME_VIEW_X + x,
-            width * sizeof(u16)
-        );
+        u32 byte_index;
+        for (byte_index = 0u; byte_index < stride; ++byte_index) {
+            u8 packed = 0u;
+            u32 subpixel;
+            for (subpixel = 0u; subpixel < 4u; ++subpixel) {
+                u32 column = byte_index * 4u + subpixel;
+                u32 gray = 0u;
+                if (column < width) {
+                    gray = guest_gray_from_rgb565(
+                        state->framebuffer[
+                            (y + row) * SCREEN_W +
+                            GAME_VIEW_X + x + column
+                        ]
+                    );
+                }
+                packed |= (u8)(gray << (6u - subpixel * 2u));
+            }
+            if (!c33_vm_write(
+                    state->vm,
+                    guest_buffer + row * stride + byte_index,
+                    &packed,
+                    1u
+                )) {
+                state->vm->fault_address =
+                    guest_buffer + row * stride + byte_index;
+                return 0;
+            }
+        }
     }
     return 1;
 }
@@ -1072,21 +1503,42 @@ static int restore_guest_box(
     u32 guest_buffer
 )
 {
-    saved_box_t *box = find_saved_box(state, guest_buffer, 0);
+    u32 stride;
     u32 row;
-    if (!box || box->width != width || box->height != height ||
+    if (!guest_buffer || !width || !height ||
         x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H ||
         width > GUEST_SCREEN_W - x ||
         height > GUEST_SCREEN_H - y) {
         return 0;
     }
+    stride = compat_gui_packed_2bpp_stride(width);
     for (row = 0u; row < height; ++row) {
-        bda_memcpy(
-            state->framebuffer +
-                (y + row) * SCREEN_W + GAME_VIEW_X + x,
-            box->pixels + row * width,
-            width * sizeof(u16)
-        );
+        u32 byte_index;
+        for (byte_index = 0u; byte_index < stride; ++byte_index) {
+            u8 packed;
+            u32 subpixel;
+            if (!c33_vm_read(
+                    state->vm,
+                    guest_buffer + row * stride + byte_index,
+                    &packed,
+                    1u
+                )) {
+                state->vm->fault_address =
+                    guest_buffer + row * stride + byte_index;
+                return 0;
+            }
+            for (subpixel = 0u; subpixel < 4u; ++subpixel) {
+                u32 column = byte_index * 4u + subpixel;
+                if (column < width) {
+                    put_guest_pixel(
+                        state,
+                        (s32)(x + column),
+                        (s32)(y + row),
+                        (packed >> (6u - subpixel * 2u)) & 3u
+                    );
+                }
+            }
+        }
     }
     return 1;
 }
@@ -1121,24 +1573,524 @@ static void render_listbox_selection(compat_9588_state_t *state)
     state->listbox_drawn_caret = state->listbox_caret;
 }
 
+static void release_native_draw_context(
+    compat_9588_state_t *state
+)
+{
+    bda_handle_t draw;
+    if (!state) {
+        return;
+    }
+    draw = state->native_draw;
+    state->native_draw = 0;
+    state->native_draw_owner = 0;
+    if (draw && (s32)draw != -1) {
+        bda_gui_end_draw(draw);
+    }
+}
+
+static int acquire_native_draw_context(
+    compat_9588_state_t *state,
+    bda_handle_t owner
+)
+{
+    if (!state || !owner || (s32)owner == -1) {
+        return 0;
+    }
+    if (state->native_draw &&
+        state->native_draw_owner == owner) {
+        return 1;
+    }
+    release_native_draw_context(state);
+    state->native_draw = bda_gui_current_draw(owner);
+    if (!state->native_draw ||
+        (s32)state->native_draw == -1) {
+        state->native_draw = 0;
+        return 0;
+    }
+    state->native_draw_owner = owner;
+    return 1;
+}
+
+typedef u32 compat_alias_u32 __attribute__((__may_alias__));
+
+static int native_gui_pointer_valid(const void *pointer)
+{
+    u32 address = (u32)pointer;
+    return pointer != 0 && address != 0xffffffffu;
+}
+
+static void *native_gui_call_pointer0(u32 offset)
+{
+    typedef void *(*function_t)(void);
+    void *table = bda_sdk_internal_gui();
+    void *function;
+    if (!native_gui_pointer_valid(table)) {
+        return 0;
+    }
+    function = bda_sdk_internal_api(table, offset);
+    if (!native_gui_pointer_valid(function)) {
+        return 0;
+    }
+    return ((function_t)function)();
+}
+
+static u32 native_gui_call_u32_0(u32 offset, u32 fallback)
+{
+    typedef u32 (*function_t)(void);
+    void *table = bda_sdk_internal_gui();
+    void *function;
+    if (!native_gui_pointer_valid(table)) {
+        return fallback;
+    }
+    function = bda_sdk_internal_api(table, offset);
+    if (!native_gui_pointer_valid(function)) {
+        return fallback;
+    }
+    return ((function_t)function)();
+}
+
+static void initialize_native_direct_framebuffer(void)
+{
+    void *candidate;
+    u32 address;
+    u32 segment;
+    u32 physical;
+    u32 orientation;
+    if (g_native_direct_framebuffer_initialized) {
+        return;
+    }
+    g_native_direct_framebuffer_initialized = 1;
+    candidate = native_gui_call_pointer0(C200_GUI_SCREEN_BUFFER);
+    address = (u32)candidate;
+    segment = address & MIPS_SEGMENT_MASK;
+    physical = address & MIPS_PHYS_MASK;
+    orientation = native_gui_call_u32_0(
+        C200_GUI_SCREEN_ORIENTATION, 0xffffffffu
+    );
+    g_native_direct_framebuffer = 0;
+    g_native_direct_framebuffer_rotate_180 = 0;
+    if ((segment != MIPS_KSEG0_BASE &&
+         segment != MIPS_KSEG1_BASE) ||
+        physical != C200_FRAMEBUFFER_PHYS ||
+        (orientation != 0x130u && orientation != 0x131u)) {
+        compat_log_record(
+            "VIDEO_DIRECT_REJECTED",
+            0,
+            address,
+            physical,
+            orientation,
+            segment
+        );
+        return;
+    }
+    g_native_direct_framebuffer =
+        (volatile u16 *)(MIPS_KSEG1_BASE | physical);
+    g_native_direct_framebuffer_rotate_180 =
+        orientation != 0x131u;
+    compat_log_record(
+        "VIDEO_DIRECT_READY",
+        0,
+        (u32)g_native_direct_framebuffer,
+        physical,
+        orientation,
+        (u32)g_native_direct_framebuffer_rotate_180
+    );
+}
+
+static int submit_native_direct_framebuffer(
+    const u16 *pixels
+)
+{
+    const compat_alias_u32 *source;
+    volatile compat_alias_u32 *destination;
+    u32 remaining = SCREEN_W * SCREEN_H / 2u;
+    if (!pixels || !g_native_direct_framebuffer) {
+        return 0;
+    }
+    source = (const compat_alias_u32 *)pixels;
+    destination =
+        (volatile compat_alias_u32 *)g_native_direct_framebuffer;
+    if (!g_native_direct_framebuffer_rotate_180) {
+        while (remaining != 0u) {
+            *destination++ = *source++;
+            --remaining;
+        }
+    } else {
+        source += SCREEN_W * SCREEN_H / 2u;
+        while (remaining != 0u) {
+            u32 pair = *--source;
+            *destination++ = (pair << 16) | (pair >> 16);
+            --remaining;
+        }
+    }
+#if defined(__mips__)
+    __asm__ volatile("sync" ::: "memory");
+#endif
+    return 1;
+}
+
+static void put_fullscreen_pixel(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u16 color
+)
+{
+    if (!state || !state->fullscreen_buffer ||
+        x < 0 || y < 0 ||
+        x >= FULLSCREEN_W || y >= FULLSCREEN_H) {
+        return;
+    }
+    state->fullscreen_buffer[(u32)y * SCREEN_W + (u32)x] =
+        color;
+}
+
+static void fill_fullscreen_rect(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u16 color
+)
+{
+    u32 px;
+    u32 py;
+    for (py = 0u; py < height; ++py) {
+        for (px = 0u; px < width; ++px) {
+            put_fullscreen_pixel(
+                state, x + (s32)px, y + (s32)py, color
+            );
+        }
+    }
+}
+
+static void draw_fullscreen_text(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    const char *text,
+    u16 color
+)
+{
+    u32 index;
+    for (index = 0u; text[index]; ++index) {
+        u32 row;
+        for (row = 0u; row < 7u; ++row) {
+            u8 bits = glyph_row(text[index], row);
+            u32 column;
+            for (column = 0u; column < 5u; ++column) {
+                if (bits & (1u << (4u - column))) {
+                    put_fullscreen_pixel(
+                        state,
+                        x + (s32)(index * 6u + column),
+                        y + (s32)row,
+                        color
+                    );
+                }
+            }
+        }
+    }
+}
+
+static void draw_fullscreen_restore_float(
+    compat_9588_state_t *state
+)
+{
+    s32 x = state->fullscreen_float_x;
+    s32 y = state->fullscreen_float_y;
+    fill_fullscreen_rect(
+        state,
+        x + 2,
+        y + 2,
+        FULLSCREEN_FLOAT_W,
+        FULLSCREEN_FLOAT_H,
+        0x0000u
+    );
+    fill_fullscreen_rect(
+        state,
+        x,
+        y,
+        FULLSCREEN_FLOAT_W,
+        FULLSCREEN_FLOAT_H,
+        0xef9eu
+    );
+    fill_fullscreen_rect(
+        state,
+        x + 1,
+        y + 1,
+        FULLSCREEN_FLOAT_W - 2u,
+        FULLSCREEN_FLOAT_H - 2u,
+        0x10a2u
+    );
+    fill_fullscreen_rect(
+        state,
+        x + 5,
+        y + 5,
+        FULLSCREEN_FLOAT_W - 10u,
+        3u,
+        0x2697u
+    );
+    draw_fullscreen_text(
+        state, x + 9, y + 14, "BACK", 0xef9eu
+    );
+}
+
+static u16 interpolate_rgb565(
+    u16 first,
+    u16 second,
+    u32 weight
+)
+{
+    u32 inverse;
+    u32 red;
+    u32 green;
+    u32 blue;
+    if (weight == 0u || first == second) {
+        return first;
+    }
+    inverse = 256u - weight;
+    red =
+        (((u32)(first >> 11) * inverse) +
+         ((u32)(second >> 11) * weight) + 128u) >> 8;
+    green =
+        ((((u32)first >> 5) & 0x3fu) * inverse +
+         (((u32)second >> 5) & 0x3fu) * weight +
+         128u) >> 8;
+    blue =
+        (((u32)(first & 0x1fu) * inverse) +
+         ((u32)(second & 0x1fu) * weight) + 128u) >> 8;
+    return (u16)((red << 11) | (green << 5) | blue);
+}
+
+static void scale_fullscreen_row_bilinear(
+    const u16 *source,
+    u16 *destination
+)
+{
+    /*
+     * 160 source pixels map to 213 destination pixels with both endpoints
+     * aligned. The resulting 8.8 fixed-point step is exactly 192 (3/4).
+     */
+    u32 source_position = 0u;
+    u32 output_x;
+    for (output_x = 0u;
+         output_x < FULLSCREEN_VIEW_W;
+         ++output_x) {
+        u32 source_x = source_position >> 8;
+        u32 next_x =
+            source_x + 1u < GUEST_SCREEN_W
+                ? source_x + 1u
+                : source_x;
+        destination[output_x] = interpolate_rgb565(
+            source[source_x],
+            source[next_x],
+            source_position & 0xffu
+        );
+        source_position +=
+            (GUEST_SCREEN_W - 1u) * 256u /
+            (FULLSCREEN_VIEW_W - 1u);
+    }
+}
+
+static void build_fullscreen_framebuffer(
+    compat_9588_state_t *state
+)
+{
+    u16 row_storage_a[FULLSCREEN_VIEW_W];
+    u16 row_storage_b[FULLSCREEN_VIEW_W];
+    u16 *upper_row = row_storage_a;
+    u16 *lower_row = row_storage_b;
+    u32 upper_source_y = 0u;
+    u32 lower_source_y =
+        GUEST_SCREEN_H > 1u ? 1u : 0u;
+    u32 output_y;
+    if (!state || !state->framebuffer ||
+        !state->fullscreen_buffer) {
+        return;
+    }
+    /*
+     * The 9288S guest surface is 160x240 in the portrait backing store.
+     * Keep its 2:3 aspect ratio and scale it to 213x320 in the centre of
+     * the 240x320 panel. Two separable RGB565 interpolation passes provide
+     * bilinear filtering without floating-point work on the 9588. Only two
+     * horizontally scaled source rows are cached on the stack.
+     */
+    bda_memset(
+        state->fullscreen_buffer,
+        0,
+        SCREEN_W * SCREEN_H * sizeof(u16)
+    );
+    scale_fullscreen_row_bilinear(
+        state->framebuffer + GAME_VIEW_X,
+        upper_row
+    );
+    scale_fullscreen_row_bilinear(
+        state->framebuffer +
+            lower_source_y * SCREEN_W + GAME_VIEW_X,
+        lower_row
+    );
+    for (output_y = 0u;
+         output_y < FULLSCREEN_VIEW_H;
+         ++output_y) {
+        u32 source_position =
+            output_y * (GUEST_SCREEN_H - 1u) * 256u /
+            (FULLSCREEN_VIEW_H - 1u);
+        u32 source_y = source_position >> 8;
+        u32 next_y =
+            source_y + 1u < GUEST_SCREEN_H
+                ? source_y + 1u
+                : source_y;
+        u32 vertical_weight = source_position & 0xffu;
+        u16 *output =
+            state->fullscreen_buffer +
+            (output_y + FULLSCREEN_VIEW_Y) * SCREEN_W +
+            FULLSCREEN_VIEW_X;
+        u32 output_x;
+        if (source_y != upper_source_y) {
+            if (source_y == lower_source_y) {
+                u16 *swap = upper_row;
+                upper_row = lower_row;
+                lower_row = swap;
+            } else {
+                scale_fullscreen_row_bilinear(
+                    state->framebuffer +
+                        source_y * SCREEN_W + GAME_VIEW_X,
+                    upper_row
+                );
+            }
+            upper_source_y = source_y;
+            lower_source_y = next_y;
+            if (lower_source_y != upper_source_y) {
+                scale_fullscreen_row_bilinear(
+                    state->framebuffer +
+                        lower_source_y * SCREEN_W +
+                        GAME_VIEW_X,
+                    lower_row
+                );
+            }
+        }
+        for (output_x = 0u;
+             output_x < FULLSCREEN_VIEW_W;
+             ++output_x) {
+            output[output_x] = interpolate_rgb565(
+                upper_row[output_x],
+                next_y == source_y
+                    ? upper_row[output_x]
+                    : lower_row[output_x],
+                vertical_weight
+            );
+        }
+    }
+    draw_fullscreen_restore_float(state);
+}
+
+static int present_native_framebuffer(
+    compat_9588_state_t *state
+)
+{
+    u16 *present_pixels;
+    void *old_object;
+    int draw_result;
+    if (!state || !state->framebuffer) {
+        return 0;
+    }
+    present_pixels =
+        state->fullscreen_mode && state->fullscreen_buffer
+            ? state->fullscreen_buffer
+            : state->framebuffer;
+    if (submit_native_direct_framebuffer(present_pixels)) {
+        state->native_redraw = 0;
+        g_diagnostic[8] = 0u;
+        g_diagnostic[9] = 1u;
+        g_diagnostic[10] += 1u;
+        return 1;
+    }
+    if (!state->native_draw || !state->native_draw_object) {
+        return 0;
+    }
+    /*
+     * Guarded firmware fallback for an unknown C200 framebuffer layout.
+     */
+    state->native_picture.source_pixels = present_pixels;
+    (void)bda_gui_draw_guard_begin();
+    old_object = bda_gui_select_draw_object(
+        state->native_draw, state->native_draw_object
+    );
+    draw_result = bda_gui_render_picture(
+        state->native_draw,
+        0,
+        0,
+        SCREEN_W,
+        SCREEN_H,
+        &state->native_picture
+    );
+    (void)bda_gui_select_draw_object(
+        state->native_draw, old_object
+    );
+    (void)bda_gui_draw_guard_end();
+    g_diagnostic[8] = (u32)draw_result;
+    g_diagnostic[9] = 0u;
+    g_diagnostic[10] += 1u;
+    if (draw_result == 0) {
+        state->native_redraw = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void present_framebuffer(compat_9588_state_t *state)
 {
-    volatile u16 *output = (volatile u16 *)QEMU_FRAMEBUFFER;
-    u32 x;
-    u32 y;
     if (!state->framebuffer) {
         return;
     }
     render_listbox_selection(state);
-    draw_virtual_controls(state);
-    for (y = 0; y < PHYSICAL_SCREEN_H; ++y) {
-        for (x = 0; x < PHYSICAL_SCREEN_W; ++x) {
-            u32 output_x = PHYSICAL_SCREEN_W - 1u - x;
-            u32 output_y = PHYSICAL_SCREEN_H - 1u - y;
-            output[output_y * PHYSICAL_SCREEN_W + output_x] =
-                state->framebuffer[y * SCREEN_W + x];
-        }
+    if (state->fullscreen_mode && state->fullscreen_buffer) {
+        build_fullscreen_framebuffer(state);
+    } else {
+        draw_virtual_controls(state);
     }
+    (void)present_native_framebuffer(state);
+}
+
+static void log_picv_fault(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    u32 picture,
+    u32 virtual_screen,
+    u32 mode,
+    u32 reason,
+    u32 return_pc
+)
+{
+    compat_log_record(
+        "PICV_FAULT_GEOMETRY",
+        state->selected_path,
+        (u32)x,
+        (u32)y,
+        width,
+        height
+    );
+    compat_log_record(
+        "PICV_FAULT_BUFFERS",
+        state->selected_path,
+        picture,
+        virtual_screen,
+        mode,
+        reason
+    );
+    compat_log_record(
+        "PICV_FAULT_CONTEXT",
+        state->selected_path,
+        state->vm->pc,
+        state->vm->sp,
+        return_pc,
+        state->vm->fault_address
+    );
 }
 
 static int draw_packed_2bpp(
@@ -1157,18 +2109,53 @@ static int draw_packed_2bpp(
     u32 source_bytes;
     u32 source_address = guest_buffer;
     u32 index;
-    int selector_frame =
-        state->parent_hwnd &&
-        x == 0 && y == 0 &&
-        width == GUEST_SCREEN_W && height == GUEST_SCREEN_H;
+    int has_header = c33_vm_read(
+        vm, guest_buffer, image_header, sizeof(image_header)
+    );
+    int selector_frame;
     u8 packed;
     u32 loaded_byte = 0xffffffffu;
 
+    if (has_header) {
+        u32 header_width =
+            (u32)image_header[8] | ((u32)image_header[9] << 8);
+        u32 header_height =
+            (u32)image_header[10] | ((u32)image_header[11] << 8);
+        u32 header_payload =
+            (u32)image_header[12] |
+            ((u32)image_header[13] << 8) |
+            ((u32)image_header[14] << 16) |
+            ((u32)image_header[15] << 24);
+        u32 required_payload =
+            compat_gui_packed_2bpp_payload_size(
+                header_width, header_height
+            );
+        /*
+         * The SDK image object is authoritative. 9288S applications do not
+         * consistently pass a literal pixel width/height here: Five-in-a-row
+         * passes 161x241 for a 160x240 frame, negative deltas for small
+         * sprites, and x=8,y=40,w=137,h=51 for a valid 144x118 options
+         * panel. Using those call-site values as the packed row width shifts
+         * every following scanline. The original API obtains the actual
+         * 2bpp layout from the 16-byte image header.
+         */
+        if (header_width && header_height &&
+            header_width <= GUEST_SCREEN_W &&
+            header_height <= GUEST_SCREEN_H &&
+            header_payload >= required_payload) {
+            width = header_width;
+            height = header_height;
+        }
+    }
     if (!width || !height ||
         width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
         width > 0xffffffffu / height) {
         return 0;
     }
+    selector_frame =
+        state->parent_hwnd &&
+        x == 0 && y == 0 &&
+        width == GUEST_SCREEN_W && height == GUEST_SCREEN_H;
     pixel_count = width * height;
     source_stride = compat_gui_packed_2bpp_stride(width);
     source_bytes = compat_gui_packed_2bpp_payload_size(width, height);
@@ -1179,9 +2166,7 @@ static int draw_packed_2bpp(
      * pixels shifts every following scanline and makes one board look like
      * two broken half-width boards.
      */
-    if (c33_vm_read(
-            vm, guest_buffer, image_header, sizeof(image_header)
-        )) {
+    if (has_header) {
         source_address += compat_gui_image_payload_offset(
             image_header, width, height, source_bytes
         );
@@ -1212,7 +2197,7 @@ static int draw_packed_2bpp(
          */
         state->listbox_drawn_caret = 0xffffffffu;
     }
-    if (!state->instant_paint) {
+    if (state->instant_paint) {
         present_framebuffer(state);
     }
     return 1;
@@ -1220,54 +2205,92 @@ static int draw_packed_2bpp(
 
 static int legacy_blit_virtual_2bpp(
     compat_9588_state_t *state,
-    u32 x,
-    u32 y,
+    s32 x,
+    s32 y,
     u32 width,
     u32 height,
     u32 picture,
     u32 virtual_screen,
-    u32 mode
+    u32 mode,
+    u32 *failure_reason
 )
 {
     c33_vm_t *vm = state->vm;
     u32 source_stride;
-    u32 source_width = width;
+    u32 source_start_x = 0u;
+    u32 source_start_y = 0u;
+    u32 destination_x;
+    u32 destination_y;
+    u32 clipped_width;
+    u32 clipped_height;
     u32 row;
     u8 source[40];
     u8 destination[40];
 
-    if (!virtual_screen || !width || !height ||
-        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
-        x >= GUEST_SCREEN_W || y >= GUEST_SCREEN_H) {
+    if (failure_reason) {
+        *failure_reason = 0u;
+    }
+    if (!virtual_screen || (!picture && mode != 4u) ||
+        !width || !height ||
+        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H) {
+        if (failure_reason) {
+            *failure_reason = PICV_FAULT_INVALID_ARGUMENT;
+        }
         return 0;
     }
     /*
-     * The 9288S SysShowPicV clips at the virtual-screen edge. 三国霸业
-     * deliberately draws a 160-pixel strip at x=2, so preserve the source
-     * row stride while discarding the two off-screen destination pixels.
+     * SysShowPicV accepts signed positions and clips at every virtual-screen
+     * edge. 雷霆战机 keeps animating sprites after x reaches 180, and 三国霸业
+     * deliberately draws a 160-pixel strip at x=2. Both are valid no-op or
+     * clipped draws, not VM faults.
      */
-    if (width > GUEST_SCREEN_W - x) {
-        width = GUEST_SCREEN_W - x;
+    if (x < 0) {
+        source_start_x = (u32)-x;
     }
-    if (height > GUEST_SCREEN_H - y) {
-        height = GUEST_SCREEN_H - y;
+    if (y < 0) {
+        source_start_y = (u32)-y;
     }
-    source_stride = (source_width + 3u) / 4u;
+    if (source_start_x >= width || source_start_y >= height ||
+        x >= (s32)GUEST_SCREEN_W || y >= (s32)GUEST_SCREEN_H) {
+        return 1;
+    }
+    destination_x = x < 0 ? 0u : (u32)x;
+    destination_y = y < 0 ? 0u : (u32)y;
+    clipped_width = width - source_start_x;
+    clipped_height = height - source_start_y;
+    if (clipped_width > GUEST_SCREEN_W - destination_x) {
+        clipped_width = GUEST_SCREEN_W - destination_x;
+    }
+    if (clipped_height > GUEST_SCREEN_H - destination_y) {
+        clipped_height = GUEST_SCREEN_H - destination_y;
+    }
+    if (!clipped_width || !clipped_height) {
+        return 1;
+    }
+    source_stride = (width + 3u) / 4u;
     if (source_stride > sizeof(source)) {
+        if (failure_reason) {
+            *failure_reason = PICV_FAULT_SOURCE_STRIDE;
+        }
         return 0;
     }
-    for (row = 0u; row < height; ++row) {
+    for (row = 0u; row < clipped_height; ++row) {
         u32 column;
         u32 destination_address =
-            virtual_screen + (y + row) * (GUEST_SCREEN_W / 4u);
+            virtual_screen +
+            (destination_y + row) * (GUEST_SCREEN_W / 4u);
         if (mode != 4u &&
             !c33_vm_read(
                 vm,
-                picture + row * source_stride,
+                picture + (source_start_y + row) * source_stride,
                 source,
                 source_stride
             )) {
-            vm->fault_address = picture + row * source_stride;
+            vm->fault_address =
+                picture + (source_start_y + row) * source_stride;
+            if (failure_reason) {
+                *failure_reason = PICV_FAULT_SOURCE_READ;
+            }
             return 0;
         }
         /*
@@ -1276,16 +2299,25 @@ static int legacy_blit_virtual_2bpp(
          * access and branch for every individual pixel makes the intro run
          * hundreds of times slower under the 9588 CPU emulator.
          */
-        if ((x & 3u) == 0u && (width & 3u) == 0u) {
-            u32 first_byte = x / 4u;
-            if (mode == 0u && x == 0u && width == GUEST_SCREEN_W) {
+        if (!source_start_x &&
+            (destination_x & 3u) == 0u &&
+            (clipped_width & 3u) == 0u) {
+            u32 first_byte = destination_x / 4u;
+            u32 clipped_stride = clipped_width / 4u;
+            if (mode == 0u &&
+                destination_x == 0u &&
+                clipped_width == GUEST_SCREEN_W) {
                 if (!c33_vm_write(
                         vm,
                         destination_address,
                         source,
-                        source_stride
+                        clipped_stride
                     )) {
                     vm->fault_address = destination_address;
+                    if (failure_reason) {
+                        *failure_reason =
+                            PICV_FAULT_DESTINATION_WRITE;
+                    }
                     return 0;
                 }
                 continue;
@@ -1297,15 +2329,25 @@ static int legacy_blit_virtual_2bpp(
                     sizeof(destination)
                 )) {
                 vm->fault_address = destination_address;
+                if (failure_reason) {
+                    *failure_reason =
+                        PICV_FAULT_DESTINATION_READ;
+                }
                 return 0;
             }
-            for (column = 0u; column < source_stride; ++column) {
+            for (column = 0u; column < clipped_stride; ++column) {
                 u8 *destination_byte =
                     &destination[first_byte + column];
+                /*
+                 * The shipped game assets use mode 1 for the sparse sprite
+                 * plane and mode 2 for its inverse mask. This is the order
+                 * used by the 9288S runtime even though an old SDK comment
+                 * labels the two modes the other way around.
+                 */
                 if (mode == 1u) {
-                    *destination_byte &= source[column];
-                } else if (mode == 2u) {
                     *destination_byte |= source[column];
+                } else if (mode == 2u) {
+                    *destination_byte &= source[column];
                 } else if (mode == 3u) {
                     *destination_byte ^= source[column];
                 } else if (mode == 4u) {
@@ -1319,8 +2361,12 @@ static int legacy_blit_virtual_2bpp(
                     destination_address,
                     destination,
                     sizeof(destination)
-                )) {
+            )) {
                 vm->fault_address = destination_address;
+                if (failure_reason) {
+                    *failure_reason =
+                        PICV_FAULT_DESTINATION_WRITE;
+                }
                 return 0;
             }
             continue;
@@ -1330,28 +2376,32 @@ static int legacy_blit_virtual_2bpp(
                 destination_address,
                 destination,
                 sizeof(destination)
-            )) {
+        )) {
             vm->fault_address = destination_address;
+            if (failure_reason) {
+                *failure_reason = PICV_FAULT_DESTINATION_READ;
+            }
             return 0;
         }
-        for (column = 0u; column < width; ++column) {
-            u32 destination_x = x + column;
-            u32 source_shift = 6u - ((column & 3u) * 2u);
+        for (column = 0u; column < clipped_width; ++column) {
+            u32 source_x = source_start_x + column;
+            u32 output_x = destination_x + column;
+            u32 source_shift = 6u - ((source_x & 3u) * 2u);
             u32 destination_shift =
-                6u - ((destination_x & 3u) * 2u);
+                6u - ((output_x & 3u) * 2u);
             u32 source_pixel =
                 mode == 4u ? 3u :
-                (source[column / 4u] >> source_shift) & 3u;
+                (source[source_x / 4u] >> source_shift) & 3u;
             u8 *destination_byte =
-                &destination[destination_x / 4u];
+                &destination[output_x / 4u];
             u32 destination_pixel =
                 (*destination_byte >> destination_shift) & 3u;
             u32 output_pixel;
 
             if (mode == 1u) {
-                output_pixel = destination_pixel & source_pixel;
-            } else if (mode == 2u) {
                 output_pixel = destination_pixel | source_pixel;
+            } else if (mode == 2u) {
+                output_pixel = destination_pixel & source_pixel;
             } else if (mode == 3u) {
                 output_pixel = destination_pixel ^ source_pixel;
             } else {
@@ -1367,8 +2417,11 @@ static int legacy_blit_virtual_2bpp(
                 destination_address,
                 destination,
                 sizeof(destination)
-            )) {
+        )) {
             vm->fault_address = destination_address;
+            if (failure_reason) {
+                *failure_reason = PICV_FAULT_DESTINATION_WRITE;
+            }
             return 0;
         }
     }
@@ -1428,6 +2481,75 @@ static int legacy_blit_screen_2bpp(
     return 1;
 }
 
+static int legacy_get_part_picture_data_2bpp(
+    compat_9588_state_t *state,
+    u32 width,
+    u32 height,
+    u32 x1,
+    u32 y1,
+    u32 x2,
+    u32 y2,
+    u32 source_buffer,
+    u32 destination_buffer
+)
+{
+    c33_vm_t *vm = state->vm;
+    u32 source_stride;
+    u32 destination_width;
+    u32 destination_stride;
+    u32 row;
+    u8 source[40];
+    u8 destination[40];
+
+    if (!width || !height ||
+        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H ||
+        x1 > x2 || y1 > y2 ||
+        x2 >= width || y2 >= height ||
+        !source_buffer || !destination_buffer) {
+        return 0;
+    }
+    source_stride = (width + 3u) / 4u;
+    destination_width = x2 - x1 + 1u;
+    destination_stride = (destination_width + 3u) / 4u;
+    if (source_stride > sizeof(source) ||
+        destination_stride > sizeof(destination)) {
+        return 0;
+    }
+    for (row = 0u; row <= y2 - y1; ++row) {
+        u32 column;
+        u32 source_address =
+            source_buffer + (y1 + row) * source_stride;
+        u32 destination_address =
+            destination_buffer + row * destination_stride;
+        bda_memset(destination, 0, destination_stride);
+        if (!c33_vm_read(
+                vm, source_address, source, source_stride
+            )) {
+            vm->fault_address = source_address;
+            return 0;
+        }
+        for (column = 0u; column < destination_width; ++column) {
+            u32 source_x = x1 + column;
+            u32 source_shift = 6u - ((source_x & 3u) * 2u);
+            u32 destination_shift = 6u - ((column & 3u) * 2u);
+            u32 pixel =
+                (source[source_x / 4u] >> source_shift) & 3u;
+            destination[column / 4u] |=
+                (u8)(pixel << destination_shift);
+        }
+        if (!c33_vm_write(
+                vm,
+                destination_address,
+                destination,
+                destination_stride
+            )) {
+            vm->fault_address = destination_address;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int legacy_write_virtual_pixel_2bpp(
     compat_9588_state_t *state,
     u32 virtual_screen,
@@ -1454,13 +2576,16 @@ static int legacy_write_virtual_pixel_2bpp(
         return 0;
     }
     /*
-     * The 9288S packed grayscale convention is 0=black and 3=white.
-     * Glyph helpers receive a monochrome mask, so write black ink on a
-     * white cell instead of relying on the previously inverted palette.
+     * Game glyph helpers supply a transparent monochrome mask. Ink is the
+     * inverse of the existing pixel: white on 雷霆战机's black playfield and
+     * black on a light menu. Zero bits leave the background untouched.
      */
-    value =
-        (u8)((value & (u8)~(u8)(3u << shift)) |
-             (u8)((set ? 0u : 3u) << shift));
+    if (set) {
+        u32 current = (value >> shift) & 3u;
+        value =
+            (u8)((value & (u8)~(u8)(3u << shift)) |
+                 (u8)((3u - current) << shift));
+    }
     if (!c33_vm_write(state->vm, address, &value, 1u)) {
         state->vm->fault_address = address;
         return 0;
@@ -1616,7 +2741,7 @@ static int legacy_present_virtual_2bpp(
             pixels[3] = gray_palette[bits & 3u];
         }
     }
-    if (!state->instant_paint) {
+    if (state->instant_paint) {
         present_framebuffer(state);
     }
     return 1;
@@ -1652,6 +2777,36 @@ static void draw_line(
     }
 }
 
+static void draw_3d_control_frame(
+    compat_9588_state_t *state,
+    s32 x0,
+    s32 y0,
+    s32 x1,
+    s32 y1,
+    u32 fill_color,
+    int raised
+)
+{
+    u32 upper_left = raised ? 15u : 7u;
+    u32 lower_right = raised ? 7u : 15u;
+
+    if (x1 < x0 || y1 < y0) {
+        return;
+    }
+    fill_guest_rect(
+        state,
+        (u32)x0,
+        (u32)y0,
+        (u32)(x1 - x0 + 1),
+        (u32)(y1 - y0 + 1),
+        fill_color
+    );
+    draw_line(state, x0, y0, x1, y0, upper_left);
+    draw_line(state, x0, y0, x0, y1, upper_left);
+    draw_line(state, x0, y1, x1, y1, lower_right);
+    draw_line(state, x1, y0, x1, y1, lower_right);
+}
+
 static u8 glyph_row(char ch, u32 row)
 {
     static const u8 digits[10][7] = {
@@ -1682,8 +2837,16 @@ static u8 glyph_row(char ch, u32 row)
         static const u8 glyph[7] = {30,17,17,30,17,17,30};
         return glyph[row];
     }
+    if (ch == 'C') {
+        static const u8 glyph[7] = {14,17,16,16,16,17,14};
+        return glyph[row];
+    }
     if (ch == 'E') {
         static const u8 glyph[7] = {31,16,16,30,16,16,31};
+        return glyph[row];
+    }
+    if (ch == 'K') {
+        static const u8 glyph[7] = {17,18,20,24,20,18,17};
         return glyph[row];
     }
     if (ch == 'O') {
@@ -1805,6 +2968,39 @@ static void put_guest_text_pixel(
     }
 }
 
+static void fill_guest_text_cell(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    u32 width,
+    u32 height,
+    s32 clip_left,
+    s32 clip_top,
+    s32 clip_right,
+    s32 clip_bottom
+)
+{
+    u32 row;
+    u32 column;
+    if (state->background_mode != 0u) {
+        return;
+    }
+    for (row = 0u; row < height; ++row) {
+        for (column = 0u; column < width; ++column) {
+            put_guest_text_pixel(
+                state,
+                x + (s32)column,
+                y + (s32)row,
+                state->background_color,
+                clip_left,
+                clip_top,
+                clip_right,
+                clip_bottom
+            );
+        }
+    }
+}
+
 static void draw_guest_text(
     compat_9588_state_t *state,
     s32 x,
@@ -1846,11 +3042,23 @@ static void draw_guest_text(
         if (ch >= 0x80u && index + 1u < limit) {
             u8 low;
             u8 glyph[HZK_GLYPH_SIZE];
+            u32 cell_width = small_font ? 12u : 16u;
             if (!c33_vm_read(
                     state->vm, guest_text + index + 1u, &low, 1u
                 )) {
                 break;
             }
+            fill_guest_text_cell(
+                state,
+                cursor_x,
+                cursor_y,
+                cell_width,
+                12u,
+                clip_left,
+                clip_top,
+                clip_right,
+                clip_bottom
+            );
             if (read_hzk_glyph(state, ch, low, glyph)) {
                 u32 row;
                 for (row = 0u; row < 12u; ++row) {
@@ -1883,6 +3091,17 @@ static void draw_guest_text(
             u32 row;
             u32 row_count = small_font ? 12u : 7u;
             u32 advance = small_font ? 6u : (ch == ' ' ? 6u : 12u);
+            fill_guest_text_cell(
+                state,
+                cursor_x,
+                cursor_y,
+                advance,
+                small_font ? 12u : 14u,
+                clip_left,
+                clip_top,
+                clip_right,
+                clip_bottom
+            );
             for (row = 0; row < row_count; ++row) {
                 u8 bits = small_font
                     ? legacy_small_glyph_row((char)ch, row)
@@ -1950,7 +3169,7 @@ static void draw_guest_text(
             ++index;
         }
     }
-    if (!state->instant_paint) {
+    if (state->instant_paint) {
         present_framebuffer(state);
     }
 }
@@ -2005,8 +3224,6 @@ static int queue_pointer_message(
     return 1;
 }
 
-static u32 translate_native_key_value(u32 value);
-
 static int pop_message(compat_9588_state_t *state, guest_message_t *event)
 {
     if (!state || !state->event_count) {
@@ -2018,24 +3235,26 @@ static int pop_message(compat_9588_state_t *state, guest_message_t *event)
     return 1;
 }
 
-static u32 touch_raw_to_panel_x(u32 raw_x)
+static int message_is_pending(
+    const compat_9588_state_t *state,
+    u32 hwnd,
+    u32 message
+)
 {
-    /*
-     * Invert the four-point C200/9588 calibration used by the frontend.
-     * X raw values decrease from about 0xe74 on the left to 0x172 on the
-     * right.  Extending that line to the physical 0..239 panel avoids a
-     * dead strip outside the original 10..230 calibration targets.
-     */
-    if (raw_x >= 3841u) return 0u;
-    if (raw_x <= 238u) return PHYSICAL_SCREEN_W - 1u;
-    return (3841u - raw_x) * (PHYSICAL_SCREEN_W - 1u) / 3603u;
-}
-
-static u32 touch_raw_to_panel_y(u32 raw_y)
-{
-    if (raw_y >= 3660u) return 0u;
-    if (raw_y <= 141u) return PHYSICAL_SCREEN_H - 1u;
-    return (3660u - raw_y) * (PHYSICAL_SCREEN_H - 1u) / 3519u;
+    u32 index;
+    u32 position;
+    if (!state) {
+        return 0;
+    }
+    position = state->event_read;
+    for (index = 0u; index < state->event_count; ++index) {
+        const guest_message_t *event = &state->events[position];
+        if (event->hwnd == hwnd && event->message == message) {
+            return 1;
+        }
+        position = (position + 1u) % EVENT_QUEUE_SIZE;
+    }
+    return 0;
 }
 
 static int panel_to_guest(
@@ -2071,6 +3290,9 @@ static u32 virtual_action_at(
     }
     if (x >= 202u && x < 238u && y >= 82u && y < 134u) {
         return VIRTUAL_ACTION_SETTINGS;
+    }
+    if (x >= 2u && x < 38u && y >= 148u && y < 196u) {
+        return VIRTUAL_ACTION_FULLSCREEN;
     }
     if ((s32)x >= dpad_x + 28 && (s32)x < dpad_x + 56 &&
         y >= 242u && y < 266u) {
@@ -2116,6 +3338,105 @@ static void toggle_control_layout(compat_9588_state_t *state)
     state->controls_left = !state->controls_left;
 }
 
+static int enter_fullscreen(compat_9588_state_t *state)
+{
+    if (!state) {
+        return 0;
+    }
+    if (!state->fullscreen_buffer) {
+        state->fullscreen_buffer = (u16 *)bda_alloc(
+            SCREEN_W * SCREEN_H * sizeof(u16)
+        );
+        if (allocation_failed(state->fullscreen_buffer)) {
+            compat_log_record(
+                "FULLSCREEN_ALLOC_FAILED",
+                state->selected_path,
+                SCREEN_W * SCREEN_H * sizeof(u16),
+                (u32)state->fullscreen_buffer,
+                0u,
+                0u
+            );
+            state->fullscreen_buffer = 0;
+            return 0;
+        }
+    }
+    if (state->fullscreen_float_x < 0 ||
+        state->fullscreen_float_x >
+            FULLSCREEN_W - FULLSCREEN_FLOAT_W ||
+        state->fullscreen_float_y < 0 ||
+        state->fullscreen_float_y >
+            FULLSCREEN_H - FULLSCREEN_FLOAT_H) {
+        state->fullscreen_float_x =
+            FULLSCREEN_FLOAT_DEFAULT_X;
+        state->fullscreen_float_y =
+            FULLSCREEN_FLOAT_DEFAULT_Y;
+    }
+    state->fullscreen_mode = 1;
+    state->fullscreen_dragged = 0;
+    state->native_redraw = 1;
+    compat_log_record(
+        "FULLSCREEN_ENTER",
+        state->selected_path,
+        (u32)state->fullscreen_float_x,
+        (u32)state->fullscreen_float_y,
+        FULLSCREEN_W,
+        FULLSCREEN_H
+    );
+    return 1;
+}
+
+static void leave_fullscreen(compat_9588_state_t *state)
+{
+    if (!state || !state->fullscreen_mode) {
+        return;
+    }
+    state->fullscreen_mode = 0;
+    state->fullscreen_dragged = 0;
+    state->native_redraw = 1;
+    compat_log_record(
+        "FULLSCREEN_EXIT",
+        state->selected_path,
+        (u32)state->fullscreen_float_x,
+        (u32)state->fullscreen_float_y,
+        0u,
+        0u
+    );
+}
+
+static void fullscreen_logical_touch(
+    u32 panel_x,
+    u32 panel_y,
+    s32 *logical_x,
+    s32 *logical_y
+)
+{
+    *logical_x = (s32)panel_x;
+    *logical_y = (s32)panel_y;
+}
+
+static int fullscreen_float_hit(
+    const compat_9588_state_t *state,
+    s32 x,
+    s32 y
+)
+{
+    return x >= state->fullscreen_float_x &&
+           x < state->fullscreen_float_x + FULLSCREEN_FLOAT_W &&
+           y >= state->fullscreen_float_y &&
+           y < state->fullscreen_float_y + FULLSCREEN_FLOAT_H;
+}
+
+static s32 clamp_s32(s32 value, s32 minimum, s32 maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
+}
+
 static void queue_guest_pointer_down(
     compat_9588_state_t *state,
     u32 guest_x,
@@ -2135,7 +3456,11 @@ static void queue_guest_pointer_down(
         }
     }
     queue_pointer_message(
-        state, COMPAT_MSG_LBUTTONDOWN, guest_x, guest_y, 4u
+        state,
+        COMPAT_MSG_LBUTTONDOWN,
+        guest_x,
+        guest_y,
+        COMPAT_KEYSTATE_LEFT_BUTTON
     );
 }
 
@@ -2170,30 +3495,161 @@ static void queue_guest_pointer_up(
     }
 }
 
-static void service_touch_input(compat_9588_state_t *state)
+static void service_fullscreen_touch_sample(
+    compat_9588_state_t *state,
+    int down,
+    u32 panel_x,
+    u32 panel_y
+)
 {
-    volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
-    u32 down;
-    u32 panel_x;
-    u32 panel_y;
+    s32 logical_x;
+    s32 logical_y;
+    s32 content_x;
+    s32 content_y;
+    u32 guest_x;
+    u32 guest_y;
+    int guest_hit;
+    fullscreen_logical_touch(
+        panel_x, panel_y, &logical_x, &logical_y
+    );
+    logical_x = clamp_s32(logical_x, 0, FULLSCREEN_W - 1);
+    logical_y = clamp_s32(logical_y, 0, FULLSCREEN_H - 1);
+    guest_hit =
+        logical_x >= FULLSCREEN_VIEW_X &&
+        logical_x < FULLSCREEN_VIEW_X + FULLSCREEN_VIEW_W &&
+        logical_y >= FULLSCREEN_VIEW_Y &&
+        logical_y < FULLSCREEN_VIEW_Y + FULLSCREEN_VIEW_H;
+    content_x = clamp_s32(
+        logical_x - FULLSCREEN_VIEW_X,
+        0,
+        FULLSCREEN_VIEW_W - 1
+    );
+    content_y = clamp_s32(
+        logical_y - FULLSCREEN_VIEW_Y,
+        0,
+        FULLSCREEN_VIEW_H - 1
+    );
+    guest_x =
+        (u32)content_x * GUEST_SCREEN_W /
+        FULLSCREEN_VIEW_W;
+    guest_y =
+        (u32)content_y * GUEST_SCREEN_H /
+        FULLSCREEN_VIEW_H;
+
+    if (down && !state->touch_down) {
+        if (fullscreen_float_hit(state, logical_x, logical_y)) {
+            state->touch_region = 3u;
+            state->fullscreen_touch_start_x = logical_x;
+            state->fullscreen_touch_start_y = logical_y;
+            state->fullscreen_float_start_x =
+                state->fullscreen_float_x;
+            state->fullscreen_float_start_y =
+                state->fullscreen_float_y;
+            state->fullscreen_dragged = 0;
+        } else if (guest_hit) {
+            queue_guest_pointer_down(state, guest_x, guest_y);
+            state->touch_region = 1u;
+            state->touch_captured = 1;
+            g_diagnostic[14] += 1u;
+        }
+    } else if (down && state->touch_region == 3u) {
+        s32 delta_x =
+            logical_x - state->fullscreen_touch_start_x;
+        s32 delta_y =
+            logical_y - state->fullscreen_touch_start_y;
+        if (delta_x > FULLSCREEN_DRAG_THRESHOLD ||
+            delta_x < -FULLSCREEN_DRAG_THRESHOLD ||
+            delta_y > FULLSCREEN_DRAG_THRESHOLD ||
+            delta_y < -FULLSCREEN_DRAG_THRESHOLD) {
+            state->fullscreen_dragged = 1;
+        }
+        state->fullscreen_float_x = clamp_s32(
+            state->fullscreen_float_start_x + delta_x,
+            0,
+            FULLSCREEN_W - FULLSCREEN_FLOAT_W
+        );
+        state->fullscreen_float_y = clamp_s32(
+            state->fullscreen_float_start_y + delta_y,
+            0,
+            FULLSCREEN_H - FULLSCREEN_FLOAT_H
+        );
+        state->native_redraw = 1;
+    } else if (down && state->touch_region == 1u &&
+               (panel_x != state->touch_x ||
+                panel_y != state->touch_y)) {
+        queue_pointer_message(
+            state,
+            COMPAT_MSG_MOUSEMOVE,
+            guest_x,
+            guest_y,
+            COMPAT_KEYSTATE_LEFT_BUTTON
+        );
+    } else if (!down && state->touch_down) {
+        if (state->touch_region == 3u) {
+            s32 delta_x =
+                logical_x - state->fullscreen_touch_start_x;
+            s32 delta_y =
+                logical_y - state->fullscreen_touch_start_y;
+            /*
+             * The 9588 can coalesce MOVE and UP into one raw-event pump.
+             * Re-evaluate total displacement at release so a real drag is
+             * never mistaken for the tap-to-restore gesture.
+             */
+            if (delta_x > FULLSCREEN_DRAG_THRESHOLD ||
+                delta_x < -FULLSCREEN_DRAG_THRESHOLD ||
+                delta_y > FULLSCREEN_DRAG_THRESHOLD ||
+                delta_y < -FULLSCREEN_DRAG_THRESHOLD) {
+                state->fullscreen_dragged = 1;
+                state->fullscreen_float_x = clamp_s32(
+                    state->fullscreen_float_start_x + delta_x,
+                    0,
+                    FULLSCREEN_W - FULLSCREEN_FLOAT_W
+                );
+                state->fullscreen_float_y = clamp_s32(
+                    state->fullscreen_float_start_y + delta_y,
+                    0,
+                    FULLSCREEN_H - FULLSCREEN_FLOAT_H
+                );
+            }
+            if (state->fullscreen_dragged) {
+                compat_log_record(
+                    "FULLSCREEN_FLOAT_MOVED",
+                    state->selected_path,
+                    (u32)state->fullscreen_float_x,
+                    (u32)state->fullscreen_float_y,
+                    (u32)logical_x,
+                    (u32)logical_y
+                );
+            } else {
+                leave_fullscreen(state);
+            }
+        } else if (state->touch_region == 1u) {
+            queue_guest_pointer_up(state, guest_x, guest_y);
+        }
+        state->touch_region = 0u;
+        state->virtual_action = VIRTUAL_ACTION_NONE;
+        state->touch_captured = 0;
+    }
+    state->touch_down = down;
+    state->touch_x = panel_x;
+    state->touch_y = panel_y;
+}
+
+static void service_native_touch_sample(
+    compat_9588_state_t *state,
+    int down,
+    u32 panel_x,
+    u32 panel_y
+)
+{
     u32 guest_x;
     u32 guest_y;
     u32 action;
 
-    if (trace[0] != QEMU_TOUCH_MAGIC) {
-        state->touch_ready = 0;
-        return;
-    }
-    down = trace[4] != 0u;
-    panel_x = touch_raw_to_panel_x(trace[5] & 0xfffu);
-    panel_y = touch_raw_to_panel_y(trace[6] & 0xfffu);
-
-    if (!state->touch_ready) {
-        state->touch_ready = 1;
-        state->touch_down = down;
-        state->touch_captured = 0;
-        state->touch_x = panel_x;
-        state->touch_y = panel_y;
+    if (state->fullscreen_mode) {
+        service_fullscreen_touch_sample(
+            state, down, panel_x, panel_y
+        );
         return;
     }
 
@@ -2217,7 +3673,11 @@ static void service_touch_input(compat_9588_state_t *state)
                    state, panel_x, panel_y, &guest_x, &guest_y
                )) {
         queue_pointer_message(
-            state, COMPAT_MSG_MOUSEMOVE, guest_x, guest_y, 4u
+            state,
+            COMPAT_MSG_MOUSEMOVE,
+            guest_x,
+            guest_y,
+            COMPAT_KEYSTATE_LEFT_BUTTON
         );
     } else if (!down && state->touch_down) {
         if (state->touch_region == 1u) {
@@ -2254,6 +3714,8 @@ static void service_touch_input(compat_9588_state_t *state)
                     state->request_reselect = 1;
                 } else if (action == VIRTUAL_ACTION_SETTINGS) {
                     toggle_control_layout(state);
+                } else if (action == VIRTUAL_ACTION_FULLSCREEN) {
+                    (void)enter_fullscreen(state);
                 }
             }
         }
@@ -2266,73 +3728,346 @@ static void service_touch_input(compat_9588_state_t *state)
     state->touch_y = panel_y;
 }
 
+static void queue_native_key_down(
+    compat_9588_state_t *state,
+    u32 scancode
+)
+{
+    int queued;
+    if (!scancode) {
+        return;
+    }
+    if (state->parent_hwnd && state->listbox_item_count) {
+        if (scancode == COMPAT_SCANCODE_UP &&
+            state->listbox_caret > 0u) {
+            state->listbox_caret--;
+        } else if (scancode == COMPAT_SCANCODE_DOWN &&
+                   state->listbox_caret + 1u <
+                       state->listbox_item_count) {
+            state->listbox_caret++;
+        }
+    }
+    queued = queue_message(
+        state,
+        state->guest_hwnd,
+        COMPAT_MSG_KEYDOWN,
+        scancode,
+        0u
+    );
+    g_diagnostic[10] = (u32)(queued != 0);
+    g_diagnostic[11] = state->event_count;
+    g_diagnostic[12] = scancode;
+    g_diagnostic[13] = scancode;
+    g_diagnostic[14] = scancode;
+    g_diagnostic[15] += 1u;
+}
+
+static int native_input_window_proc(
+    bda_handle_t handle,
+    u32 message,
+    u32 wparam,
+    u32 lparam
+)
+{
+    /*
+     * Lifecycle callback only. Active input is never dispatched through
+     * Frame messages; it is polled from the GBA-style raw touch stream and
+     * six-byte input packet.
+     */
+    compat_9588_state_t *state = g_native_input_state;
+    if (state && message == BDA_MSG_DRAW_CONTEXT_ATTACH) {
+        state->native_frame = handle;
+        if (acquire_native_draw_context(state, handle)) {
+            g_native_shared_frame = state->native_frame;
+            g_native_shared_draw = state->native_draw;
+            g_native_shared_draw_owner = state->native_draw_owner;
+            if (!state->native_draw_object) {
+                state->native_draw_object =
+                    bda_gui_draw_object_create(7u);
+            }
+            g_native_shared_draw_object = state->native_draw_object;
+            state->native_redraw = 1;
+        }
+    } else if (state &&
+               message == BDA_MSG_DRAW_CONTEXT_DETACH) {
+        if (!state->native_draw_owner ||
+            state->native_draw_owner == handle) {
+            release_native_draw_context(state);
+            g_native_shared_draw = 0;
+            g_native_shared_draw_owner = 0;
+        }
+        state->native_frame_detached = 1;
+    }
+    return bda_gui_default_proc(handle, message, wparam, lparam);
+}
+
+static int native_input_open(compat_9588_state_t *state)
+{
+    bda_frame_desc_t descriptor;
+    if (!state) {
+        return 0;
+    }
+    bda_memset(&descriptor, 0, sizeof(descriptor));
+    state->native_frame_detached = 0;
+    state->native_redraw = 1;
+    state->hardware_events_ready = 0;
+    state->touch_down = 0;
+    state->touch_escape_suppressed = 0;
+    state->native_escape_pending = 0;
+    bda_memset(state->combo_keys, 0, sizeof(state->combo_keys));
+    bda_memset(
+        &state->native_picture, 0, sizeof(state->native_picture)
+    );
+    state->native_picture.width = SCREEN_W;
+    state->native_picture.height = SCREEN_H;
+    state->native_picture.stride_bytes =
+        SCREEN_W * sizeof(u16);
+    state->native_picture.source_pixels = state->framebuffer;
+    state->native_picture.selected_index = -1;
+
+    if (g_native_shared_frame &&
+        (s32)g_native_shared_frame != -1) {
+        state->native_frame = g_native_shared_frame;
+        state->native_draw = g_native_shared_draw;
+        state->native_draw_owner = g_native_shared_draw_owner;
+        state->native_draw_object = g_native_shared_draw_object;
+        g_native_input_state = state;
+        (void)bda_gui_frame_activate(state->native_frame, 0x100u);
+        if (!state->native_draw &&
+            !acquire_native_draw_context(
+                state, state->native_frame
+            )) {
+            g_native_input_state = 0;
+            return 0;
+        }
+        if (!state->native_draw_object) {
+            state->native_draw_object =
+                bda_gui_draw_object_create(7u);
+        }
+        if (!state->native_draw_object ||
+            (s32)(u32)state->native_draw_object == -1) {
+            g_native_input_state = 0;
+            return 0;
+        }
+        g_native_shared_draw = state->native_draw;
+        g_native_shared_draw_owner = state->native_draw_owner;
+        g_native_shared_draw_object = state->native_draw_object;
+        initialize_native_direct_framebuffer();
+        return 1;
+    }
+
+    descriptor.style = 0u;
+    descriptor.title = k_native_help_title;
+    descriptor.wndproc = native_input_window_proc;
+    descriptor.height = SCREEN_W;
+    descriptor.width = SCREEN_H;
+    g_native_input_state = state;
+    state->native_frame = bda_gui_register_frame_desc(&descriptor);
+    if (!state->native_frame ||
+        (s32)state->native_frame == -1) {
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    (void)bda_gui_frame_activate(state->native_frame, 0x100u);
+    if (!acquire_native_draw_context(
+            state, state->native_frame
+        )) {
+        bda_gui_close_frame(state->native_frame);
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    state->native_draw_object =
+        bda_gui_draw_object_create(7u);
+    if (!state->native_draw_object ||
+        (s32)(u32)state->native_draw_object == -1) {
+        state->native_draw_object = 0;
+        release_native_draw_context(state);
+        bda_gui_close_frame(state->native_frame);
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    g_native_shared_frame = state->native_frame;
+    g_native_shared_draw = state->native_draw;
+    g_native_shared_draw_owner = state->native_draw_owner;
+    g_native_shared_draw_object = state->native_draw_object;
+    initialize_native_direct_framebuffer();
+    return 1;
+}
+
+static void native_input_close(compat_9588_state_t *state)
+{
+    if (!state) {
+        return;
+    }
+    if (state->native_frame &&
+        (s32)state->native_frame != -1) {
+        g_native_shared_frame = state->native_frame;
+        g_native_shared_draw = state->native_draw;
+        g_native_shared_draw_owner = state->native_draw_owner;
+        g_native_shared_draw_object = state->native_draw_object;
+    }
+    if (g_native_input_state == state) {
+        g_native_input_state = 0;
+    }
+    state->native_frame = 0;
+    state->native_draw = 0;
+    state->native_draw_owner = 0;
+    state->native_draw_object = 0;
+}
+
+static void native_input_shutdown(void)
+{
+    bda_gui_message_t message;
+    u32 wait;
+    if (!g_native_shared_frame ||
+        (s32)g_native_shared_frame == -1) {
+        g_native_direct_framebuffer = 0;
+        g_native_direct_framebuffer_rotate_180 = 0;
+        g_native_direct_framebuffer_initialized = 0;
+        return;
+    }
+    g_native_input_state = 0;
+    (void)bda_gui_frame_stop(g_native_shared_frame);
+    (void)bda_gui_frame_release(g_native_shared_frame);
+    bda_memset(&message, 0, sizeof(message));
+    for (wait = 0u; wait < 128u; ++wait) {
+        if (!bda_gui_event_pump_frame_once(
+                &message, g_native_shared_frame
+            )) {
+            break;
+        }
+        bda_sys_delay(1u);
+    }
+    if (g_native_shared_draw &&
+        (s32)g_native_shared_draw != -1) {
+        bda_gui_end_draw(g_native_shared_draw);
+    }
+    bda_gui_close_frame(g_native_shared_frame);
+    g_native_shared_frame = 0;
+    g_native_shared_draw = 0;
+    g_native_shared_draw_owner = 0;
+    g_native_shared_draw_object = 0;
+    g_native_direct_framebuffer = 0;
+    g_native_direct_framebuffer_rotate_180 = 0;
+    g_native_direct_framebuffer_initialized = 0;
+}
+
+static void filter_native_touch_escape(
+    compat_9588_state_t *state,
+    bda_gui_input_packet_t *packet
+)
+{
+    const u32 escape_index = BDA_INPUT_PACKET_ESCAPE_INDEX;
+    if (!state->touch_escape_suppressed) {
+        return;
+    }
+    if (!state->touch_down &&
+        packet->bytes[escape_index] != 1u) {
+        state->touch_escape_suppressed = 0;
+    }
+    state->native_escape_pending = 0;
+    packet->bytes[escape_index] = 0u;
+    state->combo_keys[escape_index] = 0u;
+}
+
 static void service_hardware_input(compat_9588_state_t *state)
 {
-    volatile u32 *queue = (volatile u32 *)QEMU_EVENT_QUEUE;
-    u32 write_index;
-    u32 remaining;
+    static const u32 portrait_scancodes[
+        BDA_GUI_INPUT_PACKET_SIZE
+    ] = {
+        COMPAT_SCANCODE_RIGHT,
+        COMPAT_SCANCODE_LEFT,
+        COMPAT_SCANCODE_DOWN,
+        COMPAT_SCANCODE_UP,
+        COMPAT_SCANCODE_ESCAPE,
+        COMPAT_SCANCODE_ENTER
+    };
+    bda_gui_input_packet_t packet;
+    bda_gui_raw_event_t event;
+    u32 index;
+    u32 drained = 0u;
+    int move_pending = 0;
 
-    if (queue[0] != QEMU_EVENT_MAGIC) {
-        state->hardware_events_ready = 0;
-        return;
+    while (drained < RAW_EVENT_MAX_PER_POLL &&
+           bda_gui_raw_event_fetch(&event) >= 0) {
+        ++drained;
+        ++state->raw_event_count;
+        if ((u32)event.code == BDA_INPUT_EVENT_TOUCH_DOWN) {
+            u16 x = 0u;
+            u16 y = 0u;
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            bda_gui_touch_position(&x, &y);
+            service_native_touch_sample(state, 1, x, y);
+            move_pending = 0;
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_MOVE) {
+            ++state->raw_touch_count;
+            if (state->touch_down) {
+                move_pending = 1;
+            }
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_UP) {
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            if (state->touch_down) {
+                u16 x = 0u;
+                u16 y = 0u;
+                bda_gui_touch_position(&x, &y);
+                service_native_touch_sample(state, 0, x, y);
+            }
+            move_pending = 0;
+        }
     }
-    write_index = queue[2];
-    if (write_index >= QEMU_EVENT_SLOTS) {
-        state->hardware_events_ready = 0;
-        return;
+    if (move_pending && state->touch_down) {
+        u16 x = 0u;
+        u16 y = 0u;
+        bda_gui_touch_position(&x, &y);
+        service_native_touch_sample(state, 1, x, y);
     }
+
+    (void)bda_gui_input_packet(&packet);
+    filter_native_touch_escape(state, &packet);
     if (!state->hardware_events_ready) {
         /*
          * Discard the launcher navigation and the key that opened this BDA.
          * Only events arriving after the guest is ready belong to the game.
          */
-        state->hardware_event_cursor = write_index;
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            state->combo_keys[index] =
+                packet.bytes[index] == 1u ? 1u : 0u;
+        }
         state->hardware_events_ready = 1;
-        return;
-    }
-
-    remaining = QEMU_EVENT_SLOTS;
-    while (state->hardware_event_cursor != write_index && remaining--) {
-        u32 slot = state->hardware_event_cursor;
-        volatile u32 *event =
-            queue + 4u + slot * QEMU_EVENT_WORDS;
-        u32 kind = event[1];
-        u32 key_code = event[2];
-        u32 down = event[3];
-
-        state->hardware_event_cursor =
-            (state->hardware_event_cursor + 1u) % QEMU_EVENT_SLOTS;
-        if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY && down) {
-            u32 scancode = translate_native_key_value(key_code);
-            if (scancode) {
-                int queued;
-                if (state->parent_hwnd && state->listbox_item_count) {
-                    if (scancode == COMPAT_SCANCODE_UP &&
-                        state->listbox_caret > 0u) {
-                        state->listbox_caret--;
-                    } else if (scancode == COMPAT_SCANCODE_DOWN &&
-                               state->listbox_caret + 1u <
-                                   state->listbox_item_count) {
-                        state->listbox_caret++;
-                    }
+    } else {
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            u8 down = packet.bytes[index] == 1u ? 1u : 0u;
+            if (index == BDA_INPUT_PACKET_ESCAPE_INDEX) {
+                if (down && !state->combo_keys[index]) {
+                    state->native_escape_pending = 1;
+                } else if (!down &&
+                           state->combo_keys[index] &&
+                           state->native_escape_pending) {
+                    queue_native_key_down(
+                        state, COMPAT_SCANCODE_ESCAPE
+                    );
+                    state->native_escape_pending = 0;
                 }
-                queued = queue_message(
+            } else if (down && !state->combo_keys[index]) {
+                queue_native_key_down(
                     state,
-                    state->guest_hwnd,
-                    COMPAT_MSG_KEYDOWN,
-                    scancode,
-                    0u
+                    portrait_scancodes[index]
                 );
-                g_diagnostic[10] = (u32)(queued != 0);
-                g_diagnostic[11] = state->event_count;
-                g_diagnostic[12] = scancode;
-                g_diagnostic[13] = scancode;
-                g_diagnostic[14] = scancode;
-                g_diagnostic[15] += 1u;
             }
+            state->combo_keys[index] = down;
         }
     }
-    service_touch_input(state);
 }
 
 static int write_guest_message(
@@ -2365,30 +4100,6 @@ static int read_guest_message(
            guest_read_u32(vm, address + 24u, &event->point_y);
 }
 
-static u32 translate_native_key_value(u32 value)
-{
-    u32 code = value & 0xffffu;
-    switch (code) {
-    case 4: return COMPAT_SCANCODE_UP;
-    case 5: return COMPAT_SCANCODE_DOWN;
-    case 6: return COMPAT_SCANCODE_LEFT;
-    case 7: return COMPAT_SCANCODE_RIGHT;
-    case 9: return COMPAT_SCANCODE_ESCAPE;
-    case 10: return COMPAT_SCANCODE_ENTER;
-    case 13: return COMPAT_SCANCODE_ENTER;
-    case 27: return COMPAT_SCANCODE_ESCAPE;
-    case COMPAT_SCANCODE_ENTER:
-    case COMPAT_SCANCODE_UP:
-    case COMPAT_SCANCODE_LEFT:
-    case COMPAT_SCANCODE_RIGHT:
-    case COMPAT_SCANCODE_DOWN:
-        return code;
-    default:
-        break;
-    }
-    return 0;
-}
-
 static c33_vm_status_t call_guest_window_proc(
     compat_9588_state_t *state,
     u32 hwnd,
@@ -2397,11 +4108,15 @@ static c33_vm_status_t call_guest_window_proc(
     u32 lparam
 )
 {
+    c33_vm_status_t status;
     if (!state->guest_window_proc) {
         state->vm->regs[4] = 0u;
         return C33_VM_OK;
     }
-    return c33_vm_call(
+    if (message == COMPAT_MSG_PAINT) {
+        state->guest_paint_depth++;
+    }
+    status = c33_vm_call(
         state->vm,
         state->guest_window_proc,
         hwnd,
@@ -2410,6 +4125,10 @@ static c33_vm_status_t call_guest_window_proc(
         lparam,
         CALLBACK_BUDGET
     );
+    if (message == COMPAT_MSG_PAINT && state->guest_paint_depth) {
+        state->guest_paint_depth--;
+    }
+    return status;
 }
 
 static c33_vm_status_t dispatch_listbox_message(
@@ -2522,7 +4241,8 @@ static c33_vm_status_t dispatch_9588_fs(
                 )) {
                 return C33_VM_FAULT;
             }
-            if (!compat_fs_map_guest_path(
+            if (!map_guest_path_for_state(
+                    state,
                     guest_path, native_path, sizeof(native_path)
                 )) {
                 vm->regs[4] = 0xffffffffu;
@@ -2645,6 +4365,133 @@ static c33_vm_status_t dispatch_9588_fs(
     case COMPAT_FS_ERROR:
         vm->regs[4] = (u32)bda_fs_error((int)vm->regs[6]);
         return C33_VM_OK;
+    case COMPAT_FS_CLEAR_ERROR:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_FS_REMOVE:
+        {
+            char guest_path[GUEST_PATH_CAPACITY];
+            char native_path[NATIVE_PATH_CAPACITY];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!map_guest_path_for_state(
+                    state, guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+            } else {
+                vm->regs[4] = (u32)bda_fs_remove_compat(native_path);
+            }
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_RENAME:
+        {
+            char old_guest[GUEST_PATH_CAPACITY];
+            char new_guest[GUEST_PATH_CAPACITY];
+            char old_native[NATIVE_PATH_CAPACITY];
+            char new_native[NATIVE_PATH_CAPACITY];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], old_guest, sizeof(old_guest)
+                ) ||
+                !guest_read_c_string(
+                    vm, vm->regs[7], new_guest, sizeof(new_guest)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!map_guest_path_for_state(
+                    state, old_guest, old_native, sizeof(old_native)
+                ) ||
+                !map_guest_path_for_state(
+                    state, new_guest, new_native, sizeof(new_native)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+            } else {
+                ensure_native_parent_directories(new_native);
+                vm->regs[4] = (u32)bda_fs_rename_compat(
+                    old_native, new_native
+                );
+            }
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_CHDIR:
+        {
+            char guest_path[GUEST_PATH_CAPACITY];
+            char native_path[NATIVE_PATH_CAPACITY];
+            bda_fs_find_data_t find_data;
+            int result;
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!map_guest_path_for_state(
+                    state, guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+            if (!guest_path[0] ||
+                native_path[
+                    sizeof(COMPAT_FS_NATIVE_ROOT) - 1u
+                ] == 0) {
+                result = 0;
+            } else {
+                result = native_path_info(native_path, &find_data);
+                if (result != -1 &&
+                    !(find_data.attr_or_flags & 0x10u)) {
+                    result = -1;
+                }
+            }
+            if (result != -1 &&
+                !set_guest_cwd_from_native(state, native_path)) {
+                result = -1;
+            }
+            vm->regs[4] = (u32)result;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_MKDIR:
+        {
+            char guest_path[192];
+            char native_path[NATIVE_PATH_CAPACITY];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!map_guest_path_for_state(
+                    state,
+                    guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+                return C33_VM_OK;
+            }
+            ensure_native_directory_tree(native_path);
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_RMDIR:
+        {
+            char guest_path[GUEST_PATH_CAPACITY];
+            char native_path[NATIVE_PATH_CAPACITY];
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            if (!map_guest_path_for_state(
+                    state, guest_path, native_path, sizeof(native_path)
+                )) {
+                vm->regs[4] = 0xffffffffu;
+            } else {
+                vm->regs[4] = (u32)bda_fs_rmdir_compat(native_path);
+            }
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_GET_FILE_NUMBER:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
     case COMPAT_FS_FIND_FIRST:
         {
             char guest_path[192];
@@ -2659,7 +4506,8 @@ static c33_vm_status_t dispatch_9588_fs(
                 (void)bda_fs_findclose(&state->native_find_data);
                 state->native_find_open = 0;
             }
-            if (!compat_fs_map_guest_path(
+            if (!map_guest_path_for_state(
+                    state,
                     guest_path, native_path, sizeof(native_path)
                 )) {
                 vm->regs[4] = 0xffffffffu;
@@ -2733,50 +4581,97 @@ static c33_vm_status_t dispatch_9588_fs(
         }
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    case COMPAT_FS_GETCWD:
+    case COMPAT_FS_GETCWD2:
+        {
+            u32 length = 0u;
+            u32 buffer = vm->regs[6];
+            u32 capacity = vm->regs[7];
+            while (state->guest_cwd[length]) ++length;
+            if (!capacity || length + 1u > capacity) {
+                vm->regs[4] = slot == COMPAT_FS_GETCWD
+                    ? 0u : 0xffffffffu;
+                return C33_VM_OK;
+            }
+            if (!buffer && slot == COMPAT_FS_GETCWD) {
+                buffer = compat_api_heap_alloc(api, length + 1u, 0);
+            }
+            if (!buffer ||
+                !c33_vm_write(
+                    vm, buffer, state->guest_cwd, length + 1u
+                )) {
+                vm->regs[4] = slot == COMPAT_FS_GETCWD
+                    ? 0u : 0xffffffffu;
+                return C33_VM_OK;
+            }
+            vm->regs[4] = slot == COMPAT_FS_GETCWD ? buffer : 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_FS_STAT:
         {
-            char guest_path[192];
+            char guest_path[GUEST_PATH_CAPACITY];
             char native_path[NATIVE_PATH_CAPACITY];
-            bda_fs_find_data_t *find_data;
+            bda_fs_find_data_t find_data;
             int result;
             if (!guest_read_c_string(
                     vm, vm->regs[6], guest_path, sizeof(guest_path)
                 )) {
                 return C33_VM_FAULT;
             }
-            if (!compat_fs_map_guest_path(
+            if (!map_guest_path_for_state(
+                    state,
                     guest_path, native_path, sizeof(native_path)
                 )) {
                 vm->regs[4] = 0xffffffffu;
                 return C33_VM_OK;
             }
-            /*
-             * Original system directories already exist on a 9288S. Create
-             * their sandbox counterparts lazily when a guest probes a path
-             * explicitly written as a directory.
-             */
-            if (path_has_trailing_separator(guest_path)) {
-                ensure_native_directory_tree(native_path);
-                vm->regs[4] = 0u;
-                return C33_VM_OK;
-            }
-            find_data = (bda_fs_find_data_t *)bda_alloc(
-                sizeof(*find_data)
-            );
-            if (allocation_failed(find_data)) {
-                vm->regs[4] = 0xffffffffu;
-                return C33_VM_OK;
-            }
-            bda_fs_find_data_init(find_data);
-            result = bda_fs_findfirst(native_path, 0x27u, find_data);
+            result = native_path_info(native_path, &find_data);
             if (result != -1) {
-                (void)bda_fs_findclose(find_data);
-                result = 0;
+                u16 mode = (find_data.attr_or_flags & 0x10u)
+                    ? 0x4000u : 0x8000u;
+                if (!guest_write_u16(vm, vm->regs[7] + 0u, 0u) ||
+                    !guest_write_u16(vm, vm->regs[7] + 2u, mode) ||
+                    !guest_write_u16(vm, vm->regs[7] + 4u, 0u) ||
+                    !guest_write_u16(vm, vm->regs[7] + 6u, 0u) ||
+                    !guest_write_u32(
+                        vm, vm->regs[7] + 8u, find_data.size_or_aux
+                    ) ||
+                    !guest_write_u32(vm, vm->regs[7] + 12u, 0u) ||
+                    !guest_write_u32(vm, vm->regs[7] + 16u, 0u) ||
+                    !guest_write_u32(vm, vm->regs[7] + 20u, 0u)) {
+                    return C33_VM_FAULT;
+                }
             }
-            bda_free(find_data);
             vm->regs[4] = (u32)result;
             return C33_VM_OK;
         }
+    case COMPAT_FS_ACCESS:
+        {
+            char guest_path[GUEST_PATH_CAPACITY];
+            char native_path[NATIVE_PATH_CAPACITY];
+            bda_fs_find_data_t find_data;
+            if (!guest_read_c_string(
+                    vm, vm->regs[6], guest_path, sizeof(guest_path)
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] =
+                map_guest_path_for_state(
+                    state,
+                    guest_path,
+                    native_path,
+                    sizeof(native_path)
+                ) &&
+                native_path_info(native_path, &find_data) != -1
+                    ? 0u : 0xffffffffu;
+            return C33_VM_OK;
+        }
+    case COMPAT_FS_INIT:
+    case COMPAT_FS_REFRESH_CACHE:
+    case COMPAT_FS_UPDATE:
+    case COMPAT_FS_FLUSH_CACHE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
     default:
         return C33_VM_UNSUPPORTED;
     }
@@ -2798,6 +4693,7 @@ static c33_vm_status_t dispatch_9588(
     if (!state) {
         return C33_VM_UNSUPPORTED;
     }
+    state->api_call_count += 1u;
     if (group == COMPAT_API_FS) {
         return dispatch_9588_fs(api, slot, state);
     }
@@ -2806,6 +4702,28 @@ static c33_vm_status_t dispatch_9588(
     }
 
     switch (slot) {
+    case COMPAT_GUI_DRAW_3D_CONTROL_FRAME:
+        {
+            u32 y1;
+            u32 fill_color;
+            u32 raised;
+            if (!guest_read_u32(vm, vm->sp + 4u, &y1) ||
+                !guest_read_u32(vm, vm->sp + 8u, &fill_color) ||
+                !guest_read_u32(vm, vm->sp + 12u, &raised)) {
+                return C33_VM_FAULT;
+            }
+            draw_3d_control_frame(
+                state,
+                (s32)vm->regs[7],
+                (s32)vm->regs[8],
+                (s32)vm->regs[9],
+                (s32)y1,
+                fill_color,
+                raised != 0u
+            );
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_GET_MESSAGE:
         {
             guest_message_t event;
@@ -2909,8 +4827,24 @@ static c33_vm_status_t dispatch_9588(
                     vm->regs[6] + COMPAT_MAIN_WIN_CREATE_PROC_OFFSET;
                 return C33_VM_FAULT;
             }
+            compat_log_record(
+                "CREATE_MAIN_ENTER",
+                state->selected_path,
+                vm->regs[6],
+                callback,
+                state->guest_hwnd,
+                state->parent_hwnd
+            );
             if (state->guest_hwnd) {
                 if (state->parent_hwnd) {
+                    compat_log_record(
+                        "CREATE_MAIN_NESTING_LIMIT",
+                        state->selected_path,
+                        state->guest_hwnd,
+                        state->parent_hwnd,
+                        callback,
+                        0u
+                    );
                     return C33_VM_UNSUPPORTED;
                 }
                 state->parent_window_proc = state->guest_window_proc;
@@ -2919,6 +4853,8 @@ static c33_vm_status_t dispatch_9588(
                 state->parent_brush_color = state->brush_color;
                 state->parent_background_color =
                     state->background_color;
+                state->parent_background_mode =
+                    state->background_mode;
                 state->parent_current_x = state->current_x;
                 state->parent_current_y = state->current_y;
                 state->parent_instant_paint = state->instant_paint;
@@ -2930,9 +4866,15 @@ static c33_vm_status_t dispatch_9588(
             status = call_guest_window_proc(
                 state, state->guest_hwnd, COMPAT_MSG_CREATE, 0u, 0u
             );
+            compat_log_vm(
+                "CREATE_MAIN_AFTER_CREATE", vm, api, state, status
+            );
             if (status != C33_VM_OK) return status;
             status = call_guest_window_proc(
                 state, state->guest_hwnd, COMPAT_MSG_PAINT, 0u, 0u
+            );
+            compat_log_vm(
+                "CREATE_MAIN_AFTER_PAINT", vm, api, state, status
             );
             if (status != C33_VM_OK) return status;
             vm->regs[4] = state->guest_hwnd;
@@ -2964,6 +4906,8 @@ static c33_vm_status_t dispatch_9588(
                 state->brush_color = state->parent_brush_color;
                 state->background_color =
                     state->parent_background_color;
+                state->background_mode =
+                    state->parent_background_mode;
                 /*
                  * The board relies on its DC's default black text. The
                  * selector changes its own DC to white before creating the
@@ -3021,30 +4965,92 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_MAIN_WINDOW_CLEANUP:
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    case COMPAT_GUI_UPDATE_WINDOW:
+        present_framebuffer(state);
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
     case COMPAT_GUI_INVALIDATE_RECT:
-        vm->regs[4] = queue_message(
-            state,
-            vm->regs[6],
-            COMPAT_MSG_PAINT,
-            0u,
-            0u
-        );
+        /*
+         * 9288S MiniGUI invalidates a region; it does not append an unlimited
+         * stream of MSG_PAINT records. Coalesce one paint per window and
+         * suppress re-invalidation from inside that window's paint callback.
+         * Without this, Lianliankan never empties its queue and timers/input
+         * cannot be serviced.
+         */
+        if (state->guest_paint_depth ||
+            message_is_pending(
+                state, vm->regs[6], COMPAT_MSG_PAINT
+            )) {
+            vm->regs[4] = 1u;
+        } else {
+            vm->regs[4] = queue_message(
+                state,
+                vm->regs[6],
+                COMPAT_MSG_PAINT,
+                0u,
+                0u
+            );
+        }
+        return C33_VM_OK;
+    case COMPAT_GUI_BEGIN_PAINT:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_END_PAINT:
+        if (!state->instant_paint) {
+            present_framebuffer(state);
+        }
+        vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_CLIENT_TO_SCREEN:
         /* The compatibility window occupies the full 160x240 guest area. */
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_SET_TIMER:
-        state->timer_hwnd = vm->regs[6];
-        state->timer_id = vm->regs[7];
-        /*
-         * MiniGUI's legacy SetTimer "speed" is counted in 10 ms system
-         * ticks, not milliseconds.  海盗船 passes 20, which is 200 ms.
-         */
-        state->timer_interval =
-            compat_gui_timer_interval_ms(vm->regs[8]);
-        state->timer_elapsed = 0u;
-        vm->regs[4] = 1u;
+        {
+            guest_timer_t *timer = 0;
+            u32 index;
+            for (index = 0u; index < GUEST_TIMER_COUNT; ++index) {
+                if (state->timers[index].active &&
+                    state->timers[index].hwnd == vm->regs[6] &&
+                    state->timers[index].id == vm->regs[7]) {
+                    timer = &state->timers[index];
+                    break;
+                }
+            }
+            if (!timer) {
+                for (index = 0u; index < GUEST_TIMER_COUNT; ++index) {
+                    if (!state->timers[index].active) {
+                        timer = &state->timers[index];
+                        break;
+                    }
+                }
+            }
+            if (!timer) {
+                vm->regs[4] = 0u;
+                return C33_VM_OK;
+            }
+            timer->hwnd = vm->regs[6];
+            timer->id = vm->regs[7];
+            /*
+             * Official 9288S guiExt.h defines TIME_MS(ms)=ms*10/25:
+             * one legacy speed unit is 2.5 ms. Thunder passes 20 (50 ms)
+             * and Lianliankan passes 500 (1.25 s).
+             */
+            timer->interval =
+                compat_gui_timer_interval_ms(vm->regs[8]);
+            timer->elapsed = 0u;
+            timer->active = 1;
+            state->timer_last_id = timer->id;
+            compat_log_record(
+                "TIMER_SET",
+                state->selected_path,
+                timer->hwnd,
+                timer->id,
+                vm->regs[8],
+                timer->interval
+            );
+            vm->regs[4] = 1u;
+        }
         return C33_VM_OK;
     case COMPAT_GUI_SHOW_WINDOW:
         vm->regs[4] = 1u;
@@ -3066,11 +5072,28 @@ static c33_vm_status_t dispatch_9588(
         vm->regs[4] = 1u;
         return C33_VM_OK;
     case COMPAT_GUI_KILL_TIMER:
-        if (state->timer_hwnd == vm->regs[6] &&
-            state->timer_id == vm->regs[7]) {
-            state->timer_id = 0u;
+        {
+            u32 index;
+            int removed = 0;
+            for (index = 0u; index < GUEST_TIMER_COUNT; ++index) {
+                if (state->timers[index].active &&
+                    state->timers[index].hwnd == vm->regs[6] &&
+                    state->timers[index].id == vm->regs[7]) {
+                    state->timers[index].active = 0;
+                    removed = 1;
+                    break;
+                }
+            }
+            compat_log_record(
+                "TIMER_KILL",
+                state->selected_path,
+                vm->regs[6],
+                vm->regs[7],
+                (u32)removed,
+                index
+            );
+            vm->regs[4] = (u32)removed;
         }
-        vm->regs[4] = 1u;
         return C33_VM_OK;
     case COMPAT_GUI_MESSAGE_BOX:
         {
@@ -3139,6 +5162,8 @@ static c33_vm_status_t dispatch_9588(
         vm->regs[4] = state->brush_color;
         return C33_VM_OK;
     case COMPAT_GUI_GET_BK_MODE:
+        vm->regs[4] = state->background_mode;
+        return C33_VM_OK;
     case COMPAT_GUI_GET_PEN_TYPE:
     case COMPAT_GUI_GET_BRUSH_TYPE:
         vm->regs[4] = 0u;
@@ -3160,6 +5185,9 @@ static c33_vm_status_t dispatch_9588(
         state->brush_color = vm->regs[7];
         return C33_VM_OK;
     case COMPAT_GUI_SET_BK_MODE:
+        vm->regs[4] = state->background_mode;
+        state->background_mode = vm->regs[7] ? 1u : 0u;
+        return C33_VM_OK;
     case COMPAT_GUI_SET_PEN_TYPE:
     case COMPAT_GUI_SET_BRUSH_TYPE:
         vm->regs[4] = 0u;
@@ -3225,16 +5253,13 @@ static c33_vm_status_t dispatch_9588(
             s32 x0 = (s32)vm->regs[7];
             s32 y0 = (s32)vm->regs[8];
             s32 x1 = (s32)vm->regs[9];
-            s32 y;
-            s32 x;
             if (!guest_read_u32(vm, vm->sp + 4u, &y1)) {
                 return C33_VM_FAULT;
             }
-            for (y = y0; y <= (s32)y1; ++y) {
-                for (x = x0; x <= x1; ++x) {
-                    put_guest_pixel(state, x, y, state->brush_color);
-                }
-            }
+            /*
+             * 9288S Rectangle draws the outline.  Games use FillBox for a
+             * filled region; filling here erases the Five-in-a-row menu text.
+             */
             draw_line(state, x0, y0, x1, y0, state->pen_color);
             draw_line(state, x1, y0, x1, (s32)y1, state->pen_color);
             draw_line(state, x1, (s32)y1, x0, (s32)y1, state->pen_color);
@@ -3331,11 +5356,40 @@ static c33_vm_status_t dispatch_9588(
             return C33_VM_OK;
         }
     case COMPAT_GUI_CREATE_LOG_FONT:
-        /* The compatibility surface uses its own fixed bitmap font. */
-        vm->regs[4] = 3u;
-        return C33_VM_OK;
+        {
+            u32 requested_size = 12u;
+            /*
+             * The tenth argument is the requested pixel size.  The object is
+             * opaque to applications, so a stable non-null compatibility
+             * handle is sufficient; SelectFont applies its recorded metrics.
+             */
+            if (!guest_read_u32(vm, vm->sp + 24u, &requested_size)) {
+                return C33_VM_FAULT;
+            }
+            state->created_log_font = 3u;
+            state->created_log_font_size =
+                requested_size ? requested_size : 12u;
+            vm->regs[4] = state->created_log_font;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_DESTROY_LOG_FONT:
+        if (vm->regs[6] == state->created_log_font) {
+            if (state->selected_log_font == state->created_log_font) {
+                state->selected_log_font = 0u;
+                state->legacy_font_type = 0u;
+            }
+            state->created_log_font = 0u;
+            state->created_log_font_size = 0u;
+        }
         vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SELECT_FONT:
+        vm->regs[4] = state->selected_log_font;
+        state->selected_log_font = vm->regs[7];
+        if (vm->regs[7] == state->created_log_font) {
+            state->legacy_font_type =
+                state->created_log_font_size <= 12u ? 0u : 1u;
+        }
         return C33_VM_OK;
     case COMPAT_GUI_TEXT_OUT_LEN:
         {
@@ -3429,27 +5483,75 @@ static c33_vm_status_t dispatch_9588(
         fill_guest_rect(
             state, 0u, 0u, GUEST_SCREEN_W, GUEST_SCREEN_H, 15u
         );
-        present_framebuffer(state);
+        if (state->instant_paint) {
+            present_framebuffer(state);
+        }
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_SHOW_PICTURE_VIRTUAL:
         {
-            u32 picture;
-            u32 virtual_screen;
-            u32 mode;
-            if (!guest_read_u32(vm, vm->sp + 4u, &picture) ||
-                !guest_read_u32(vm, vm->sp + 8u, &virtual_screen) ||
-                !guest_read_u32(vm, vm->sp + 12u, &mode) ||
-                !legacy_blit_virtual_2bpp(
+            u32 picture = 0u;
+            u32 virtual_screen = 0u;
+            u32 mode = 0u;
+            u32 return_pc = 0u;
+            u32 failure_reason = 0u;
+            int picture_ok =
+                guest_read_u32(vm, vm->sp + 4u, &picture);
+            int virtual_ok =
+                guest_read_u32(vm, vm->sp + 8u, &virtual_screen);
+            int mode_ok =
+                guest_read_u32(vm, vm->sp + 12u, &mode);
+            (void)guest_read_u32(vm, vm->sp, &return_pc);
+            if (!picture_ok || !virtual_ok || !mode_ok) {
+                u32 read_mask =
+                    (picture_ok ? 1u : 0u) |
+                    (virtual_ok ? 2u : 0u) |
+                    (mode_ok ? 4u : 0u);
+                if (!picture_ok) {
+                    vm->fault_address = vm->sp + 4u;
+                } else if (!virtual_ok) {
+                    vm->fault_address = vm->sp + 8u;
+                } else {
+                    vm->fault_address = vm->sp + 12u;
+                }
+                log_picv_fault(
                     state,
-                    vm->regs[6],
-                    vm->regs[7],
+                    (s16)(u16)vm->regs[6],
+                    (s16)(u16)vm->regs[7],
                     vm->regs[8],
                     vm->regs[9],
                     picture,
                     virtual_screen,
-                    mode
+                    mode,
+                    PICV_FAULT_STACK_ARGUMENTS | read_mask,
+                    return_pc
+                );
+                return C33_VM_FAULT;
+            }
+            vm->fault_address = 0u;
+            if (!legacy_blit_virtual_2bpp(
+                    state,
+                    (s16)(u16)vm->regs[6],
+                    (s16)(u16)vm->regs[7],
+                    vm->regs[8],
+                    vm->regs[9],
+                    picture,
+                    virtual_screen,
+                    mode,
+                    &failure_reason
                 )) {
+                log_picv_fault(
+                    state,
+                    (s16)(u16)vm->regs[6],
+                    (s16)(u16)vm->regs[7],
+                    vm->regs[8],
+                    vm->regs[9],
+                    picture,
+                    virtual_screen,
+                    mode,
+                    failure_reason,
+                    return_pc
+                );
                 return C33_VM_FAULT;
             }
             vm->regs[4] = 1u;
@@ -3477,6 +5579,33 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_GET_PART_PICTURE_DATA:
+        {
+            u32 x2;
+            u32 y2;
+            u32 source_buffer;
+            u32 destination_buffer;
+            if (!guest_read_u32(vm, vm->sp + 4u, &x2) ||
+                !guest_read_u32(vm, vm->sp + 8u, &y2) ||
+                !guest_read_u32(vm, vm->sp + 12u, &source_buffer) ||
+                !guest_read_u32(
+                    vm, vm->sp + 16u, &destination_buffer
+                )) {
+                return C33_VM_FAULT;
+            }
+            vm->regs[4] = legacy_get_part_picture_data_2bpp(
+                state,
+                vm->regs[6],
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                x2,
+                y2,
+                source_buffer,
+                destination_buffer
+            ) ? 1u : 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_BLIT_FRAME:
         if (!legacy_present_virtual_2bpp(state, vm->regs[7])) {
             return C33_VM_FAULT;
@@ -3486,16 +5615,19 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_DRAW_ASCII:
         {
             u32 virtual_screen;
+            vm->fault_address = vm->sp + 4u;
             if (!guest_read_u32(vm, vm->sp + 4u, &virtual_screen) ||
-                !legacy_draw_ascii_virtual(
+                (vm->fault_address = virtual_screen,
+                 !legacy_draw_ascii_virtual(
                     state,
                     virtual_screen,
                     (s32)vm->regs[7],
                     (s32)vm->regs[8],
                     (u8)vm->regs[9]
-                )) {
+                ))) {
                 return C33_VM_FAULT;
             }
+            vm->fault_address = 0u;
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
@@ -3532,6 +5664,28 @@ static c33_vm_status_t dispatch_9588(
             vm->regs[4] = 0u;
             return C33_VM_OK;
         }
+    case COMPAT_GUI_CLEAR_RECT:
+        {
+            u32 bottom;
+            s32 left = (s32)vm->regs[7];
+            s32 top = (s32)vm->regs[8];
+            s32 right = (s32)vm->regs[9];
+            if (!guest_read_u32(vm, vm->sp + 4u, &bottom)) {
+                return C33_VM_FAULT;
+            }
+            if (right >= left && (s32)bottom >= top) {
+                fill_guest_rect(
+                    state,
+                    (u32)left,
+                    (u32)top,
+                    (u32)(right - left + 1),
+                    (u32)((s32)bottom - top + 1),
+                    state->background_color
+                );
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
     case COMPAT_GUI_GET_CURRENT_DATETIME:
         {
             static const u8 time_info[8] = {
@@ -3553,24 +5707,125 @@ static c33_vm_status_t dispatch_9588(
         }
     case COMPAT_GUI_SHOW_STATUS_AND_DESKTOP:
     case COMPAT_GUI_GET_BACKGROUND_PLAY_STATE:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_TIMER:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_LCD:
+    case COMPAT_GUI_RESET_AUTO_CLOSE_LED:
     case COMPAT_GUI_TRACE_INIT:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_REVERSE_RECT:
+        {
+            u32 height;
+            if (!guest_read_u32(vm, vm->sp + 4u, &height)) {
+                return C33_VM_FAULT;
+            }
+            reverse_guest_rect(
+                state,
+                vm->regs[7],
+                vm->regs[8],
+                vm->regs[9],
+                height
+            );
+            if (state->instant_paint) {
+                present_framebuffer(state);
+            }
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_GET_SCREEN_WIDTH:
+        vm->regs[4] = GUEST_SCREEN_W;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_SCREEN_HEIGHT:
+        vm->regs[4] = GUEST_SCREEN_H;
+        return C33_VM_OK;
+    case COMPAT_GUI_MUSIC_VOLUME_SET:
+    case COMPAT_GUI_SPEECH_OUTPUT_SET:
+    case COMPAT_GUI_MUSIC_OUTPUT_SET:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_MUSIC_VOLUME_GET:
+        vm->regs[4] = 5u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SPEECH_OUTPUT_GET:
+    case COMPAT_GUI_MUSIC_OUTPUT_GET:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_SCAN_GAME_COMBO_KEYS:
+        {
+            u32 index;
+            u32 pressed = 0u;
+            if (!c33_vm_write(
+                    vm,
+                    vm->regs[6],
+                    state->combo_keys,
+                    sizeof(state->combo_keys)
+                )) {
+                vm->fault_address = vm->regs[6];
+                return C33_VM_FAULT;
+            }
+            for (index = 0u;
+                 index < sizeof(state->combo_keys);
+                 ++index) {
+                if (state->combo_keys[index]) {
+                    pressed = 1u;
+                    break;
+                }
+            }
+            vm->regs[4] = pressed;
+            return C33_VM_OK;
+        }
+    case COMPAT_GUI_SET_LANDSCAPE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_LANDSCAPE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_ATTACH_ENABLE:
+    case COMPAT_GUI_LED:
+    case COMPAT_GUI_DISPLAY_BACKLIGHT_STATUS:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_GET_BACKLIGHT_STATUS:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_GUI_IS_SYSTEM_LOW_POWER:
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_HELP2:
         {
             char *help = guest_copy_c_string(vm, vm->regs[7], 4096u);
+            u32 drained = 0u;
+            bda_gui_raw_event_t event;
             if (!help) {
                 return C33_VM_FAULT;
             }
+            release_native_draw_context(state);
             vm->regs[4] = (u32)bda_help_page(
                 0, k_native_help_title, help
             );
             bda_free(help);
             /*
-             * parent=0 is the SDK-supported form for a BDA without a native
-             * Frame. The modal firmware page owns the display until it
-             * returns, so restore the compatibility surface afterwards.
+             * The native Help Page temporarily owns the display. Match the
+             * GBA port's modal lifecycle: discard its release events, then
+             * reactivate the runtime Frame and reacquire the draw context.
              */
+            while (drained < 32u &&
+                   bda_gui_raw_event_fetch(&event) >= 0) {
+                ++drained;
+            }
+            state->hardware_events_ready = 0;
+            state->touch_down = 0;
+            state->touch_region = 0u;
+            state->touch_escape_suppressed = 0;
+            state->native_escape_pending = 0;
+            if (state->native_frame) {
+                (void)bda_gui_frame_activate(
+                    state->native_frame, 0x100u
+                );
+                (void)acquire_native_draw_context(
+                    state, state->native_frame
+                );
+            }
             present_framebuffer(state);
             return C33_VM_OK;
         }
@@ -3582,20 +5837,1071 @@ static c33_vm_status_t dispatch_9588(
 
 static void service_timer(compat_9588_state_t *state, u32 elapsed)
 {
-    if (!state->timer_id || state->quit) {
+    u32 index;
+    if (state->quit) {
         return;
     }
-    state->timer_elapsed += elapsed;
-    if (state->timer_elapsed >= state->timer_interval) {
-        state->timer_elapsed = 0u;
-        queue_message(
-            state,
-            state->timer_hwnd,
-            COMPAT_MSG_TIMER,
-            state->timer_id,
+    state->timer_service_count++;
+    if (state->timer_service_count == 1u) {
+        compat_log_record(
+            "TIMER_SERVICE_START",
+            state->selected_path,
+            elapsed,
+            state->event_count,
+            state->timer_last_id,
             0u
         );
     }
+    for (index = 0u; index < GUEST_TIMER_COUNT; ++index) {
+        guest_timer_t *timer = &state->timers[index];
+        if (!timer->active) {
+            continue;
+        }
+        timer->elapsed += elapsed;
+        if (timer->elapsed >= timer->interval) {
+            timer->elapsed -= timer->interval;
+            state->timer_fire_count++;
+            if (state->timer_fire_count <= 8u) {
+                compat_log_record(
+                    "TIMER_FIRE",
+                    state->selected_path,
+                    timer->hwnd,
+                    timer->id,
+                    timer->interval,
+                    state->event_count
+                );
+            }
+            (void)queue_message(
+                state,
+                timer->hwnd,
+                COMPAT_MSG_TIMER,
+                timer->id,
+                0u
+            );
+        }
+    }
+}
+
+static u32 program_read_u32le(const u8 *bytes)
+{
+    return (u32)bytes[0] |
+           ((u32)bytes[1] << 8) |
+           ((u32)bytes[2] << 16) |
+           ((u32)bytes[3] << 24);
+}
+
+static u32 program_byte_string_length(const char *text, u32 capacity)
+{
+    u32 length = 0u;
+    if (!text) {
+        return 0u;
+    }
+    while (length < capacity && text[length]) {
+        ++length;
+    }
+    return length;
+}
+
+static int program_has_exe_suffix(const char *name)
+{
+    u32 length = program_byte_string_length(name, NATIVE_PATH_CAPACITY);
+    char e;
+    char x;
+    char last;
+    if (length < 4u || length >= NATIVE_PATH_CAPACITY) {
+        return 0;
+    }
+    e = name[length - 3u];
+    x = name[length - 2u];
+    last = name[length - 1u];
+    if (e >= 'A' && e <= 'Z') e = (char)(e + ('a' - 'A'));
+    if (x >= 'A' && x <= 'Z') x = (char)(x + ('a' - 'A'));
+    if (last >= 'A' && last <= 'Z') {
+        last = (char)(last + ('a' - 'A'));
+    }
+    return name[length - 4u] == '.' &&
+           e == 'e' && x == 'x' && last == 'e';
+}
+
+static void program_copy_basename(
+    char destination[NATIVE_PATH_CAPACITY],
+    const char *source
+)
+{
+    u32 length = program_byte_string_length(source, 0x20au);
+    u32 start = 0u;
+    u32 index;
+    for (index = 0u; index < length; ++index) {
+        if (source[index] == '\\' || source[index] == '/') {
+            start = index + 1u;
+        }
+    }
+    index = 0u;
+    while (start + index < length &&
+           index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index] = source[start + index];
+        ++index;
+    }
+    destination[index] = 0;
+}
+
+static int program_build_native_path(
+    char destination[NATIVE_PATH_CAPACITY],
+    const char *file_name
+)
+{
+    const char *root = COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY;
+    u32 root_index = 0u;
+    u32 index = 0u;
+    u32 name_index = 0u;
+    while (root[root_index] && index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index++] = root[root_index++];
+    }
+    while (file_name[name_index] &&
+           index + 1u < NATIVE_PATH_CAPACITY) {
+        destination[index++] = file_name[name_index++];
+    }
+    destination[index] = 0;
+    return !root[root_index] && !file_name[name_index];
+}
+
+static void program_title_from_filename(
+    char title[PROGRAM_TITLE_CAPACITY],
+    const char *file_name
+)
+{
+    u32 source_length =
+        program_byte_string_length(file_name, NATIVE_PATH_CAPACITY);
+    u32 limit = source_length;
+    u32 source = 0u;
+    u32 output = 0u;
+    if (source_length >= 4u &&
+        program_has_exe_suffix(file_name)) {
+        limit -= 4u;
+    }
+    while (source < limit && output + 1u < PROGRAM_TITLE_CAPACITY) {
+        u8 ch = (u8)file_name[source];
+        if (ch >= 0x80u) {
+            if (source + 1u >= limit ||
+                output + 2u >= PROGRAM_TITLE_CAPACITY) {
+                break;
+            }
+            title[output++] = file_name[source++];
+            title[output++] = file_name[source++];
+        } else {
+            title[output++] = file_name[source++];
+        }
+    }
+    while (output && title[output - 1u] == ' ') {
+        --output;
+    }
+    title[output] = 0;
+}
+
+static void program_title_from_header(
+    char title[PROGRAM_TITLE_CAPACITY],
+    const u8 header[D300_MIN_HEADER_SIZE],
+    const char *file_name
+)
+{
+    u32 source = 0u;
+    u32 output = 0u;
+    while (source < 16u && header[0xb0u + source] &&
+           output + 1u < PROGRAM_TITLE_CAPACITY) {
+        u8 ch = header[0xb0u + source];
+        if (ch >= 0x80u) {
+            if (source + 1u >= 16u ||
+                !header[0xb0u + source + 1u] ||
+                output + 2u >= PROGRAM_TITLE_CAPACITY) {
+                break;
+            }
+            title[output++] = (char)ch;
+            title[output++] = (char)header[0xb0u + source + 1u];
+            source += 2u;
+        } else {
+            title[output++] = (char)ch;
+            ++source;
+        }
+    }
+    while (output && title[output - 1u] == ' ') {
+        --output;
+    }
+    title[output] = 0;
+    if (!output) {
+        program_title_from_filename(title, file_name);
+    }
+}
+
+static int read_program_metadata(program_entry_t *entry)
+{
+    int file;
+    int file_size;
+    int count;
+    u8 header[D300_MIN_HEADER_SIZE];
+    u8 icon_block[
+        PROGRAM_ICON_HEADER_SIZE + PROGRAM_ICON_PAYLOAD_SIZE
+    ];
+    d300_image_t image;
+    d300_status_t status;
+
+    compat_log_record(
+        "SELECTOR_META_OPEN_BEGIN",
+        entry->file_name,
+        0u,
+        0u,
+        0u,
+        0u
+    );
+    file = bda_fs_fopen_raw(entry->path, "rb");
+    compat_log_record(
+        "SELECTOR_META_OPEN_END",
+        entry->file_name,
+        (u32)file,
+        0u,
+        0u,
+        0u
+    );
+    if (!bda_fs_file_is_valid(file)) {
+        return 0;
+    }
+    file_size = bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    compat_log_record(
+        "SELECTOR_META_SIZE",
+        entry->file_name,
+        (u32)file_size,
+        0u,
+        0u,
+        0u
+    );
+    if (file_size < (int)D300_MIN_HEADER_SIZE ||
+        (u32)file_size > MAX_D300_FILE_SIZE ||
+        bda_fs_seek_raw(file, 0, BDA_SEEK_SET) != 0) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    count = bda_fs_fread_raw(
+        header, 1u, D300_MIN_HEADER_SIZE, file
+    );
+    if (count != (int)D300_MIN_HEADER_SIZE) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    bda_memset(&image, 0, sizeof(image));
+    status = d300_parse(&image, header, (u32)file_size);
+    compat_log_record(
+        "SELECTOR_META_PARSE",
+        entry->file_name,
+        (u32)status,
+        image.icon_offset,
+        image.icon_size,
+        image.program_size
+    );
+    if (status != D300_OK) {
+        (void)bda_fs_close_raw(file);
+        return 0;
+    }
+    program_title_from_header(entry->title, header, entry->file_name);
+    entry->has_icon = 0;
+    if (image.icon_size >= sizeof(icon_block) &&
+        image.icon_offset <= (u32)file_size &&
+        sizeof(icon_block) <= (u32)file_size - image.icon_offset &&
+        bda_fs_seek_raw(
+            file, (s32)image.icon_offset, BDA_SEEK_SET
+        ) == (int)image.icon_offset) {
+        count = bda_fs_fread_raw(
+            icon_block, 1u, sizeof(icon_block), file
+        );
+        if (count == (int)sizeof(icon_block)) {
+            u32 icon_width =
+                (u32)icon_block[8] |
+                ((u32)icon_block[9] << 8);
+            u32 icon_height =
+                (u32)icon_block[10] |
+                ((u32)icon_block[11] << 8);
+            u32 payload_size = program_read_u32le(icon_block + 12u);
+            if (icon_width == PROGRAM_ICON_WIDTH &&
+                icon_height == PROGRAM_ICON_HEIGHT * 2u &&
+                payload_size >= PROGRAM_ICON_PAYLOAD_SIZE) {
+                bda_memcpy(
+                    entry->icon,
+                    icon_block + PROGRAM_ICON_HEADER_SIZE,
+                    PROGRAM_ICON_PAYLOAD_SIZE
+                );
+                entry->has_icon = 1;
+            }
+        }
+    }
+    (void)bda_fs_close_raw(file);
+    compat_log_record(
+        "SELECTOR_META_DONE",
+        entry->file_name,
+        (u32)entry->has_icon,
+        0u,
+        0u,
+        0u
+    );
+    return 1;
+}
+
+static void draw_program_loading(
+    compat_9588_state_t *state,
+    u32 scanned,
+    u32 accepted
+)
+{
+    char scanned_text[3];
+    char accepted_text[3];
+    u32 segment;
+    scanned_text[0] = (char)('0' + (scanned / 10u) % 10u);
+    scanned_text[1] = (char)('0' + scanned % 10u);
+    scanned_text[2] = 0;
+    accepted_text[0] = (char)('0' + (accepted / 10u) % 10u);
+    accepted_text[1] = (char)('0' + accepted % 10u);
+    accepted_text[2] = 0;
+
+    fill_framebuffer(state, 0xef7du);
+    fill_panel_rect(state, 0, 0, SCREEN_W, 34u, 0x18c3u);
+    draw_panel_text(state, 10, 13, "9288S", 0xffffu);
+    fill_panel_rounded_rect(
+        state, 28, 92, 184u, 126u, 8u, 0xffffu
+    );
+    draw_panel_text(state, 99, 119, "LOADING", 0x18c3u);
+    fill_panel_rect(state, 42, 151, 156u, 14u, 0x7befu);
+    for (segment = 0u; segment < 12u; ++segment) {
+        if (segment < scanned && segment < 12u) {
+            fill_panel_rect(
+                state,
+                45 + (s32)segment * 13,
+                154,
+                10u,
+                8u,
+                0x2697u
+            );
+        }
+    }
+    draw_panel_text(state, 66, 182, "SCAN", 0x4208u);
+    draw_panel_text(state, 96, 182, scanned_text, 0x18c3u);
+    draw_panel_text(state, 126, 182, "OK", 0x4208u);
+    draw_panel_text(state, 144, 182, accepted_text, 0x18c3u);
+}
+
+static void present_program_loading(
+    compat_9588_state_t *state,
+    u32 scanned,
+    u32 accepted
+)
+{
+    draw_program_loading(state, scanned, accepted);
+    (void)present_native_framebuffer(state);
+}
+
+static u32 load_program_entries(
+    compat_9588_state_t *state,
+    program_entry_t *entries,
+    u32 capacity
+)
+{
+    bda_fs_find_data_t find_data;
+    int result;
+    int find_open;
+    u32 count = 0u;
+    u32 scanned = 0u;
+    bda_fs_find_data_init(&find_data);
+    compat_log_record(
+        "SELECTOR_FINDFIRST_BEGIN",
+        COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY "*.*",
+        capacity,
+        0x27u,
+        sizeof(find_data),
+        0u
+    );
+    result = bda_fs_findfirst(
+        COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY "*.*",
+        0x27u,
+        &find_data
+    );
+    compat_log_record(
+        "SELECTOR_FINDFIRST_END",
+        0,
+        (u32)result,
+        (u32)find_data.cursor,
+        find_data.attr_or_flags,
+        (u32)(s32)find_data.volume_index
+    );
+    find_open = result != -1;
+    while (result != -1 && count < capacity) {
+        program_entry_t *entry = &entries[count];
+        int metadata_ok = 0;
+        bda_memset(entry, 0, sizeof(*entry));
+        program_copy_basename(
+            entry->file_name, find_data.name_or_path
+        );
+        compat_log_record(
+            "SELECTOR_SCAN_ITEM",
+            entry->file_name,
+            count,
+            find_data.attr_or_flags,
+            find_data.size_or_aux,
+            (u32)(s32)find_data.volume_index
+        );
+        if (!(find_data.attr_or_flags & 0x10u) &&
+            program_has_exe_suffix(entry->file_name) &&
+            program_build_native_path(
+                entry->path, entry->file_name
+            )) {
+            metadata_ok = read_program_metadata(entry);
+        }
+        if (metadata_ok) {
+            ++count;
+        }
+        ++scanned;
+        present_program_loading(state, scanned, count);
+        compat_log_record(
+            "SELECTOR_FINDNEXT_BEGIN",
+            entry->file_name,
+            count,
+            0u,
+            0u,
+            0u
+        );
+        result = bda_fs_findnext(&find_data);
+        compat_log_record(
+            "SELECTOR_FINDNEXT_END",
+            0,
+            (u32)result,
+            count,
+            (u32)find_data.cursor,
+            (u32)(s32)find_data.volume_index
+        );
+    }
+    if (find_open) {
+        compat_log_record(
+            "SELECTOR_FINDCLOSE_BEGIN",
+            0,
+            count,
+            (u32)find_data.cursor,
+            0u,
+            0u
+        );
+        (void)bda_fs_findclose(&find_data);
+        compat_log_record(
+            "SELECTOR_FINDCLOSE_END",
+            0,
+            count,
+            0u,
+            0u,
+            0u
+        );
+    }
+    return count;
+}
+
+static s32 draw_panel_gbk_text(
+    compat_9588_state_t *state,
+    s32 x,
+    s32 y,
+    const char *text,
+    s32 right,
+    u16 color
+)
+{
+    u32 index = 0u;
+    s32 cursor = x;
+    while (text[index] && cursor < right) {
+        u8 ch = (u8)text[index];
+        if (ch >= 0x80u && text[index + 1u]) {
+            u8 glyph[HZK_GLYPH_SIZE];
+            if (cursor + 12 > right) {
+                break;
+            }
+            if (read_hzk_glyph(
+                    state, ch, (u8)text[index + 1u], glyph
+                )) {
+                draw_panel_hz_bitmap(
+                    state, cursor, y, glyph, color
+                );
+            } else {
+                draw_panel_text(state, cursor, y + 2, "?", color);
+            }
+            cursor += 12;
+            index += 2u;
+        } else {
+            char character[2];
+            if (cursor + 6 > right) {
+                break;
+            }
+            character[0] = (char)ch;
+            character[1] = 0;
+            draw_panel_text(state, cursor, y + 2, character, color);
+            cursor += 6;
+            ++index;
+        }
+    }
+    return cursor;
+}
+
+static void draw_program_icon(
+    compat_9588_state_t *state,
+    const program_entry_t *entry,
+    s32 x,
+    s32 y,
+    int selected
+)
+{
+    static const u16 colors[4] = {
+        0x0000u, 0x52aau, 0xad55u, 0xffffu
+    };
+    u32 row;
+    u32 frame_offset =
+        selected ? PROGRAM_ICON_FRAME_SIZE : 0u;
+    if (!entry->has_icon) {
+        fill_panel_rounded_rect(
+            state, x, y, PROGRAM_ICON_WIDTH,
+            PROGRAM_ICON_HEIGHT, 4u, 0x4208u
+        );
+        draw_panel_text(state, x + 7, y + 13, "EXE", 0xffffu);
+        return;
+    }
+    for (row = 0u; row < PROGRAM_ICON_HEIGHT; ++row) {
+        u32 column;
+        for (column = 0u; column < PROGRAM_ICON_WIDTH; ++column) {
+            u32 byte_index =
+                frame_offset + row * (PROGRAM_ICON_WIDTH / 4u) +
+                column / 4u;
+            u8 packed = entry->icon[byte_index];
+            u32 value =
+                (packed >> compat_gui_packed_2bpp_shift(column)) & 3u;
+            put_panel_pixel(
+                state,
+                x + (s32)column,
+                y + (s32)row,
+                colors[value]
+            );
+        }
+    }
+}
+
+static void program_page_text(
+    char text[8],
+    u32 page,
+    u32 page_count
+)
+{
+    u32 output = 0u;
+    if (page >= 9u) {
+        text[output++] = (char)('0' + ((page + 1u) / 10u) % 10u);
+    }
+    text[output++] = (char)('0' + (page + 1u) % 10u);
+    text[output++] = '/';
+    if (page_count >= 10u) {
+        text[output++] = (char)('0' + (page_count / 10u) % 10u);
+    }
+    text[output++] = (char)('0' + page_count % 10u);
+    text[output] = 0;
+}
+
+static void draw_program_browser(
+    compat_9588_state_t *state,
+    const program_entry_t *entries,
+    u32 count,
+    u32 selected
+)
+{
+    u32 page = count ? selected / PROGRAMS_PER_PAGE : 0u;
+    u32 page_count =
+        count ? (count + PROGRAMS_PER_PAGE - 1u) /
+            PROGRAMS_PER_PAGE : 1u;
+    u32 first = page * PROGRAMS_PER_PAGE;
+    u32 row;
+    char page_label[8];
+
+    fill_framebuffer(state, 0xef7du);
+    fill_panel_rect(state, 0, 0, SCREEN_W, 34u, 0x18c3u);
+    draw_panel_gbk_text(
+        state, 10, 10,
+        "9288S \xb3\xcc\xd0\xf2",
+        180, 0xffffu
+    );
+    program_page_text(page_label, page, page_count);
+    draw_panel_text(state, 205, 13, page_label, 0xffffu);
+
+    for (row = 0u; row < PROGRAMS_PER_PAGE; ++row) {
+        u32 index = first + row;
+        s32 y = (s32)(PROGRAM_ROW_TOP + row * PROGRAM_ROW_HEIGHT);
+        int is_selected = count && index == selected;
+        u16 background = is_selected ? 0x2a69u : 0xffffu;
+        u16 title_color = is_selected ? 0xffffu : 0x1082u;
+        fill_panel_rect(
+            state, 6, y, SCREEN_W - 12u,
+            PROGRAM_ROW_HEIGHT - 3u, background
+        );
+        if (index < count) {
+            draw_program_icon(
+                state, &entries[index], 13, y + 5, is_selected
+            );
+            draw_panel_gbk_text(
+                state, 56, y + 15,
+                entries[index].title, 230, title_color
+            );
+        }
+    }
+
+    if (!count) {
+        draw_panel_gbk_text(
+            state, 30, 115,
+            "\xce\xb4\xd5\xd2\xb5\xbd 9288S \xb3\xcc\xd0\xf2",
+            220, 0x4208u
+        );
+        draw_panel_gbk_text(
+            state, 42, 143,
+            "\xc7\xeb\xbd\xab EXE \xb7\xc5\xc8\xeb",
+            215, 0x7befu
+        );
+        draw_panel_gbk_text(
+            state, 18, 165,
+            "\xcf\xb5\xcd\xb3\\\xb3\xcc\xd0\xf2",
+            220, 0x7befu
+        );
+    }
+
+    fill_panel_rounded_rect(state, 8, 284, 70u, 28u, 6u, 0x632cu);
+    draw_panel_gbk_text(
+        state, 31, 291, "\xcd\xcb\xb3\xf6", 70, 0xffffu
+    );
+    fill_panel_rounded_rect(state, 162, 284, 70u, 28u, 6u, 0x2a69u);
+    draw_panel_gbk_text(
+        state, 185, 291, "\xcb\xa2\xd0\xc2", 225, 0xffffu
+    );
+    if (count) {
+        draw_panel_gbk_text(
+            state, 89, 292, "\xc8\xb7\xc8\xcf\xb4\xf2\xbf\xaa",
+            155, 0x4208u
+        );
+    }
+}
+
+static u32 poll_program_browser_key(compat_9588_state_t *state)
+{
+    static const u32 scancodes[BDA_GUI_INPUT_PACKET_SIZE] = {
+        COMPAT_SCANCODE_RIGHT,
+        COMPAT_SCANCODE_LEFT,
+        COMPAT_SCANCODE_DOWN,
+        COMPAT_SCANCODE_UP,
+        COMPAT_SCANCODE_ESCAPE,
+        COMPAT_SCANCODE_ENTER
+    };
+    bda_gui_input_packet_t packet;
+    u32 index;
+    u32 pressed = 0u;
+
+    (void)bda_gui_input_packet(&packet);
+    filter_native_touch_escape(state, &packet);
+    if (!state->hardware_events_ready) {
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            state->combo_keys[index] =
+                packet.bytes[index] == 1u ? 1u : 0u;
+        }
+        state->hardware_events_ready = 1;
+        return 0u;
+    }
+    for (index = 0u;
+         index < BDA_GUI_INPUT_PACKET_SIZE;
+         ++index) {
+        u8 down = packet.bytes[index] == 1u ? 1u : 0u;
+        if (index == BDA_INPUT_PACKET_ESCAPE_INDEX) {
+            if (down && !state->combo_keys[index]) {
+                state->native_escape_pending = 1;
+            } else if (!down &&
+                       state->combo_keys[index] &&
+                       state->native_escape_pending) {
+                pressed = COMPAT_SCANCODE_ESCAPE;
+                state->native_escape_pending = 0;
+            }
+        } else if (!pressed &&
+                   down && !state->combo_keys[index]) {
+            pressed = scancodes[index];
+        }
+        state->combo_keys[index] = down;
+    }
+    return pressed;
+}
+
+static int poll_program_browser_touch(
+    compat_9588_state_t *state,
+    u32 *x_out,
+    u32 *y_out
+)
+{
+    bda_gui_raw_event_t event;
+    u32 drained = 0u;
+    int move_pending = 0;
+    while (drained < RAW_EVENT_MAX_PER_POLL &&
+           bda_gui_raw_event_fetch(&event) >= 0) {
+        ++drained;
+        ++state->raw_event_count;
+        if ((u32)event.code == BDA_INPUT_EVENT_TOUCH_DOWN) {
+            u16 x = 0u;
+            u16 y = 0u;
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            bda_gui_touch_position(&x, &y);
+            state->touch_down = 1;
+            state->touch_x = x;
+            state->touch_y = y;
+            move_pending = 0;
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_MOVE) {
+            ++state->raw_touch_count;
+            if (state->touch_down) {
+                move_pending = 1;
+            }
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_UP) {
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            if (state->touch_down) {
+                u16 x = 0u;
+                u16 y = 0u;
+                bda_gui_touch_position(&x, &y);
+                state->touch_down = 0;
+                state->touch_x = x;
+                state->touch_y = y;
+                *x_out = x;
+                *y_out = y;
+                return 1;
+            }
+            move_pending = 0;
+        }
+    }
+    if (move_pending && state->touch_down) {
+        u16 x = 0u;
+        u16 y = 0u;
+        bda_gui_touch_position(&x, &y);
+        state->touch_x = x;
+        state->touch_y = y;
+    }
+    return 0;
+}
+
+static int select_9288s_program(
+    char selected_path[NATIVE_PATH_CAPACITY]
+)
+{
+    compat_9588_state_t *state;
+    program_entry_t *entries;
+    u16 *framebuffer;
+    u32 count;
+    u32 selected = 0u;
+    u32 heartbeat_tick;
+    u32 selector_open_tick;
+    u32 scan_start_tick;
+    int input_armed = 0;
+    int dirty = 1;
+    int result = 0;
+
+    state = (compat_9588_state_t *)bda_alloc(sizeof(*state));
+    entries = (program_entry_t *)bda_alloc(
+        sizeof(*entries) * PROGRAM_MAX_ENTRIES
+    );
+    framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * sizeof(u16));
+    compat_log_record(
+        "SELECTOR_ALLOC",
+        0,
+        (u32)state,
+        (u32)entries,
+        (u32)framebuffer,
+        sizeof(*entries) * PROGRAM_MAX_ENTRIES
+    );
+    if (allocation_failed(state) ||
+        allocation_failed(entries) ||
+        allocation_failed(framebuffer)) {
+        if (!allocation_failed(framebuffer)) bda_free(framebuffer);
+        if (!allocation_failed(entries)) bda_free(entries);
+        if (!allocation_failed(state)) bda_free(state);
+        bda_msgbox("9288S", "Not enough memory for program list");
+        return -1;
+    }
+    bda_memset(state, 0, sizeof(*state));
+    state->framebuffer = framebuffer;
+    state->hzk_file = -1;
+    if (!native_input_open(state)) {
+        compat_log_record(
+            "SELECTOR_FRAME_FAILED",
+            0,
+            (u32)state->native_frame,
+            0u,
+            0u,
+            0u
+        );
+        if (state->hzk_attempted &&
+            bda_fs_file_is_valid(state->hzk_file)) {
+            (void)bda_fs_close_raw(state->hzk_file);
+        }
+        bda_free(framebuffer);
+        bda_free(entries);
+        bda_free(state);
+        bda_msgbox("9288S", "Could not open input window");
+        return -1;
+    }
+    compat_log_record(
+        "SELECTOR_FRAME_OPEN",
+        0,
+        (u32)state->native_frame,
+        (u32)state->native_draw,
+        (u32)g_native_direct_framebuffer,
+        (u32)state->native_draw_object
+    );
+    present_program_loading(state, 0u, 0u);
+    scan_start_tick = bda_gui_tick_count_25ms();
+    compat_log_record(
+        "SELECTOR_SCAN_BEGIN",
+        0,
+        sizeof(*state),
+        SCREEN_W * SCREEN_H * sizeof(u16),
+        PROGRAM_MAX_ENTRIES,
+        0u
+    );
+    count = load_program_entries(
+        state, entries, PROGRAM_MAX_ENTRIES
+    );
+    compat_log_record(
+        "SELECTOR_SCAN_END",
+        0,
+        count,
+        bda_gui_tick_count_25ms() - scan_start_tick,
+        0u,
+        0u
+    );
+    heartbeat_tick = bda_gui_tick_count_25ms();
+    selector_open_tick = heartbeat_tick;
+
+    for (;;) {
+        u32 key;
+        u32 touch_x = 0u;
+        u32 touch_y = 0u;
+        int touched;
+        int refresh = 0;
+        if (dirty) {
+            compat_log_record(
+                "SELECTOR_DRAW_BEGIN",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
+            draw_program_browser(state, entries, count, selected);
+            compat_log_record(
+                "SELECTOR_PRESENT_BEGIN",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
+            (void)present_native_framebuffer(state);
+            compat_log_record(
+                "SELECTOR_PRESENT_END",
+                0,
+                g_diagnostic[8],
+                g_diagnostic[9],
+                g_diagnostic[10],
+                (u32)state->native_redraw
+            );
+            compat_log_record(
+                "SELECTOR_READY",
+                0,
+                count,
+                selected,
+                (u32)state->framebuffer,
+                0u
+            );
+            dirty = 0;
+        }
+        if (state->native_redraw) {
+            dirty = 1;
+        }
+        touched = poll_program_browser_touch(
+            state, &touch_x, &touch_y
+        );
+        key = poll_program_browser_key(state);
+        /*
+         * The touch/key event that launches the BDA may still be queued when
+         * the selector frame opens.  Drain it, then require a short released
+         * interval before accepting selector input; otherwise that launch
+         * touch can silently choose the second row.
+         */
+        if (!input_armed) {
+            u32 now = bda_gui_tick_count_25ms();
+            touched = 0;
+            key = 0u;
+            if (now - selector_open_tick >= 8u &&
+                !state->touch_down) {
+                input_armed = 1;
+                compat_log_record(
+                    "SELECTOR_INPUT_ARMED",
+                    0,
+                    state->raw_event_count,
+                    state->raw_touch_count,
+                    now - selector_open_tick,
+                    0u
+                );
+            }
+        }
+        if (key) {
+            compat_log_record(
+                "SELECTOR_KEY",
+                0,
+                key,
+                selected,
+                count,
+                0u
+            );
+        }
+        if (touched) {
+            compat_log_record(
+                "SELECTOR_TOUCH",
+                0,
+                touch_x,
+                touch_y,
+                selected,
+                count
+            );
+        }
+        if (key == COMPAT_SCANCODE_ESCAPE) {
+            result = 0;
+            break;
+        } else if (key == COMPAT_SCANCODE_ENTER) {
+            if (count) {
+                copy_native_path(selected_path, entries[selected].path);
+                compat_log_record(
+                    "SELECTOR_CHOOSE",
+                    selected_path,
+                    selected,
+                    count,
+                    key,
+                    0u
+                );
+                result = 1;
+                break;
+            }
+            refresh = 1;
+        } else if (count && key == COMPAT_SCANCODE_UP) {
+            selected = selected ? selected - 1u : count - 1u;
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_DOWN) {
+            selected = selected + 1u < count ? selected + 1u : 0u;
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_LEFT) {
+            if (selected >= PROGRAMS_PER_PAGE) {
+                selected -= PROGRAMS_PER_PAGE;
+            } else {
+                selected = 0u;
+            }
+            dirty = 1;
+        } else if (count && key == COMPAT_SCANCODE_RIGHT) {
+            if (selected + PROGRAMS_PER_PAGE < count) {
+                selected += PROGRAMS_PER_PAGE;
+            } else {
+                selected = count - 1u;
+            }
+            dirty = 1;
+        }
+
+        if (touched) {
+            if (touch_y >= PROGRAM_ROW_TOP &&
+                touch_y <
+                    PROGRAM_ROW_TOP +
+                    PROGRAMS_PER_PAGE * PROGRAM_ROW_HEIGHT &&
+                touch_x >= 6u && touch_x < SCREEN_W - 6u) {
+                u32 page = count
+                    ? selected / PROGRAMS_PER_PAGE : 0u;
+                u32 row =
+                    (touch_y - PROGRAM_ROW_TOP) / PROGRAM_ROW_HEIGHT;
+                u32 index = page * PROGRAMS_PER_PAGE + row;
+                if (index < count) {
+                    copy_native_path(
+                        selected_path, entries[index].path
+                    );
+                    compat_log_record(
+                        "SELECTOR_CHOOSE",
+                        selected_path,
+                        index,
+                        count,
+                        touch_x,
+                        touch_y
+                    );
+                    result = 1;
+                    break;
+                }
+            } else if (touch_y >= 280u &&
+                       touch_x >= 8u && touch_x < 78u) {
+                result = 0;
+                break;
+            } else if (touch_y >= 280u &&
+                       touch_x >= 162u && touch_x < 232u) {
+                refresh = 1;
+            }
+        }
+        if (refresh) {
+            compat_log_record(
+                "SELECTOR_REFRESH",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
+            bda_memset(
+                entries, 0,
+                sizeof(*entries) * PROGRAM_MAX_ENTRIES
+            );
+            present_program_loading(state, 0u, 0u);
+            count = load_program_entries(
+                state, entries, PROGRAM_MAX_ENTRIES
+            );
+            selected = 0u;
+            dirty = 1;
+        }
+        {
+            u32 now = bda_gui_tick_count_25ms();
+            if (now - heartbeat_tick >=
+                COMPAT_LOG_HEARTBEAT_TICKS) {
+                compat_log_record(
+                    "SELECTOR_HEARTBEAT",
+                    0,
+                    count,
+                    selected,
+                    (u32)state->touch_down,
+                    ((state->raw_touch_count & 0xffffu) << 16) |
+                        (state->raw_event_count & 0xffffu)
+                );
+                heartbeat_tick = now;
+            }
+        }
+        bda_sys_delay(1u);
+    }
+
+    compat_log_record(
+        "SELECTOR_LEAVE",
+        result == 1 ? selected_path : 0,
+        (u32)result,
+        count,
+        selected,
+        ((state->raw_touch_count & 0xffffu) << 16) |
+            (state->raw_event_count & 0xffffu)
+    );
+    native_input_close(state);
+    if (state->hzk_attempted &&
+        bda_fs_file_is_valid(state->hzk_file)) {
+        (void)bda_fs_close_raw(state->hzk_file);
+    }
+    bda_free(framebuffer);
+    bda_free(entries);
+    bda_free(state);
+    return result;
 }
 
 static u8 *load_d300_file(
@@ -3671,7 +6977,14 @@ static int run_selected_game(
     u8 *api_ram = 0;
     u8 *heap_ram = 0;
     u8 *code_ram = 0;
-    u32 code_size = GUEST_CODE_MIN_SIZE;
+    u8 *jit_code = 0;
+    /*
+     * D300 images only report the initialized program length. 9288S
+     * executables also address zero-initialized globals above that range,
+     * so keep the entire application window mapped just like the original
+     * 9288S SDRAM layout.
+     */
+    u32 code_size = GUEST_CODE_MAX_SIZE;
     u16 *framebuffer = 0;
     compat_9588_runtime_t *runtime;
     d300_image_t *image;
@@ -3684,6 +6997,9 @@ static int run_selected_game(
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
     *reselect_out = 0;
+    compat_log_record(
+        "RUN_BEGIN", selected_path, 0u, 0u, 0u, 0u
+    );
     file_bytes = load_d300_file(
         selected_path, &file_size, &load_stage, &load_detail
     );
@@ -3698,14 +7014,33 @@ static int run_selected_game(
         append_text(&out, end, "\nPath: ");
         append_text(&out, end, selected_path);
         *out = 0;
+        compat_log_record(
+            "LOAD_FAILED",
+            selected_path,
+            load_stage,
+            (u32)load_detail,
+            0u,
+            0u
+        );
         bda_msgbox("9288S", text);
         *reselect_out = 1;
         return 3;
     }
+    compat_log_record(
+        "LOAD_OK", selected_path, file_size, 0u, 0u, 0u
+    );
 
     g_diagnostic[1] = 1u;
     runtime = (compat_9588_runtime_t *)bda_alloc(sizeof(*runtime));
     if (allocation_failed(runtime)) {
+        compat_log_record(
+            "ALLOC_RUNTIME_FAILED",
+            selected_path,
+            sizeof(*runtime),
+            (u32)runtime,
+            0u,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Not enough runtime memory");
         bda_free(file_bytes);
         return 1;
@@ -3718,13 +7053,26 @@ static int run_selected_game(
     state = &runtime->state;
     state->vm = vm;
     copy_native_path(state->selected_path, selected_path);
+    state->guest_cwd[0] = '\\';
+    state->guest_cwd[1] = 0;
     state->pen_color = 16u;
     state->brush_color = 15u;
     state->background_color = 15u;
+    state->background_mode = 0u;
     state->text_color = 16u;
     state->controls_left = 1;
+    state->fullscreen_float_x = FULLSCREEN_FLOAT_DEFAULT_X;
+    state->fullscreen_float_y = FULLSCREEN_FLOAT_DEFAULT_Y;
     framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * 2u);
     if (allocation_failed(framebuffer)) {
+        compat_log_record(
+            "ALLOC_FRAMEBUFFER_FAILED",
+            selected_path,
+            SCREEN_W * SCREEN_H * 2u,
+            (u32)framebuffer,
+            (u32)runtime,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Not enough display memory");
         bda_free(file_bytes);
         bda_free(runtime);
@@ -3736,6 +7084,14 @@ static int run_selected_game(
     present_framebuffer(state);
 
     image_status = d300_parse(image, file_bytes, file_size);
+    compat_log_record(
+        "D300_PARSED",
+        selected_path,
+        (u32)image_status,
+        image->program_size,
+        image->resource_offset,
+        image->resource_size
+    );
     if (image_status != D300_OK) {
         bda_msgbox("9288S compatibility", d300_status_string(image_status));
         bda_free(file_bytes);
@@ -3753,11 +7109,6 @@ static int run_selected_game(
         *reselect_out = 1;
         return 5;
     }
-    if (image->program_size > code_size) {
-        code_size =
-            (image->program_size + 0xffffu) & ~0xffffu;
-    }
-
     iram = (u8 *)bda_alloc(GUEST_IRAM_SIZE);
     api_ram = (u8 *)bda_alloc(GUEST_API_SIZE);
     heap_ram = (u8 *)bda_alloc(GUEST_HEAP_SIZE);
@@ -3773,9 +7124,25 @@ static int run_selected_game(
         bda_free(file_bytes);
         bda_free(framebuffer);
         bda_free(runtime);
+        compat_log_record(
+            "ALLOC_GUEST_FAILED",
+            selected_path,
+            (u32)iram,
+            (u32)api_ram,
+            (u32)heap_ram,
+            (u32)code_ram
+        );
         bda_msgbox("9288S compatibility", "Not enough memory for guest RAM");
         return 6;
     }
+    compat_log_record(
+        "ALLOC_GUEST_OK",
+        selected_path,
+        (u32)iram,
+        (u32)api_ram,
+        (u32)heap_ram,
+        (u32)code_ram
+    );
     g_diagnostic[1] = 5u;
     bda_memset(iram, 0, GUEST_IRAM_SIZE);
     bda_memset(api_ram, 0, GUEST_API_SIZE);
@@ -3798,6 +7165,14 @@ static int run_selected_game(
     api->dispatch = dispatch_9588;
     api->dispatch_opaque = state;
     if (!compat_api_install(api)) {
+        compat_log_record(
+            "API_INSTALL_FAILED",
+            selected_path,
+            api->heap_next,
+            api->heap_end,
+            0u,
+            0u
+        );
         bda_msgbox("9288S compatibility", "Could not install API tables");
         bda_free(code_ram);
         bda_free(heap_ram);
@@ -3809,11 +7184,68 @@ static int run_selected_game(
     }
     g_diagnostic[1] = 6u;
 
+    jit_code = (u8 *)bda_alloc(C33_JIT_CODE_CACHE_SIZE);
+    if (!allocation_failed(jit_code)) {
+        int jit_enabled = c33_jit_init(
+            vm, jit_code, C33_JIT_CODE_CACHE_SIZE
+        );
+        compat_log_record(
+            "JIT_INIT",
+            selected_path,
+            (u32)jit_enabled,
+            (u32)jit_code,
+            C33_JIT_CODE_CACHE_SIZE,
+            0u
+        );
+    } else {
+        jit_code = 0;
+        (void)c33_jit_init(vm, 0, 0u);
+        compat_log_record(
+            "JIT_ALLOC_FAILED",
+            selected_path,
+            C33_JIT_CODE_CACHE_SIZE,
+            0u,
+            0u,
+            0u
+        );
+    }
+
+    if (!native_input_open(state)) {
+        compat_log_record(
+            "RUN_FRAME_FAILED",
+            selected_path,
+            (u32)state->native_frame,
+            0u,
+            0u,
+            0u
+        );
+        bda_msgbox("9288S", "Could not open input window");
+        (void)c33_jit_init(0, 0, 0u);
+        if (jit_code) bda_free(jit_code);
+        bda_free(code_ram);
+        bda_free(heap_ram);
+        bda_free(api_ram);
+        bda_free(iram);
+        bda_free(framebuffer);
+        bda_free(runtime);
+        return 9;
+    }
+    compat_log_record(
+        "RUN_FRAME_OPEN",
+        selected_path,
+        (u32)state->native_frame,
+        0u,
+        0u,
+        0u
+    );
     c33_vm_reset(vm, D300_GUEST_LOAD_BASE, GUEST_STACK_TOP, 0);
+    c33_jit_reset(vm);
     vm->sp -= 4u;
     c33_vm_write(vm, vm->sp, exit_pc, sizeof(exit_pc));
     host_tick = bda_gui_tick_count_25ms();
+    state->heartbeat_tick = bda_gui_tick_count_25ms();
     g_diagnostic[1] = 7u;
+    compat_log_vm("VM_START", vm, api, state, C33_VM_OK);
 
     for (;;) {
         vm_status = c33_vm_run(vm, VM_SLICE);
@@ -3825,6 +7257,7 @@ static int run_selected_game(
         g_diagnostic[6] = api->last_group;
         g_diagnostic[7] = api->last_slot;
         if (vm_status != C33_VM_YIELD) {
+            compat_log_vm("VM_STOP", vm, api, state, vm_status);
             break;
         }
 
@@ -3836,7 +7269,6 @@ static int run_selected_game(
          */
         {
             u32 current_tick;
-            u32 elapsed_ticks;
             bda_sys_delay(1u);
             service_hardware_input(state);
             if (state->request_reselect) {
@@ -3844,15 +7276,94 @@ static int run_selected_game(
                 break;
             }
             current_tick = bda_gui_tick_count_25ms();
-            elapsed_ticks = current_tick - host_tick;
-            if (elapsed_ticks) {
-                service_timer(state, elapsed_ticks * HOST_TICK_MS);
+            if (current_tick != host_tick) {
+                service_timer(
+                    state, (current_tick - host_tick) * 25u
+                );
                 host_tick = current_tick;
+            }
+            if (current_tick - state->heartbeat_tick >=
+                COMPAT_LOG_HEARTBEAT_TICKS) {
+                c33_jit_stats_t jit_stats;
+                compat_log_vm(
+                    "VM_HEARTBEAT", vm, api, state, vm_status
+                );
+                c33_jit_get_stats(vm, &jit_stats);
+                compat_log_record(
+                    "JIT_HEARTBEAT",
+                    selected_path,
+                    jit_stats.blocks_compiled,
+                    jit_stats.blocks_verified,
+                    jit_stats.verification_failures,
+                    jit_stats.last_failed_pc
+                );
+                compat_log_record(
+                    "JIT_HEARTBEAT2",
+                    selected_path,
+                    jit_stats.cache_hits,
+                    jit_stats.cache_misses,
+                    jit_stats.fallback_steps,
+                    (u32)jit_stats.native_instructions
+                );
+                compat_log_record(
+                    "JIT_HEARTBEAT3",
+                    selected_path,
+                    jit_stats.negative_hits,
+                    jit_stats.compile_failures,
+                    (u32)jit_stats.lookup_probes,
+                    jit_stats.max_lookup_probes
+                );
+                state->heartbeat_tick = current_tick;
             }
         }
         present_framebuffer(state);
     }
 
+    native_input_close(state);
+    {
+        c33_jit_stats_t jit_stats;
+        c33_jit_get_stats(vm, &jit_stats);
+        compat_log_record(
+            "JIT_STATS_A",
+            selected_path,
+            jit_stats.enabled,
+            jit_stats.blocks_compiled,
+            jit_stats.cache_hits,
+            jit_stats.cache_misses
+        );
+        compat_log_record(
+            "JIT_STATS_B",
+            selected_path,
+            jit_stats.cache_used,
+            jit_stats.cache_flushes,
+            jit_stats.blocks_verified,
+            jit_stats.verification_failures
+        );
+        compat_log_record(
+            "JIT_STATS_C",
+            selected_path,
+            jit_stats.last_failed_pc,
+            jit_stats.fallback_steps,
+            (u32)jit_stats.native_instructions,
+            (u32)(jit_stats.native_instructions >> 32)
+        );
+        compat_log_record(
+            "JIT_STATS_D",
+            selected_path,
+            (u32)vm->instructions,
+            (u32)(vm->instructions >> 32),
+            jit_stats.cache_size,
+            0u
+        );
+        compat_log_record(
+            "JIT_STATS_E",
+            selected_path,
+            jit_stats.negative_hits,
+            jit_stats.compile_failures,
+            (u32)jit_stats.lookup_probes,
+            jit_stats.max_lookup_probes
+        );
+    }
     if (vm_status == C33_VM_DONE &&
         !state->quit &&
         !state->request_reselect) {
@@ -3877,24 +7388,35 @@ static int run_selected_game(
         (void)bda_fs_close_raw(state->hzk_file);
         state->hzk_file = -1;
     }
-    {
-        u32 saved_index;
-        for (saved_index = 0u;
-             saved_index < SAVED_BOX_SLOTS;
-             ++saved_index) {
-            if (state->saved_boxes[saved_index].pixels) {
-                bda_free(state->saved_boxes[saved_index].pixels);
-                state->saved_boxes[saved_index].pixels = 0;
-            }
-        }
-    }
+    (void)c33_jit_init(0, 0, 0u);
+    if (jit_code) bda_free(jit_code);
     bda_free(code_ram);
     bda_free(heap_ram);
     bda_free(api_ram);
     bda_free(iram);
+    if (state->fullscreen_buffer) {
+        bda_free(state->fullscreen_buffer);
+        state->fullscreen_buffer = 0;
+    }
     bda_free(framebuffer);
     state->framebuffer = 0;
     *reselect_out = state->request_reselect;
+    compat_log_record(
+        "INPUT_STATS",
+        selected_path,
+        state->raw_event_count,
+        state->raw_touch_count,
+        (u32)state->hardware_events_ready,
+        (u32)state->touch_down
+    );
+    compat_log_record(
+        "RUN_END",
+        selected_path,
+        (u32)vm_status,
+        (u32)state->request_reselect,
+        (u32)state->quit,
+        state->api_call_count
+    );
     bda_free(runtime);
     return vm_status == C33_VM_DONE ? 0 : 8;
 }
@@ -3902,42 +7424,70 @@ static int run_selected_game(
 __attribute__((section(".text.bda_main")))
 int bda_main(void)
 {
-    bda_file_selector_t *selector;
+    char *selected_path;
     int selector_result;
     int run_result = 0;
     int reselect = 0;
 
-    selector = (bda_file_selector_t *)bda_alloc(sizeof(*selector));
-    if (allocation_failed(selector)) {
-        bda_msgbox("9288S", "Not enough memory for file selector");
+    selected_path = (char *)bda_alloc(NATIVE_PATH_CAPACITY);
+    if (allocation_failed(selected_path)) {
+        bda_msgbox("9288S", "Not enough memory for program path");
         return 1;
     }
-    ensure_native_directory_tree(COMPAT_FS_NATIVE_ROOT);
+    ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
+    compat_log_write(
+        "9288S compatibility real-device log v11\r\n", 1
+    );
+    compat_log_record(
+        "BDA_START",
+        COMPAT_FS_NATIVE_ROOT,
+        (u32)selected_path,
+        sizeof(compat_9588_runtime_t),
+        VM_SLICE,
+        CALLBACK_BUDGET
+    );
+    compat_log_record(
+        "INPUT_ARCH",
+        "GBA raw touch + input packet; Frame pump shutdown only",
+        RAW_EVENT_MAX_PER_POLL,
+        0u,
+        0u,
+        0u
+    );
     for (;;) {
-        selector_result = bda_gui_select_file(
-            selector,
-            COMPAT_FS_NATIVE_ROOT_DIRECTORY,
-            "exe",
-            "Select 9288S EXE"
+        compat_log_record(
+            "SELECTOR_ENTER", 0, 0u, 0u, 0u, 0u
         );
-        if (selector_result != BDA_FILE_SELECTOR_SELECTED) {
-            if (selector_result == BDA_FILE_SELECTOR_ERROR) {
-                bda_msgbox("9288S", "File selector failed");
-                run_result = 2;
-            }
+        selector_result = select_9288s_program(selected_path);
+        compat_log_record(
+            "SELECTOR_RESULT",
+            selector_result == 1 ? selected_path : 0,
+            (u32)selector_result,
+            0u,
+            0u,
+            0u
+        );
+        if (selector_result != 1) {
+            if (selector_result < 0) run_result = 2;
             break;
         }
-        run_result = run_selected_game(selector->path, &reselect);
+        run_result = run_selected_game(selected_path, &reselect);
         if (!reselect) {
             break;
         }
     }
-    bda_free(selector);
+    compat_log_record(
+        "BDA_END", 0, (u32)run_result, (u32)reselect, 0u, 0u
+    );
+    native_input_shutdown();
+    compat_log_close();
+    bda_free(selected_path);
     return run_result;
 }
 
 /* The existing one-source BDA builder compiles a single translation unit. */
 #include "../../runtime/src/d300.c"
 #include "../../runtime/src/c33vm.c"
+#include "../../runtime/src/c33jit.c"
 #include "../../runtime/src/compat_api.c"
 #include "../../runtime/src/compat_fs.c"

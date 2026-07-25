@@ -7,6 +7,7 @@
  * _ToUnic_SUPPORT enabled.
  */
 enum compat_gui_slot {
+    COMPAT_GUI_DRAW_3D_CONTROL_FRAME = 10,
     COMPAT_GUI_GET_MESSAGE = 12,
     COMPAT_GUI_HAVE_PENDING_MESSAGE = 13,
     COMPAT_GUI_PEEK_POST_MESSAGE = 14,
@@ -21,7 +22,10 @@ enum compat_gui_slot {
     COMPAT_GUI_CREATE_MAIN_WINDOW = 33,
     COMPAT_GUI_DESTROY_MAIN_WINDOW = 34,
     COMPAT_GUI_DEFAULT_MAIN_WIN_PROC = 35,
+    COMPAT_GUI_UPDATE_WINDOW = 37,
     COMPAT_GUI_INVALIDATE_RECT = 56,
+    COMPAT_GUI_BEGIN_PAINT = 57,
+    COMPAT_GUI_END_PAINT = 58,
     COMPAT_GUI_CLIENT_TO_SCREEN = 61,
     COMPAT_GUI_SHOW_WINDOW = 77,
     COMPAT_GUI_MAIN_WINDOW_CLEANUP = 95,
@@ -63,6 +67,7 @@ enum compat_gui_slot {
     COMPAT_GUI_POINT_IN_RECT = 283,
     COMPAT_GUI_CREATE_LOG_FONT = 292,
     COMPAT_GUI_DESTROY_LOG_FONT = 294,
+    COMPAT_GUI_SELECT_FONT = 298,
     COMPAT_GUI_TEXT_OUT_LEN = 316,
     COMPAT_GUI_DRAW_TEXT_EX = 318,
     COMPAT_GUI_PUT_IMAGE_AREA = 336,
@@ -79,10 +84,31 @@ enum compat_gui_slot {
     COMPAT_GUI_DRAW_ASCII = 360,
     COMPAT_GUI_DRAW_HZ = 361,
     COMPAT_GUI_PRINT_STRING = 362,
+    COMPAT_GUI_CLEAR_RECT = 364,
     COMPAT_GUI_SHOW_STATUS_AND_DESKTOP = 388,
+    COMPAT_GUI_REVERSE_RECT = 390,
     COMPAT_GUI_GET_BACKGROUND_PLAY_STATE = 392,
+    COMPAT_GUI_MUSIC_VOLUME_SET = 403,
+    COMPAT_GUI_MUSIC_VOLUME_GET = 404,
+    COMPAT_GUI_SPEECH_OUTPUT_SET = 405,
+    COMPAT_GUI_SPEECH_OUTPUT_GET = 406,
+    COMPAT_GUI_MUSIC_OUTPUT_SET = 407,
+    COMPAT_GUI_MUSIC_OUTPUT_GET = 408,
+    COMPAT_GUI_SCAN_GAME_COMBO_KEYS = 419,
+    COMPAT_GUI_RESET_AUTO_CLOSE_TIMER = 430,
+    COMPAT_GUI_RESET_AUTO_CLOSE_LCD = 431,
+    COMPAT_GUI_RESET_AUTO_CLOSE_LED = 432,
+    COMPAT_GUI_GET_SCREEN_WIDTH = 437,
+    COMPAT_GUI_GET_SCREEN_HEIGHT = 438,
+    COMPAT_GUI_SET_LANDSCAPE = 439,
+    COMPAT_GUI_GET_LANDSCAPE = 440,
     COMPAT_GUI_HELP2 = 448,
-    COMPAT_GUI_TRACE_INIT = 449
+    COMPAT_GUI_TRACE_INIT = 449,
+    COMPAT_GUI_ATTACH_ENABLE = 455,
+    COMPAT_GUI_GET_BACKLIGHT_STATUS = 456,
+    COMPAT_GUI_IS_SYSTEM_LOW_POWER = 457,
+    COMPAT_GUI_LED = 459,
+    COMPAT_GUI_DISPLAY_BACKLIGHT_STATUS = 460
 };
 
 enum compat_listbox_message {
@@ -118,13 +144,18 @@ enum compat_gui_scancode {
     COMPAT_SCANCODE_DOWN = 108
 };
 
+#define COMPAT_KEYSTATE_LEFT_BUTTON 0x00001000u
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
 #define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
-#define COMPAT_GUI_TIMER_TICK_MS 10u
-
 static inline unsigned compat_gui_timer_interval_ms(unsigned speed)
 {
-    return (speed ? speed : 1u) * COMPAT_GUI_TIMER_TICK_MS;
+    /*
+     * The original guiExt.h defines GUI_TIMER_TICK=25 and
+     * TIME_MS(ms)=ms*10/GUI_TIMER_TICK. Therefore one SetTimer "speed"
+     * unit is 25/10 ms (2.5 ms). Round up so a nonzero legacy period
+     * never collapses to zero milliseconds.
+     */
+    return (((speed ? speed : 1u) * 25u) + 9u) / 10u;
 }
 
 static inline unsigned compat_gui_packed_2bpp_stride(unsigned width)
@@ -164,7 +195,8 @@ static inline unsigned compat_gui_image_payload_offset(
 
     return compat_gui_packed_2bpp_stride(header_width) ==
                compat_gui_packed_2bpp_stride(width) &&
-           header_height == height &&
+           height >= header_height &&
+           height <= header_height + 3u &&
            payload_size >= minimum_payload_size
         ? COMPAT_GUI_IMAGE_HEADER_SIZE : 0u;
 }

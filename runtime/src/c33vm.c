@@ -1,4 +1,5 @@
 #include "../include/c33vm.h"
+#include "../include/c33jit.h"
 
 static void clear_bytes(void *ptr, size_t size)
 {
@@ -366,6 +367,7 @@ void c33_vm_reset(c33_vm_t *vm, uint32_t entry,
     vm->fault_pc = 0;
     vm->fault_address = 0;
     vm->fault_opcode = 0;
+    vm->jit_value = 0;
     vm->instructions = 0;
 }
 
@@ -907,7 +909,15 @@ stack_fault:
 
 c33_vm_status_t c33_vm_run(c33_vm_t *vm, uint32_t budget)
 {
-    while (budget--) {
+    while (budget) {
+        uint32_t native_count = c33_jit_run_block(vm, budget);
+        if (native_count) {
+            budget -= native_count;
+            continue;
+        }
+        c33_jit_note_fallback(vm);
+        --budget;
+        {
         c33_vm_status_t status = c33_vm_step(vm);
         if (status == C33_VM_DONE && vm->callback_depth) {
             c33_vm_callback_t *callback =
@@ -929,6 +939,7 @@ c33_vm_status_t c33_vm_run(c33_vm_t *vm, uint32_t budget)
         if (status != C33_VM_OK) {
             return status;
         }
+        }
     }
     return C33_VM_YIELD;
 }
@@ -943,7 +954,11 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     uint32_t resume_sp;
     c33_vm_status_t status;
 
-    if (!vm || !budget || (target & 1u)) {
+    if (!vm || !budget) {
+        return C33_VM_FAULT;
+    }
+    if (target & 1u) {
+        vm->fault_address = target;
         return C33_VM_FAULT;
     }
     resume_pc = vm->pc;
@@ -961,7 +976,15 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     vm->regs[8] = arg2;
     vm->regs[9] = arg3;
     vm->ext_count = 0;
-    while (budget--) {
+    status = C33_VM_OK;
+    while (budget) {
+        uint32_t native_count = c33_jit_run_block(vm, budget);
+        if (native_count) {
+            budget -= native_count;
+            continue;
+        }
+        c33_jit_note_fallback(vm);
+        --budget;
         status = c33_vm_step(vm);
         if (status != C33_VM_OK) {
             break;
@@ -976,9 +999,12 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
      * original stack position. The outer hostcall still has its own guest
      * return address below this boundary.
      */
-    if (status == C33_VM_DONE && vm->sp == resume_sp) {
-        vm->pc = resume_pc;
-        return C33_VM_OK;
+    if (status == C33_VM_DONE) {
+        if (vm->sp == resume_sp) {
+            vm->pc = resume_pc;
+            return C33_VM_OK;
+        }
+        vm->fault_address = vm->sp;
     }
     if (status == C33_VM_YIELD) {
         c33_vm_callback_t *callback;

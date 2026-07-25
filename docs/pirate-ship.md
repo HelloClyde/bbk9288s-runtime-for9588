@@ -39,9 +39,9 @@ not game content. The title/board artwork is embedded in the program image.
 - GUI timer calls and tick count.
 - Packed 2bpp drawing, virtual-screen blit, text, lines, and rectangles.
 - Four-level grayscale conversion to the 9588 RGB565 framebuffer.
-- Direct QEMU 9588 key-event translation for direction, confirm, and exit.
-- Direct QEMU touch-state translation to 9288S `MSG_LBUTTONDOWN`,
-  `MSG_MOUSEMOVE`, and `MSG_LBUTTONUP` messages.
+- Native 9588 input-packet translation for direction, confirm, and exit.
+- Native raw touch-event and calibrated-coordinate translation to 9288S
+  `MSG_LBUTTONDOWN`, `MSG_MOUSEMOVE`, and `MSG_LBUTTONUP` messages.
 - Native 9588 Help Page for the original help text, plus a native message box
   for exit confirmation.
 - Clean 9288S main-window destruction and quit-message handling.
@@ -85,15 +85,16 @@ VM completion.
 
 ## 9588 emulator verification
 
-The native BDA opens the firmware EXE selector at startup and reads the selected
-D300 bytes from NAND. It maps the program at its original `0x02700000` address
-and executes it unchanged; no original game bytes are packaged in the BDA.
+The native BDA scans the private 9288S program directory, draws a launcher from
+each D300 file's embedded title and icon, and reads the selected D300 bytes
+from NAND. It maps the program at its original `0x02700000` address and
+executes it unchanged; no original game bytes are packaged in the BDA.
 
 Verified in the 9588 emulator:
 
-1. Launching the BDA opens the native 9588 `.exe` selector.
+1. Launching the BDA shows its own title/icon program list.
 2. Selecting 海盗船 loads it from NAND and reaches the original title image.
-3. The bottom touch `A` button enters the game board.
+3. The bottom touch `确认` button enters the game board.
 4. Repeated direction input changes game state without scanline corruption or
    stale movement trails.
 5. Tapping `帮助说明` opens the original help text.
@@ -103,16 +104,18 @@ Verified in the 9588 emulator:
    support touch selection and confirmation, and restore the board cleanly.
 8. All five 182-byte save files remain available after BDA rebuilds and
    emulator resets.
-9. `EXE` reopens the firmware selector, while `SET` swaps the virtual controls
+9. `EXE` returns to the program list, while `SET` swaps the virtual controls
    between left- and right-handed layouts.
 10. The VM remains in the guest `GetMessage` loop between inputs, with timer
    messages serviced by the host adapter.
 
-Because starting a BDA occurs inside the firmware's own event dispatch stack,
-calling the native GUI poller recursively is unsafe. This port reads the
-emulator's uncached diagnostic event mirror at `0xA9F00040` and writes its
-160×240 output unscaled at the top center of the rotated 240×320 scanout at
-`0xA1F82000`. Side and bottom pixels are used by compatibility controls.
+Like the GBA 9588 port, the active compatibility loop consumes the public
+raw-input stream at frame boundaries and does not run the Frame event pump at
+the same time. The event pump is used only during Frame teardown. RGB565
+output uses the guarded PS-for-9588 C200 direct framebuffer path, with the
+native Frame draw context retained only as a firmware-layout fallback; the 160×240 guest
+surface remains unscaled at the top center, with side and bottom pixels used
+by compatibility controls.
 
 `PutImageArea` receives a 16-byte SDK image object header followed by its
 packed 2bpp payload. Most full-screen images record width 160, height 240, and
@@ -127,20 +130,20 @@ a 4-byte row stride and a 52-byte payload, not a continuous 43-byte bitstream.
 Both the source byte and its two-bit shift restart at each row. This detail is
 what prevents moving cells from becoming skewed or leaving corrupted trails.
 
-Touch does not appear in the regular QEMU key queue. The LAN launcher enables
-the `touch-trace=on` machine option, and the BDA polls the uncached touch mirror
-at `0xA9F00100`. Raw SADC coordinates are converted to the centered 160×240
-guest surface before pointer messages are queued; touches in the side and
-bottom control regions become compatibility actions instead.
+Touch follows the same public SDK path as the GBA 9588 port. Raw events
+`8/12/11` track down, move, and release, while
+`bda_gui_touch_position()` supplies the latest calibrated 240×320 logical
+coordinates. Coordinates over the centered guest surface become 9288S pointer
+messages; touches in the side and bottom regions become compatibility actions.
 
 The original help action calls GUI slot 448, `Help2(hWnd, helpString)`.
 The adapter reads the zero-terminated GBK help text from guest memory and
 passes it to the public 9588 SDK call
 `bda_help_page(parent, title, body)`. This invokes firmware GUI slot `+0x5A8`,
 which owns the title bar, scrollable body, scrollbar, bottom return bar, and
-its modal message loop. The compatibility BDA has no native parent Frame, so
-it uses the SDK-verified `parent=0` form and restores the guest framebuffer
-after the Help Page closes.
+its modal message loop. The runtime releases its draw context before the
+modal call, then reactivates the Frame, reacquires drawing, and restores the
+guest surface after the Help Page closes.
 
 The guest `GetMessage` call yields when no message is available. Each empty
 poll performs only a one-unit firmware busy-wait, then reads the public SDK's

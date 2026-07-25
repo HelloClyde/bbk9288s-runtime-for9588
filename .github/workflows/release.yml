@@ -66,14 +66,14 @@ jobs:
         shell: pwsh
         run: |
           $env:PYTHONPATH = (Resolve-Path .\sdk).Path
-          python -m bda_packer.validate .\build\bbk9588\9288SCompat.bda
+          python -m bda_packer.validate .\build\bbk9588\9288S.bda
           if ($LASTEXITCODE -ne 0) {
             throw "BDA validation failed with exit code $LASTEXITCODE"
           }
           $hash = (Get-FileHash `
             -Algorithm SHA256 `
-            .\build\bbk9588\9288SCompat.bda).Hash.ToLowerInvariant()
-          "$hash *9288SCompat.bda" |
+            .\build\bbk9588\9288S.bda).Hash.ToLowerInvariant()
+          "$hash *9288S.bda" |
             Set-Content `
               .\build\bbk9588\SHA256SUMS.txt `
               -Encoding ascii
@@ -81,9 +81,9 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 9288SCompat-${{ github.ref_name }}
+          name: 9288S-${{ github.ref_name }}
           path: |
-            build/bbk9588/9288SCompat.bda
+            build/bbk9588/9288S.bda
             build/bbk9588/SHA256SUMS.txt
           if-no-files-found: error
 
@@ -97,12 +97,12 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag `
-              .\build\bbk9588\9288SCompat.bda `
+              .\build\bbk9588\9288S.bda `
               .\build\bbk9588\SHA256SUMS.txt `
               --clobber
           } else {
             gh release create $tag `
-              .\build\bbk9588\9288SCompat.bda `
+              .\build\bbk9588\9288S.bda `
               .\build\bbk9588\SHA256SUMS.txt `
               --title $tag `
               --generate-notes

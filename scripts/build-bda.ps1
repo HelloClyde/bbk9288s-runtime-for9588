@@ -14,8 +14,9 @@ $SdkRoot = [System.IO.Path]::GetFullPath($SdkRoot)
 $SdkHeader = Join-Path $SdkRoot "sdk\include\bda_dialogs.h"
 $ToolchainSetup = Join-Path $SdkRoot "scripts\setup_toolchain.ps1"
 $Source = Join-Path $ProjectRoot "ports\bbk9588\bda_main.c"
+$Icon = Join-Path $ProjectRoot "assets\9288s-runtime-icon.png"
 $OutputDir = Join-Path $ProjectRoot "build\bbk9588"
-$Output = Join-Path $OutputDir "9288SCompat.bda"
+$Output = Join-Path $OutputDir "9288S.bda"
 
 if (-not (Test-Path -LiteralPath $SdkHeader)) {
   throw @"
@@ -23,6 +24,9 @@ if (-not (Test-Path -LiteralPath $SdkHeader)) {
 Initialize the sdk submodule with:
   git submodule update --init sdk
 "@
+}
+if (-not (Test-Path -LiteralPath $Icon -PathType Leaf)) {
+  throw "Runtime icon not found: $Icon"
 }
 
 function Find-ToolchainPrefix {
@@ -79,8 +83,9 @@ try {
   & $Python `
     -m bda_packer `
     $Source `
-    --title "9288SCompat" `
+    --title "9288S" `
     --category 4 `
+    --icon-png $Icon `
     --prefix $ToolchainPrefix `
     -o $Output
   if ($LASTEXITCODE -ne 0) {
@@ -94,6 +99,6 @@ try {
   }
 }
 
-Write-Output "runtime: selectable 9288S D300 EXE"
+Write-Output "runtime: D300 launcher with title/icon program list"
 Write-Output "sdk: $SdkRoot"
 Write-Output "built: $Output"
