@@ -123,10 +123,10 @@ SDK 的其他嵌套子模块不是本项目的构建依赖，无需初始化。
 `sdk/.toolchain/` 目录。生成文件位于：
 
 ```text
-build/bbk9588/9288SCompat.bda
+build/bbk9588/9288S.bda
 ```
 
-将生成的 `9288SCompat.bda` 按普通 BDA 安装方式放入 9588，并把要运行的
+将生成的 `9288S.bda` 按普通 BDA 安装方式放入 9588，并把要运行的
 9288S D300 EXE 放入 `应用/数据/9288s/系统/程序`。启动 BDA 后会直接显示
 自绘程序列表；列表从每个有效 D300 文件读取标题和普通/选中图标，不再打开
 9588 文件选择对话框。
@@ -195,7 +195,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\probe-d300.ps1 `
 
 1. 运行 Python 测试及可移植 C 运行时测试；
 2. 检出固定版本的 `sdk` 子模块；
-3. 在 Windows 环境构建并校验 `9288SCompat.bda`；
+3. 在 Windows 环境构建并校验 `9288S.bda`；
 4. 上传 BDA 及 `SHA256SUMS.txt` 作为工作流产物；
 5. 创建或更新与 Tag 同名的 GitHub Release。
 
