@@ -360,21 +360,25 @@ static int test_gui_image_header(void)
     if (compat_gui_image_payload_offset(header, 80, 240, 4800) != 0u) {
         return 2;
     }
+    if (compat_gui_image_payload_offset(header, 160, 243, 9600) !=
+        COMPAT_GUI_IMAGE_HEADER_SIZE) {
+        return 3;
+    }
     if (compat_gui_image_payload_offset(
             padded_header, 160, 240, 9600
         ) != COMPAT_GUI_IMAGE_HEADER_SIZE) {
-        return 3;
+        return 4;
     }
     if (compat_gui_packed_2bpp_stride(13) != 4u ||
         compat_gui_packed_2bpp_payload_size(13, 13) != 52u ||
         compat_gui_packed_2bpp_shift(0) != 6u ||
         compat_gui_packed_2bpp_shift(3) != 0u ||
         compat_gui_packed_2bpp_shift(4) != 6u) {
-        return 4;
+        return 5;
     }
     if (compat_gui_timer_interval_ms(20) != 200u ||
         compat_gui_timer_interval_ms(0) != 10u) {
-        return 5;
+        return 6;
     }
     return 0;
 }

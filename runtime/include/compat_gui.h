@@ -188,7 +188,8 @@ static inline unsigned compat_gui_image_payload_offset(
 
     return compat_gui_packed_2bpp_stride(header_width) ==
                compat_gui_packed_2bpp_stride(width) &&
-           header_height == height &&
+           height >= header_height &&
+           height <= header_height + 3u &&
            payload_size >= minimum_payload_size
         ? COMPAT_GUI_IMAGE_HEADER_SIZE : 0u;
 }

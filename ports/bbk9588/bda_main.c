@@ -1432,7 +1432,8 @@ static int draw_packed_2bpp(
                 width == header_width + 1u) &&
                (height == header_height ||
                 height + 1u == header_height ||
-                height == header_height + 1u))) ||
+                (height >= header_height &&
+                 height <= header_height + 3u)))) ||
              !width || !height ||
              width > GUEST_SCREEN_W ||
              height > GUEST_SCREEN_H)) {
@@ -3808,16 +3809,13 @@ static c33_vm_status_t dispatch_9588(
             s32 x0 = (s32)vm->regs[7];
             s32 y0 = (s32)vm->regs[8];
             s32 x1 = (s32)vm->regs[9];
-            s32 y;
-            s32 x;
             if (!guest_read_u32(vm, vm->sp + 4u, &y1)) {
                 return C33_VM_FAULT;
             }
-            for (y = y0; y <= (s32)y1; ++y) {
-                for (x = x0; x <= x1; ++x) {
-                    put_guest_pixel(state, x, y, state->brush_color);
-                }
-            }
+            /*
+             * 9288S Rectangle draws the outline.  Games use FillBox for a
+             * filled region; filling here erases the Five-in-a-row menu text.
+             */
             draw_line(state, x0, y0, x1, y0, state->pen_color);
             draw_line(state, x1, y0, x1, (s32)y1, state->pen_color);
             draw_line(state, x1, (s32)y1, x0, (s32)y1, state->pen_color);
