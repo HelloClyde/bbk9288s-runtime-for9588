@@ -112,7 +112,8 @@ Verified in the 9588 emulator:
 Like the GBA 9588 port, the active compatibility loop consumes the public
 raw-input stream at frame boundaries and does not run the Frame event pump at
 the same time. The event pump is used only during Frame teardown. RGB565
-output is submitted through a native Frame draw context; the 160×240 guest
+output uses the guarded PS-for-9588 C200 direct framebuffer path, with the
+native Frame draw context retained only as a firmware-layout fallback; the 160×240 guest
 surface remains unscaled at the top center, with side and bottom pixels used
 by compatibility controls.
 

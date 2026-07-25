@@ -28,7 +28,15 @@
     (FULLSCREEN_W - FULLSCREEN_FLOAT_W - 8)
 #define FULLSCREEN_FLOAT_DEFAULT_Y 8
 #define FULLSCREEN_DRAG_THRESHOLD 3
-#define RAW_EVENT_MAX_PER_POLL 16u
+#define C200_GUI_SCREEN_BUFFER 0x6b0u
+#define C200_GUI_SCREEN_ORIENTATION 0x738u
+#define C200_FRAMEBUFFER_PHYS 0x01f82000u
+#define MIPS_PHYS_MASK 0x1fffffffu
+#define MIPS_SEGMENT_MASK 0xe0000000u
+#define MIPS_KSEG0_BASE 0x80000000u
+#define MIPS_KSEG1_BASE 0xa0000000u
+#define RAW_EVENT_MAX_PER_POLL 8u
+#define COMPAT_LOG_VERBOSE 0
 
 #define GUEST_IRAM_SIZE  0x00004000u
 #define GUEST_API_BASE   0x02000000u
@@ -155,7 +163,6 @@ typedef struct compat_9588_state {
     bda_handle_t native_draw_owner;
     void *native_draw_object;
     bda_gui_picture_t native_picture;
-    bda_gui_message_t native_message;
     int native_frame_detached;
     int native_redraw;
     u32 raw_event_count;
@@ -230,6 +237,14 @@ static bda_handle_t g_native_shared_draw_owner
     __attribute__((section(".data"))) = 0;
 static void *g_native_shared_draw_object
     __attribute__((section(".data"))) = 0;
+static volatile u16 *g_native_direct_framebuffer
+    __attribute__((section(".data"))) = 0;
+static int g_native_direct_framebuffer_rotate_180
+    __attribute__((section(".data"))) = 0;
+static int g_native_direct_framebuffer_initialized
+    __attribute__((section(".data"))) = 0;
+static int g_compat_log_file
+    __attribute__((section(".data"))) = -1;
 
 static int allocation_failed(const void *pointer)
 {
@@ -263,26 +278,78 @@ static u32 native_text_length(const char *text)
     return length;
 }
 
+static int native_text_equal(
+    const char *left,
+    const char *right
+)
+{
+    if (!left || !right) {
+        return left == right;
+    }
+    while (*left && *right && *left == *right) {
+        ++left;
+        ++right;
+    }
+    return *left == *right;
+}
+
+static int native_text_starts_with(
+    const char *text,
+    const char *prefix
+)
+{
+    if (!text || !prefix) {
+        return 0;
+    }
+    while (*prefix && *text == *prefix) {
+        ++text;
+        ++prefix;
+    }
+    return *prefix == 0;
+}
+
+static int compat_log_event_is_verbose(const char *event)
+{
+    return native_text_equal(event, "SELECTOR_ALLOC") ||
+           native_text_starts_with(event, "SELECTOR_META_") ||
+           native_text_starts_with(event, "SELECTOR_FIND") ||
+           native_text_equal(event, "SELECTOR_SCAN_ITEM") ||
+           native_text_equal(event, "SELECTOR_DRAW_BEGIN") ||
+           native_text_equal(event, "SELECTOR_PRESENT_BEGIN") ||
+           native_text_equal(event, "SELECTOR_PRESENT_END") ||
+           native_text_equal(event, "SELECTOR_READY") ||
+           native_text_equal(event, "SELECTOR_KEY") ||
+           native_text_equal(event, "SELECTOR_TOUCH");
+}
+
+static void compat_log_close(void)
+{
+    if (bda_fs_file_is_valid(g_compat_log_file)) {
+        (void)bda_fs_close_raw(g_compat_log_file);
+    }
+    g_compat_log_file = -1;
+}
+
 static void compat_log_write(const char *text, int truncate)
 {
-    int file = bda_fs_fopen_raw(
-        COMPAT_LOG_PATH, truncate ? "wb" : "rb+"
-    );
     u32 length;
-    if (!bda_fs_file_is_valid(file) && !truncate) {
-        file = bda_fs_fopen_raw(COMPAT_LOG_PATH, "wb");
+    if (truncate) {
+        compat_log_close();
     }
-    if (!bda_fs_file_is_valid(file)) {
+    if (!bda_fs_file_is_valid(g_compat_log_file)) {
+        g_compat_log_file = bda_fs_fopen_raw(
+            COMPAT_LOG_PATH, truncate ? "wb" : "ab"
+        );
+    }
+    if (!bda_fs_file_is_valid(g_compat_log_file)) {
         return;
-    }
-    if (!truncate) {
-        (void)bda_fs_seek_raw(file, 0, BDA_SEEK_END);
     }
     length = native_text_length(text);
     if (length) {
-        (void)bda_fs_fwrite_raw(text, 1u, length, file);
+        (void)bda_fs_fwrite_raw(
+            text, 1u, length, g_compat_log_file
+        );
     }
-    (void)bda_fs_close_raw(file);
 }
 
 static void compat_log_record(
@@ -297,6 +364,11 @@ static void compat_log_record(
     char line[256];
     char *out = line;
     char *end = line + sizeof(line);
+#if !COMPAT_LOG_VERBOSE
+    if (compat_log_event_is_verbose(event)) {
+        return;
+    }
+#endif
     append_text(&out, end, "T=");
     append_hex(&out, end, bda_gui_tick_count_25ms());
     append_text(&out, end, " ");
@@ -1540,6 +1612,124 @@ static int acquire_native_draw_context(
     return 1;
 }
 
+typedef u32 compat_alias_u32 __attribute__((__may_alias__));
+
+static int native_gui_pointer_valid(const void *pointer)
+{
+    u32 address = (u32)pointer;
+    return pointer != 0 && address != 0xffffffffu;
+}
+
+static void *native_gui_call_pointer0(u32 offset)
+{
+    typedef void *(*function_t)(void);
+    void *table = bda_sdk_internal_gui();
+    void *function;
+    if (!native_gui_pointer_valid(table)) {
+        return 0;
+    }
+    function = bda_sdk_internal_api(table, offset);
+    if (!native_gui_pointer_valid(function)) {
+        return 0;
+    }
+    return ((function_t)function)();
+}
+
+static u32 native_gui_call_u32_0(u32 offset, u32 fallback)
+{
+    typedef u32 (*function_t)(void);
+    void *table = bda_sdk_internal_gui();
+    void *function;
+    if (!native_gui_pointer_valid(table)) {
+        return fallback;
+    }
+    function = bda_sdk_internal_api(table, offset);
+    if (!native_gui_pointer_valid(function)) {
+        return fallback;
+    }
+    return ((function_t)function)();
+}
+
+static void initialize_native_direct_framebuffer(void)
+{
+    void *candidate;
+    u32 address;
+    u32 segment;
+    u32 physical;
+    u32 orientation;
+    if (g_native_direct_framebuffer_initialized) {
+        return;
+    }
+    g_native_direct_framebuffer_initialized = 1;
+    candidate = native_gui_call_pointer0(C200_GUI_SCREEN_BUFFER);
+    address = (u32)candidate;
+    segment = address & MIPS_SEGMENT_MASK;
+    physical = address & MIPS_PHYS_MASK;
+    orientation = native_gui_call_u32_0(
+        C200_GUI_SCREEN_ORIENTATION, 0xffffffffu
+    );
+    g_native_direct_framebuffer = 0;
+    g_native_direct_framebuffer_rotate_180 = 0;
+    if ((segment != MIPS_KSEG0_BASE &&
+         segment != MIPS_KSEG1_BASE) ||
+        physical != C200_FRAMEBUFFER_PHYS ||
+        (orientation != 0x130u && orientation != 0x131u)) {
+        compat_log_record(
+            "VIDEO_DIRECT_REJECTED",
+            0,
+            address,
+            physical,
+            orientation,
+            segment
+        );
+        return;
+    }
+    g_native_direct_framebuffer =
+        (volatile u16 *)(MIPS_KSEG1_BASE | physical);
+    g_native_direct_framebuffer_rotate_180 =
+        orientation != 0x131u;
+    compat_log_record(
+        "VIDEO_DIRECT_READY",
+        0,
+        (u32)g_native_direct_framebuffer,
+        physical,
+        orientation,
+        (u32)g_native_direct_framebuffer_rotate_180
+    );
+}
+
+static int submit_native_direct_framebuffer(
+    const u16 *pixels
+)
+{
+    const compat_alias_u32 *source;
+    volatile compat_alias_u32 *destination;
+    u32 remaining = SCREEN_W * SCREEN_H / 2u;
+    if (!pixels || !g_native_direct_framebuffer) {
+        return 0;
+    }
+    source = (const compat_alias_u32 *)pixels;
+    destination =
+        (volatile compat_alias_u32 *)g_native_direct_framebuffer;
+    if (!g_native_direct_framebuffer_rotate_180) {
+        while (remaining != 0u) {
+            *destination++ = *source++;
+            --remaining;
+        }
+    } else {
+        source += SCREEN_W * SCREEN_H / 2u;
+        while (remaining != 0u) {
+            u32 pair = *--source;
+            *destination++ = (pair << 16) | (pair >> 16);
+            --remaining;
+        }
+    }
+#if defined(__mips__)
+    __asm__ volatile("sync" ::: "memory");
+#endif
+    return 1;
+}
+
 static void put_fullscreen_pixel(
     compat_9588_state_t *state,
     s32 x,
@@ -1803,20 +1993,26 @@ static int present_native_framebuffer(
     u16 *present_pixels;
     void *old_object;
     int draw_result;
-    if (!state || !state->framebuffer ||
-        !state->native_draw ||
-        !state->native_draw_object) {
+    if (!state || !state->framebuffer) {
         return 0;
     }
-    /*
-     * Match the proven gba-for9588 path: render the complete RGB565 frame
-     * straight into the Frame draw context.  A compatible-context copy
-     * loses rapidly changing guest regions on both the emulator and device.
-     */
     present_pixels =
         state->fullscreen_mode && state->fullscreen_buffer
             ? state->fullscreen_buffer
             : state->framebuffer;
+    if (submit_native_direct_framebuffer(present_pixels)) {
+        state->native_redraw = 0;
+        g_diagnostic[8] = 0u;
+        g_diagnostic[9] = 1u;
+        g_diagnostic[10] += 1u;
+        return 1;
+    }
+    if (!state->native_draw || !state->native_draw_object) {
+        return 0;
+    }
+    /*
+     * Guarded firmware fallback for an unknown C200 framebuffer layout.
+     */
     state->native_picture.source_pixels = present_pixels;
     (void)bda_gui_draw_guard_begin();
     old_object = bda_gui_select_draw_object(
@@ -3573,6 +3769,11 @@ static int native_input_window_proc(
     u32 lparam
 )
 {
+    /*
+     * Lifecycle callback only. Active input is never dispatched through
+     * Frame messages; it is polled from the GBA-style raw touch stream and
+     * six-byte input packet.
+     */
     compat_9588_state_t *state = g_native_input_state;
     if (state && message == BDA_MSG_DRAW_CONTEXT_ATTACH) {
         state->native_frame = handle;
@@ -3607,9 +3808,6 @@ static int native_input_open(compat_9588_state_t *state)
         return 0;
     }
     bda_memset(&descriptor, 0, sizeof(descriptor));
-    bda_memset(
-        &state->native_message, 0, sizeof(state->native_message)
-    );
     state->native_frame_detached = 0;
     state->native_redraw = 1;
     state->hardware_events_ready = 0;
@@ -3654,6 +3852,7 @@ static int native_input_open(compat_9588_state_t *state)
         g_native_shared_draw = state->native_draw;
         g_native_shared_draw_owner = state->native_draw_owner;
         g_native_shared_draw_object = state->native_draw_object;
+        initialize_native_direct_framebuffer();
         return 1;
     }
 
@@ -3694,6 +3893,7 @@ static int native_input_open(compat_9588_state_t *state)
     g_native_shared_draw = state->native_draw;
     g_native_shared_draw_owner = state->native_draw_owner;
     g_native_shared_draw_object = state->native_draw_object;
+    initialize_native_direct_framebuffer();
     return 1;
 }
 
@@ -3724,6 +3924,9 @@ static void native_input_shutdown(void)
     u32 wait;
     if (!g_native_shared_frame ||
         (s32)g_native_shared_frame == -1) {
+        g_native_direct_framebuffer = 0;
+        g_native_direct_framebuffer_rotate_180 = 0;
+        g_native_direct_framebuffer_initialized = 0;
         return;
     }
     g_native_input_state = 0;
@@ -3747,6 +3950,9 @@ static void native_input_shutdown(void)
     g_native_shared_draw = 0;
     g_native_shared_draw_owner = 0;
     g_native_shared_draw_object = 0;
+    g_native_direct_framebuffer = 0;
+    g_native_direct_framebuffer_rotate_180 = 0;
+    g_native_direct_framebuffer_initialized = 0;
 }
 
 static void filter_native_touch_escape(
@@ -5607,8 +5813,8 @@ static c33_vm_status_t dispatch_9588(
                    bda_gui_raw_event_fetch(&event) >= 0) {
                 ++drained;
             }
-    state->hardware_events_ready = 0;
-    state->touch_down = 0;
+            state->hardware_events_ready = 0;
+            state->touch_down = 0;
             state->touch_region = 0u;
             state->touch_escape_suppressed = 0;
             state->native_escape_pending = 0;
@@ -5937,7 +6143,60 @@ static int read_program_metadata(program_entry_t *entry)
     return 1;
 }
 
+static void draw_program_loading(
+    compat_9588_state_t *state,
+    u32 scanned,
+    u32 accepted
+)
+{
+    char scanned_text[3];
+    char accepted_text[3];
+    u32 segment;
+    scanned_text[0] = (char)('0' + (scanned / 10u) % 10u);
+    scanned_text[1] = (char)('0' + scanned % 10u);
+    scanned_text[2] = 0;
+    accepted_text[0] = (char)('0' + (accepted / 10u) % 10u);
+    accepted_text[1] = (char)('0' + accepted % 10u);
+    accepted_text[2] = 0;
+
+    fill_framebuffer(state, 0xef7du);
+    fill_panel_rect(state, 0, 0, SCREEN_W, 34u, 0x18c3u);
+    draw_panel_text(state, 10, 13, "9288S", 0xffffu);
+    fill_panel_rounded_rect(
+        state, 28, 92, 184u, 126u, 8u, 0xffffu
+    );
+    draw_panel_text(state, 99, 119, "LOADING", 0x18c3u);
+    fill_panel_rect(state, 42, 151, 156u, 14u, 0x7befu);
+    for (segment = 0u; segment < 12u; ++segment) {
+        if (segment < scanned && segment < 12u) {
+            fill_panel_rect(
+                state,
+                45 + (s32)segment * 13,
+                154,
+                10u,
+                8u,
+                0x2697u
+            );
+        }
+    }
+    draw_panel_text(state, 66, 182, "SCAN", 0x4208u);
+    draw_panel_text(state, 96, 182, scanned_text, 0x18c3u);
+    draw_panel_text(state, 126, 182, "OK", 0x4208u);
+    draw_panel_text(state, 144, 182, accepted_text, 0x18c3u);
+}
+
+static void present_program_loading(
+    compat_9588_state_t *state,
+    u32 scanned,
+    u32 accepted
+)
+{
+    draw_program_loading(state, scanned, accepted);
+    (void)present_native_framebuffer(state);
+}
+
 static u32 load_program_entries(
+    compat_9588_state_t *state,
     program_entry_t *entries,
     u32 capacity
 )
@@ -5946,6 +6205,7 @@ static u32 load_program_entries(
     int result;
     int find_open;
     u32 count = 0u;
+    u32 scanned = 0u;
     bda_fs_find_data_init(&find_data);
     compat_log_record(
         "SELECTOR_FINDFIRST_BEGIN",
@@ -5994,6 +6254,8 @@ static u32 load_program_entries(
         if (metadata_ok) {
             ++count;
         }
+        ++scanned;
+        present_program_loading(state, scanned, count);
         compat_log_record(
             "SELECTOR_FINDNEXT_BEGIN",
             entry->file_name,
@@ -6334,6 +6596,7 @@ static int select_9288s_program(
     u32 selected = 0u;
     u32 heartbeat_tick;
     u32 selector_open_tick;
+    u32 scan_start_tick;
     int input_armed = 0;
     int dirty = 1;
     int result = 0;
@@ -6363,23 +6626,6 @@ static int select_9288s_program(
     bda_memset(state, 0, sizeof(*state));
     state->framebuffer = framebuffer;
     state->hzk_file = -1;
-    compat_log_record(
-        "SELECTOR_SCAN_BEGIN",
-        0,
-        sizeof(*state),
-        SCREEN_W * SCREEN_H * sizeof(u16),
-        PROGRAM_MAX_ENTRIES,
-        0u
-    );
-    count = load_program_entries(entries, PROGRAM_MAX_ENTRIES);
-    compat_log_record(
-        "SELECTOR_SCAN_END",
-        0,
-        count,
-        0u,
-        0u,
-        0u
-    );
     if (!native_input_open(state)) {
         compat_log_record(
             "SELECTOR_FRAME_FAILED",
@@ -6404,8 +6650,29 @@ static int select_9288s_program(
         0,
         (u32)state->native_frame,
         (u32)state->native_draw,
-        0u,
+        (u32)g_native_direct_framebuffer,
         (u32)state->native_draw_object
+    );
+    present_program_loading(state, 0u, 0u);
+    scan_start_tick = bda_gui_tick_count_25ms();
+    compat_log_record(
+        "SELECTOR_SCAN_BEGIN",
+        0,
+        sizeof(*state),
+        SCREEN_W * SCREEN_H * sizeof(u16),
+        PROGRAM_MAX_ENTRIES,
+        0u
+    );
+    count = load_program_entries(
+        state, entries, PROGRAM_MAX_ENTRIES
+    );
+    compat_log_record(
+        "SELECTOR_SCAN_END",
+        0,
+        count,
+        bda_gui_tick_count_25ms() - scan_start_tick,
+        0u,
+        0u
     );
     heartbeat_tick = bda_gui_tick_count_25ms();
     selector_open_tick = heartbeat_tick;
@@ -6591,8 +6858,9 @@ static int select_9288s_program(
                 entries, 0,
                 sizeof(*entries) * PROGRAM_MAX_ENTRIES
             );
+            present_program_loading(state, 0u, 0u);
             count = load_program_entries(
-                entries, PROGRAM_MAX_ENTRIES
+                state, entries, PROGRAM_MAX_ENTRIES
             );
             selected = 0u;
             dirty = 1;
@@ -7168,7 +7436,7 @@ int bda_main(void)
     }
     ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
     compat_log_write(
-        "9288S compatibility real-device log v10\r\n", 1
+        "9288S compatibility real-device log v11\r\n", 1
     );
     compat_log_record(
         "BDA_START",
@@ -7180,7 +7448,7 @@ int bda_main(void)
     );
     compat_log_record(
         "INPUT_ARCH",
-        "GBA raw touch + input packet",
+        "GBA raw touch + input packet; Frame pump shutdown only",
         RAW_EVENT_MAX_PER_POLL,
         0u,
         0u,
@@ -7212,6 +7480,7 @@ int bda_main(void)
         "BDA_END", 0, (u32)run_result, (u32)reselect, 0u, 0u
     );
     native_input_shutdown();
+    compat_log_close();
     bda_free(selected_path);
     return run_result;
 }

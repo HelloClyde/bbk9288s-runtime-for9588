@@ -15,12 +15,16 @@ The current 9588 host adapter provides:
 - side EXE/settings buttons, a centered direction pad, and 取消/确认 actions;
 - row-aligned packed 2bpp image decoding;
 - a persistent 9288S GUI message loop and timer;
-- native Frame presentation through the public 9588 drawing APIs, including
-  aspect-preserving bilinear RGB565 213x320 portrait fullscreen scaling
-  for the 160x240 guest surface;
+- guarded direct writes to the C200 240x320 RGB565 LCD framebuffer, using
+  the PS-for-9588 validation/orientation path and retaining firmware
+  RenderPicture only as a safety fallback;
+- aspect-preserving bilinear RGB565 213x320 portrait fullscreen scaling for
+  the 160x240 guest surface;
 - physical direction/confirm/exit input through the six-byte input packet;
-- touch down, move, and up translation through the public raw-input stream
-  and calibrated logical-coordinate API, matching the GBA 9588 port;
+- touch down, coalesced move, and up translation through the public raw-input
+  stream and calibrated logical-coordinate API, matching the GBA 9588 port;
+- no active Frame event pump for input; the Frame pump is used only during
+  final detach;
 - the public SDK's firmware Help Page, confirmation, window-destruction, and
   clean-exit handling;
 - nested save/load window emulation with resumable guest callbacks;
