@@ -10,20 +10,11 @@
 #define SCREEN_H         320
 #define GUEST_SCREEN_W   160
 #define GUEST_SCREEN_H   240
-#define PHYSICAL_SCREEN_W 240
-#define PHYSICAL_SCREEN_H 320
 #define GAME_VIEW_W      160
 #define GAME_VIEW_H      240
 #define GAME_VIEW_X      ((SCREEN_W - GAME_VIEW_W) / 2)
 #define BOTTOM_BAR_TOP   GAME_VIEW_H
-#define QEMU_FRAMEBUFFER  0xa1f82000u
-#define QEMU_EVENT_QUEUE  0xa9f00040u
-#define QEMU_EVENT_MAGIC  0x514b4242u
-#define QEMU_EVENT_SLOTS  8u
-#define QEMU_EVENT_WORDS  5u
-#define QEMU_EVENT_KIND_KEY 1u
-#define QEMU_TOUCH_TRACE  0xa9f00100u
-#define QEMU_TOUCH_MAGIC  0x54434b42u
+#define RAW_EVENT_MAX_PER_POLL 16u
 
 #define GUEST_IRAM_SIZE  0x00004000u
 #define GUEST_API_BASE   0x02000000u
@@ -123,14 +114,25 @@ typedef struct compat_9588_state {
     u32 event_read;
     u32 event_write;
     u32 event_count;
-    u32 hardware_event_cursor;
     int hardware_events_ready;
-    int touch_ready;
     int touch_down;
     int touch_captured;
     u32 touch_x;
     u32 touch_y;
     u32 touch_region;
+    int touch_escape_suppressed;
+    int native_escape_pending;
+    bda_handle_t native_frame;
+    bda_handle_t native_draw;
+    bda_handle_t native_draw_owner;
+    bda_handle_t native_back;
+    void *native_draw_object;
+    bda_gui_picture_t native_picture;
+    bda_gui_message_t native_message;
+    int native_frame_detached;
+    int native_redraw;
+    u32 raw_event_count;
+    u32 raw_touch_count;
     u32 virtual_action;
     u8 combo_keys[6];
     int controls_left;
@@ -179,6 +181,9 @@ static volatile u32 g_diagnostic[16] = {
     0x44473932u, 0x13579bdfu, 0x2468ace0u,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
+
+static compat_9588_state_t *g_native_input_state
+    __attribute__((section(".data"))) = 0;
 
 static int allocation_failed(const void *pointer)
 {
@@ -1285,22 +1290,128 @@ static void render_listbox_selection(compat_9588_state_t *state)
     state->listbox_drawn_caret = state->listbox_caret;
 }
 
-static void present_raw_framebuffer(compat_9588_state_t *state)
+static void release_native_draw_context(
+    compat_9588_state_t *state
+)
 {
-    volatile u16 *output = (volatile u16 *)QEMU_FRAMEBUFFER;
-    u32 x;
-    u32 y;
-    if (!state->framebuffer) {
+    bda_handle_t draw;
+    if (!state) {
         return;
     }
-    for (y = 0; y < PHYSICAL_SCREEN_H; ++y) {
-        for (x = 0; x < PHYSICAL_SCREEN_W; ++x) {
-            u32 output_x = PHYSICAL_SCREEN_W - 1u - x;
-            u32 output_y = PHYSICAL_SCREEN_H - 1u - y;
-            output[output_y * PHYSICAL_SCREEN_W + output_x] =
-                state->framebuffer[y * SCREEN_W + x];
-        }
+    draw = state->native_draw;
+    if (state->native_back &&
+        (s32)state->native_back != -1) {
+        bda_gui_compatible_context_free(state->native_back);
     }
+    state->native_back = 0;
+    state->native_draw = 0;
+    state->native_draw_owner = 0;
+    if (draw && (s32)draw != -1) {
+        bda_gui_end_draw(draw);
+    }
+}
+
+static int acquire_native_draw_context(
+    compat_9588_state_t *state,
+    bda_handle_t owner
+)
+{
+    if (!state || !owner || (s32)owner == -1) {
+        return 0;
+    }
+    if (state->native_draw &&
+        state->native_draw_owner == owner) {
+        if (state->native_back &&
+            (s32)state->native_back != -1) {
+            return 1;
+        }
+        state->native_back =
+            bda_gui_compatible_context_create(
+                state->native_draw
+            );
+        return state->native_back &&
+            (s32)state->native_back != -1;
+    }
+    release_native_draw_context(state);
+    state->native_draw = bda_gui_current_draw(owner);
+    if (!state->native_draw ||
+        (s32)state->native_draw == -1) {
+        state->native_draw = 0;
+        return 0;
+    }
+    state->native_draw_owner = owner;
+    state->native_back =
+        bda_gui_compatible_context_create(state->native_draw);
+    if (!state->native_back ||
+        (s32)state->native_back == -1) {
+        state->native_back = 0;
+        bda_gui_end_draw(state->native_draw);
+        state->native_draw = 0;
+        state->native_draw_owner = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int present_native_framebuffer(
+    compat_9588_state_t *state
+)
+{
+    void *old_object;
+    int draw_result;
+    int copy_result;
+    if (!state || !state->framebuffer ||
+        !state->native_draw ||
+        !state->native_back ||
+        !state->native_draw_object) {
+        return 0;
+    }
+    state->native_picture.source_pixels = state->framebuffer;
+    old_object = bda_gui_select_draw_object(
+        state->native_back, state->native_draw_object
+    );
+    draw_result = bda_gui_render_picture(
+        state->native_back,
+        0,
+        0,
+        SCREEN_W,
+        SCREEN_H,
+        &state->native_picture
+    );
+    (void)bda_gui_select_draw_object(
+        state->native_back, old_object
+    );
+    g_diagnostic[8] = (u32)draw_result;
+    if (draw_result != 0) {
+        g_diagnostic[10] += 1u;
+        return 0;
+    }
+    (void)bda_gui_draw_guard_begin();
+    old_object = bda_gui_select_draw_object(
+        state->native_draw, state->native_draw_object
+    );
+    copy_result = bda_gui_context_copy(
+        state->native_back,
+        0,
+        0,
+        SCREEN_W,
+        SCREEN_H,
+        state->native_draw,
+        0,
+        0,
+        BDA_GUI_COLOR_KEY_NONE
+    );
+    (void)bda_gui_select_draw_object(
+        state->native_draw, old_object
+    );
+    (void)bda_gui_draw_guard_end();
+    g_diagnostic[9] = (u32)copy_result;
+    g_diagnostic[10] += 1u;
+    if (copy_result == 0) {
+        state->native_redraw = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static void present_framebuffer(compat_9588_state_t *state)
@@ -1310,7 +1421,7 @@ static void present_framebuffer(compat_9588_state_t *state)
     }
     render_listbox_selection(state);
     draw_virtual_controls(state);
-    present_raw_framebuffer(state);
+    (void)present_native_framebuffer(state);
 }
 
 static int draw_packed_2bpp(
@@ -2324,8 +2435,6 @@ static int queue_pointer_message(
     return 1;
 }
 
-static u32 translate_native_key_value(u32 value);
-
 static int pop_message(compat_9588_state_t *state, guest_message_t *event)
 {
     if (!state || !state->event_count) {
@@ -2335,26 +2444,6 @@ static int pop_message(compat_9588_state_t *state, guest_message_t *event)
     state->event_read = (state->event_read + 1u) % EVENT_QUEUE_SIZE;
     state->event_count--;
     return 1;
-}
-
-static u32 touch_raw_to_panel_x(u32 raw_x)
-{
-    /*
-     * Invert the four-point C200/9588 calibration used by the frontend.
-     * X raw values decrease from about 0xe74 on the left to 0x172 on the
-     * right.  Extending that line to the physical 0..239 panel avoids a
-     * dead strip outside the original 10..230 calibration targets.
-     */
-    if (raw_x >= 3841u) return 0u;
-    if (raw_x <= 238u) return PHYSICAL_SCREEN_W - 1u;
-    return (3841u - raw_x) * (PHYSICAL_SCREEN_W - 1u) / 3603u;
-}
-
-static u32 touch_raw_to_panel_y(u32 raw_y)
-{
-    if (raw_y >= 3660u) return 0u;
-    if (raw_y <= 141u) return PHYSICAL_SCREEN_H - 1u;
-    return (3660u - raw_y) * (PHYSICAL_SCREEN_H - 1u) / 3519u;
 }
 
 static int panel_to_guest(
@@ -2489,32 +2578,16 @@ static void queue_guest_pointer_up(
     }
 }
 
-static void service_touch_input(compat_9588_state_t *state)
+static void service_native_touch_sample(
+    compat_9588_state_t *state,
+    int down,
+    u32 panel_x,
+    u32 panel_y
+)
 {
-    volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
-    u32 down;
-    u32 panel_x;
-    u32 panel_y;
     u32 guest_x;
     u32 guest_y;
     u32 action;
-
-    if (trace[0] != QEMU_TOUCH_MAGIC) {
-        state->touch_ready = 0;
-        return;
-    }
-    down = trace[4] != 0u;
-    panel_x = touch_raw_to_panel_x(trace[5] & 0xfffu);
-    panel_y = touch_raw_to_panel_y(trace[6] & 0xfffu);
-
-    if (!state->touch_ready) {
-        state->touch_ready = 1;
-        state->touch_down = down;
-        state->touch_captured = 0;
-        state->touch_x = panel_x;
-        state->touch_y = panel_y;
-        return;
-    }
 
     if (down && !state->touch_down) {
         if (panel_to_guest(
@@ -2585,93 +2658,276 @@ static void service_touch_input(compat_9588_state_t *state)
     state->touch_y = panel_y;
 }
 
+static void queue_native_key_down(
+    compat_9588_state_t *state,
+    u32 scancode
+)
+{
+    int queued;
+    if (!scancode) {
+        return;
+    }
+    if (state->parent_hwnd && state->listbox_item_count) {
+        if (scancode == COMPAT_SCANCODE_UP &&
+            state->listbox_caret > 0u) {
+            state->listbox_caret--;
+        } else if (scancode == COMPAT_SCANCODE_DOWN &&
+                   state->listbox_caret + 1u <
+                       state->listbox_item_count) {
+            state->listbox_caret++;
+        }
+    }
+    queued = queue_message(
+        state,
+        state->guest_hwnd,
+        COMPAT_MSG_KEYDOWN,
+        scancode,
+        0u
+    );
+    g_diagnostic[10] = (u32)(queued != 0);
+    g_diagnostic[11] = state->event_count;
+    g_diagnostic[12] = scancode;
+    g_diagnostic[13] = scancode;
+    g_diagnostic[14] = scancode;
+    g_diagnostic[15] += 1u;
+}
+
+static int native_input_window_proc(
+    bda_handle_t handle,
+    u32 message,
+    u32 wparam,
+    u32 lparam
+)
+{
+    compat_9588_state_t *state = g_native_input_state;
+    if (state && message == BDA_MSG_DRAW_CONTEXT_ATTACH) {
+        state->native_frame = handle;
+        if (acquire_native_draw_context(state, handle)) {
+            if (!state->native_draw_object) {
+                state->native_draw_object =
+                    bda_gui_draw_object_create(7u);
+            }
+            state->native_redraw = 1;
+        }
+    } else if (state &&
+               message == BDA_MSG_DRAW_CONTEXT_DETACH) {
+        if (!state->native_draw_owner ||
+            state->native_draw_owner == handle) {
+            release_native_draw_context(state);
+        }
+        state->native_frame_detached = 1;
+    }
+    return bda_gui_default_proc(handle, message, wparam, lparam);
+}
+
+static int native_input_open(compat_9588_state_t *state)
+{
+    bda_frame_desc_t descriptor;
+    if (!state) {
+        return 0;
+    }
+    bda_memset(&descriptor, 0, sizeof(descriptor));
+    bda_memset(
+        &state->native_message, 0, sizeof(state->native_message)
+    );
+    state->native_frame_detached = 0;
+    state->native_redraw = 1;
+    state->hardware_events_ready = 0;
+    state->touch_down = 0;
+    state->touch_escape_suppressed = 0;
+    state->native_escape_pending = 0;
+    bda_memset(state->combo_keys, 0, sizeof(state->combo_keys));
+    bda_memset(
+        &state->native_picture, 0, sizeof(state->native_picture)
+    );
+    state->native_picture.width = SCREEN_W;
+    state->native_picture.height = SCREEN_H;
+    state->native_picture.stride_bytes =
+        SCREEN_W * sizeof(u16);
+    state->native_picture.source_pixels = state->framebuffer;
+    state->native_picture.selected_index = -1;
+
+    descriptor.style = 0u;
+    descriptor.title = k_native_help_title;
+    descriptor.wndproc = native_input_window_proc;
+    descriptor.height = SCREEN_W;
+    descriptor.width = SCREEN_H;
+    g_native_input_state = state;
+    state->native_frame = bda_gui_register_frame_desc(&descriptor);
+    if (!state->native_frame ||
+        (s32)state->native_frame == -1) {
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    (void)bda_gui_frame_activate(state->native_frame, 0x100u);
+    if (!acquire_native_draw_context(
+            state, state->native_frame
+        )) {
+        bda_gui_close_frame(state->native_frame);
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    state->native_draw_object =
+        bda_gui_draw_object_create(7u);
+    if (!state->native_draw_object ||
+        (s32)(u32)state->native_draw_object == -1) {
+        state->native_draw_object = 0;
+        release_native_draw_context(state);
+        bda_gui_close_frame(state->native_frame);
+        state->native_frame = 0;
+        g_native_input_state = 0;
+        return 0;
+    }
+    return 1;
+}
+
+static int native_input_pump(compat_9588_state_t *state)
+{
+    if (!state || !state->native_frame ||
+        (s32)state->native_frame == -1) {
+        return 0;
+    }
+    return bda_gui_event_pump_frame_once(
+        &state->native_message, state->native_frame
+    );
+}
+
+static void native_input_close(compat_9588_state_t *state)
+{
+    u32 wait;
+    if (!state) {
+        return;
+    }
+    if (state->native_frame &&
+        (s32)state->native_frame != -1) {
+        (void)bda_gui_frame_stop(state->native_frame);
+        (void)bda_gui_frame_release(state->native_frame);
+        for (wait = 0u; wait < 128u; ++wait) {
+            int pumped = native_input_pump(state);
+            if (!pumped || state->native_frame_detached) {
+                break;
+            }
+            bda_sys_delay(1u);
+        }
+        release_native_draw_context(state);
+        bda_gui_close_frame(state->native_frame);
+        state->native_frame = 0;
+    }
+    if (g_native_input_state == state) {
+        g_native_input_state = 0;
+    }
+}
+
+static void filter_native_touch_escape(
+    compat_9588_state_t *state,
+    bda_gui_input_packet_t *packet
+)
+{
+    const u32 escape_index = BDA_INPUT_PACKET_ESCAPE_INDEX;
+    if (!state->touch_escape_suppressed) {
+        return;
+    }
+    if (!state->touch_down &&
+        packet->bytes[escape_index] != 1u) {
+        state->touch_escape_suppressed = 0;
+    }
+    state->native_escape_pending = 0;
+    packet->bytes[escape_index] = 0u;
+    state->combo_keys[escape_index] = 0u;
+}
+
 static void service_hardware_input(compat_9588_state_t *state)
 {
-    volatile u32 *queue = (volatile u32 *)QEMU_EVENT_QUEUE;
-    u32 write_index;
-    u32 remaining;
+    static const u32 scancodes[BDA_GUI_INPUT_PACKET_SIZE] = {
+        COMPAT_SCANCODE_RIGHT,
+        COMPAT_SCANCODE_LEFT,
+        COMPAT_SCANCODE_DOWN,
+        COMPAT_SCANCODE_UP,
+        COMPAT_SCANCODE_ESCAPE,
+        COMPAT_SCANCODE_ENTER
+    };
+    bda_gui_input_packet_t packet;
+    bda_gui_raw_event_t event;
+    u32 index;
+    u32 drained = 0u;
+    int move_pending = 0;
 
-    if (queue[0] != QEMU_EVENT_MAGIC) {
-        state->hardware_events_ready = 0;
-        return;
+    while (drained < RAW_EVENT_MAX_PER_POLL &&
+           bda_gui_raw_event_fetch(&event) >= 0) {
+        ++drained;
+        ++state->raw_event_count;
+        if ((u32)event.code == BDA_INPUT_EVENT_TOUCH_DOWN) {
+            u16 x = 0u;
+            u16 y = 0u;
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            bda_gui_touch_position(&x, &y);
+            service_native_touch_sample(state, 1, x, y);
+            move_pending = 0;
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_MOVE) {
+            ++state->raw_touch_count;
+            if (state->touch_down) {
+                move_pending = 1;
+            }
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_UP) {
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            if (state->touch_down) {
+                u16 x = 0u;
+                u16 y = 0u;
+                bda_gui_touch_position(&x, &y);
+                service_native_touch_sample(state, 0, x, y);
+            }
+            move_pending = 0;
+        }
     }
-    write_index = queue[2];
-    if (write_index >= QEMU_EVENT_SLOTS) {
-        state->hardware_events_ready = 0;
-        return;
+    if (move_pending && state->touch_down) {
+        u16 x = 0u;
+        u16 y = 0u;
+        bda_gui_touch_position(&x, &y);
+        service_native_touch_sample(state, 1, x, y);
     }
+
+    (void)bda_gui_input_packet(&packet);
+    filter_native_touch_escape(state, &packet);
     if (!state->hardware_events_ready) {
         /*
          * Discard the launcher navigation and the key that opened this BDA.
          * Only events arriving after the guest is ready belong to the game.
          */
-        state->hardware_event_cursor = write_index;
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            state->combo_keys[index] =
+                packet.bytes[index] == 1u ? 1u : 0u;
+        }
         state->hardware_events_ready = 1;
-        return;
-    }
-
-    remaining = QEMU_EVENT_SLOTS;
-    while (state->hardware_event_cursor != write_index && remaining--) {
-        u32 slot = state->hardware_event_cursor;
-        volatile u32 *event =
-            queue + 4u + slot * QEMU_EVENT_WORDS;
-        u32 kind = event[1];
-        u32 key_code = event[2];
-        u32 down = event[3];
-
-        state->hardware_event_cursor =
-            (state->hardware_event_cursor + 1u) % QEMU_EVENT_SLOTS;
-        if (event[0] == 3u && kind == QEMU_EVENT_KIND_KEY) {
-            u32 scancode = translate_native_key_value(key_code);
-            if (scancode) {
-                int combo_index = -1;
-                int queued;
-                if (scancode == COMPAT_SCANCODE_RIGHT) {
-                    combo_index = 0;
-                } else if (scancode == COMPAT_SCANCODE_LEFT) {
-                    combo_index = 1;
-                } else if (scancode == COMPAT_SCANCODE_DOWN) {
-                    combo_index = 2;
-                } else if (scancode == COMPAT_SCANCODE_UP) {
-                    combo_index = 3;
-                } else if (scancode == COMPAT_SCANCODE_ESCAPE) {
-                    combo_index = 4;
-                } else if (scancode == COMPAT_SCANCODE_ENTER) {
-                    combo_index = 5;
+    } else {
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            u8 down = packet.bytes[index] == 1u ? 1u : 0u;
+            if (index == BDA_INPUT_PACKET_ESCAPE_INDEX) {
+                if (down && !state->combo_keys[index]) {
+                    state->native_escape_pending = 1;
+                } else if (!down &&
+                           state->combo_keys[index] &&
+                           state->native_escape_pending) {
+                    queue_native_key_down(
+                        state, COMPAT_SCANCODE_ESCAPE
+                    );
+                    state->native_escape_pending = 0;
                 }
-                if (combo_index >= 0) {
-                    state->combo_keys[combo_index] = down ? 1u : 0u;
-                }
-                if (!down) {
-                    continue;
-                }
-                if (state->parent_hwnd && state->listbox_item_count) {
-                    if (scancode == COMPAT_SCANCODE_UP &&
-                        state->listbox_caret > 0u) {
-                        state->listbox_caret--;
-                    } else if (scancode == COMPAT_SCANCODE_DOWN &&
-                               state->listbox_caret + 1u <
-                                   state->listbox_item_count) {
-                        state->listbox_caret++;
-                    }
-                }
-                queued = queue_message(
-                    state,
-                    state->guest_hwnd,
-                    COMPAT_MSG_KEYDOWN,
-                    scancode,
-                    0u
-                );
-                g_diagnostic[10] = (u32)(queued != 0);
-                g_diagnostic[11] = state->event_count;
-                g_diagnostic[12] = scancode;
-                g_diagnostic[13] = scancode;
-                g_diagnostic[14] = scancode;
-                g_diagnostic[15] += 1u;
+            } else if (down && !state->combo_keys[index]) {
+                queue_native_key_down(state, scancodes[index]);
             }
+            state->combo_keys[index] = down;
         }
     }
-    service_touch_input(state);
 }
 
 static int write_guest_message(
@@ -2702,30 +2958,6 @@ static int read_guest_message(
            guest_read_u32(vm, address + 16u, &event->time) &&
            guest_read_u32(vm, address + 20u, &event->point_x) &&
            guest_read_u32(vm, address + 24u, &event->point_y);
-}
-
-static u32 translate_native_key_value(u32 value)
-{
-    u32 code = value & 0xffffu;
-    switch (code) {
-    case 4: return COMPAT_SCANCODE_UP;
-    case 5: return COMPAT_SCANCODE_DOWN;
-    case 6: return COMPAT_SCANCODE_LEFT;
-    case 7: return COMPAT_SCANCODE_RIGHT;
-    case 9: return COMPAT_SCANCODE_ESCAPE;
-    case 10: return COMPAT_SCANCODE_ENTER;
-    case 13: return COMPAT_SCANCODE_ENTER;
-    case 27: return COMPAT_SCANCODE_ESCAPE;
-    case COMPAT_SCANCODE_ENTER:
-    case COMPAT_SCANCODE_UP:
-    case COMPAT_SCANCODE_LEFT:
-    case COMPAT_SCANCODE_RIGHT:
-    case COMPAT_SCANCODE_DOWN:
-        return code;
-    default:
-        break;
-    }
-    return 0;
 }
 
 static c33_vm_status_t call_guest_window_proc(
@@ -4086,18 +4318,38 @@ static c33_vm_status_t dispatch_9588(
     case COMPAT_GUI_HELP2:
         {
             char *help = guest_copy_c_string(vm, vm->regs[7], 4096u);
+            u32 drained = 0u;
+            bda_gui_raw_event_t event;
             if (!help) {
                 return C33_VM_FAULT;
             }
+            release_native_draw_context(state);
             vm->regs[4] = (u32)bda_help_page(
                 0, k_native_help_title, help
             );
             bda_free(help);
             /*
-             * parent=0 is the SDK-supported form for a BDA without a native
-             * Frame. The modal firmware page owns the display until it
-             * returns, so restore the compatibility surface afterwards.
+             * The native Help Page temporarily owns the display. Match the
+             * GBA port's modal lifecycle: discard its release events, then
+             * reactivate the runtime Frame and reacquire the draw context.
              */
+            while (drained < 32u &&
+                   bda_gui_raw_event_fetch(&event) >= 0) {
+                ++drained;
+            }
+            state->hardware_events_ready = 0;
+            state->touch_down = 0;
+            state->touch_region = 0u;
+            state->touch_escape_suppressed = 0;
+            state->native_escape_pending = 0;
+            if (state->native_frame) {
+                (void)bda_gui_frame_activate(
+                    state->native_frame, 0x100u
+                );
+                (void)acquire_native_draw_context(
+                    state, state->native_frame
+                );
+            }
             present_framebuffer(state);
             return C33_VM_OK;
         }
@@ -4287,11 +4539,35 @@ static int read_program_metadata(program_entry_t *entry)
     d300_image_t image;
     d300_status_t status;
 
+    compat_log_record(
+        "SELECTOR_META_OPEN_BEGIN",
+        entry->file_name,
+        0u,
+        0u,
+        0u,
+        0u
+    );
     file = bda_fs_fopen_raw(entry->path, "rb");
+    compat_log_record(
+        "SELECTOR_META_OPEN_END",
+        entry->file_name,
+        (u32)file,
+        0u,
+        0u,
+        0u
+    );
     if (!bda_fs_file_is_valid(file)) {
         return 0;
     }
     file_size = bda_fs_seek_raw(file, 0, BDA_SEEK_END);
+    compat_log_record(
+        "SELECTOR_META_SIZE",
+        entry->file_name,
+        (u32)file_size,
+        0u,
+        0u,
+        0u
+    );
     if (file_size < (int)D300_MIN_HEADER_SIZE ||
         (u32)file_size > MAX_D300_FILE_SIZE ||
         bda_fs_seek_raw(file, 0, BDA_SEEK_SET) != 0) {
@@ -4305,7 +4581,16 @@ static int read_program_metadata(program_entry_t *entry)
         (void)bda_fs_close_raw(file);
         return 0;
     }
+    bda_memset(&image, 0, sizeof(image));
     status = d300_parse(&image, header, (u32)file_size);
+    compat_log_record(
+        "SELECTOR_META_PARSE",
+        entry->file_name,
+        (u32)status,
+        image.icon_offset,
+        image.icon_size,
+        image.program_size
+    );
     if (status != D300_OK) {
         (void)bda_fs_close_raw(file);
         return 0;
@@ -4342,6 +4627,14 @@ static int read_program_metadata(program_entry_t *entry)
         }
     }
     (void)bda_fs_close_raw(file);
+    compat_log_record(
+        "SELECTOR_META_DONE",
+        entry->file_name,
+        (u32)entry->has_icon,
+        0u,
+        0u,
+        0u
+    );
     return 1;
 }
 
@@ -4355,30 +4648,89 @@ static u32 load_program_entries(
     int find_open;
     u32 count = 0u;
     bda_fs_find_data_init(&find_data);
+    compat_log_record(
+        "SELECTOR_FINDFIRST_BEGIN",
+        COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY "*.*",
+        capacity,
+        0x27u,
+        sizeof(find_data),
+        0u
+    );
     result = bda_fs_findfirst(
         COMPAT_FS_NATIVE_PROGRAMS_DIRECTORY "*.*",
         0x27u,
         &find_data
     );
+    compat_log_record(
+        "SELECTOR_FINDFIRST_END",
+        0,
+        (u32)result,
+        (u32)find_data.cursor,
+        find_data.attr_or_flags,
+        (u32)(s32)find_data.volume_index
+    );
     find_open = result != -1;
     while (result != -1 && count < capacity) {
         program_entry_t *entry = &entries[count];
+        int metadata_ok = 0;
         bda_memset(entry, 0, sizeof(*entry));
         program_copy_basename(
             entry->file_name, find_data.name_or_path
+        );
+        compat_log_record(
+            "SELECTOR_SCAN_ITEM",
+            entry->file_name,
+            count,
+            find_data.attr_or_flags,
+            find_data.size_or_aux,
+            (u32)(s32)find_data.volume_index
         );
         if (!(find_data.attr_or_flags & 0x10u) &&
             program_has_exe_suffix(entry->file_name) &&
             program_build_native_path(
                 entry->path, entry->file_name
-            ) &&
-            read_program_metadata(entry)) {
+            )) {
+            metadata_ok = read_program_metadata(entry);
+        }
+        if (metadata_ok) {
             ++count;
         }
+        compat_log_record(
+            "SELECTOR_FINDNEXT_BEGIN",
+            entry->file_name,
+            count,
+            0u,
+            0u,
+            0u
+        );
         result = bda_fs_findnext(&find_data);
+        compat_log_record(
+            "SELECTOR_FINDNEXT_END",
+            0,
+            (u32)result,
+            count,
+            (u32)find_data.cursor,
+            (u32)(s32)find_data.volume_index
+        );
     }
     if (find_open) {
+        compat_log_record(
+            "SELECTOR_FINDCLOSE_BEGIN",
+            0,
+            count,
+            (u32)find_data.cursor,
+            0u,
+            0u
+        );
         (void)bda_fs_findclose(&find_data);
+        compat_log_record(
+            "SELECTOR_FINDCLOSE_END",
+            0,
+            count,
+            0u,
+            0u,
+            0u
+        );
     }
     return count;
 }
@@ -4569,40 +4921,50 @@ static void draw_program_browser(
 
 static u32 poll_program_browser_key(compat_9588_state_t *state)
 {
-    volatile u32 *queue = (volatile u32 *)QEMU_EVENT_QUEUE;
-    u32 write_index;
-    u32 remaining;
-    if (queue[0] != QEMU_EVENT_MAGIC) {
-        state->hardware_events_ready = 0;
-        return 0u;
-    }
-    write_index = queue[2];
-    if (write_index >= QEMU_EVENT_SLOTS) {
-        state->hardware_events_ready = 0;
-        return 0u;
-    }
+    static const u32 scancodes[BDA_GUI_INPUT_PACKET_SIZE] = {
+        COMPAT_SCANCODE_RIGHT,
+        COMPAT_SCANCODE_LEFT,
+        COMPAT_SCANCODE_DOWN,
+        COMPAT_SCANCODE_UP,
+        COMPAT_SCANCODE_ESCAPE,
+        COMPAT_SCANCODE_ENTER
+    };
+    bda_gui_input_packet_t packet;
+    u32 index;
+    u32 pressed = 0u;
+
+    (void)bda_gui_input_packet(&packet);
+    filter_native_touch_escape(state, &packet);
     if (!state->hardware_events_ready) {
-        state->hardware_event_cursor = write_index;
+        for (index = 0u;
+             index < BDA_GUI_INPUT_PACKET_SIZE;
+             ++index) {
+            state->combo_keys[index] =
+                packet.bytes[index] == 1u ? 1u : 0u;
+        }
         state->hardware_events_ready = 1;
         return 0u;
     }
-    remaining = QEMU_EVENT_SLOTS;
-    while (state->hardware_event_cursor != write_index && remaining--) {
-        u32 slot = state->hardware_event_cursor;
-        volatile u32 *event =
-            queue + 4u + slot * QEMU_EVENT_WORDS;
-        state->hardware_event_cursor =
-            (state->hardware_event_cursor + 1u) % QEMU_EVENT_SLOTS;
-        if (event[0] == 3u &&
-            event[1] == QEMU_EVENT_KIND_KEY &&
-            event[3]) {
-            u32 scancode = translate_native_key_value(event[2]);
-            if (scancode) {
-                return scancode;
+    for (index = 0u;
+         index < BDA_GUI_INPUT_PACKET_SIZE;
+         ++index) {
+        u8 down = packet.bytes[index] == 1u ? 1u : 0u;
+        if (index == BDA_INPUT_PACKET_ESCAPE_INDEX) {
+            if (down && !state->combo_keys[index]) {
+                state->native_escape_pending = 1;
+            } else if (!down &&
+                       state->combo_keys[index] &&
+                       state->native_escape_pending) {
+                pressed = COMPAT_SCANCODE_ESCAPE;
+                state->native_escape_pending = 0;
             }
+        } else if (!pressed &&
+                   down && !state->combo_keys[index]) {
+            pressed = scancodes[index];
         }
+        state->combo_keys[index] = down;
     }
-    return 0u;
+    return pressed;
 }
 
 static int poll_program_browser_touch(
@@ -4611,33 +4973,54 @@ static int poll_program_browser_touch(
     u32 *y_out
 )
 {
-    volatile u32 *trace = (volatile u32 *)QEMU_TOUCH_TRACE;
-    u32 down;
-    u32 x;
-    u32 y;
-    if (trace[0] != QEMU_TOUCH_MAGIC) {
-        state->touch_ready = 0;
-        return 0;
+    bda_gui_raw_event_t event;
+    u32 drained = 0u;
+    int move_pending = 0;
+    while (drained < RAW_EVENT_MAX_PER_POLL &&
+           bda_gui_raw_event_fetch(&event) >= 0) {
+        ++drained;
+        ++state->raw_event_count;
+        if ((u32)event.code == BDA_INPUT_EVENT_TOUCH_DOWN) {
+            u16 x = 0u;
+            u16 y = 0u;
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            bda_gui_touch_position(&x, &y);
+            state->touch_down = 1;
+            state->touch_x = x;
+            state->touch_y = y;
+            move_pending = 0;
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_MOVE) {
+            ++state->raw_touch_count;
+            if (state->touch_down) {
+                move_pending = 1;
+            }
+        } else if ((u32)event.code ==
+                   BDA_INPUT_EVENT_TOUCH_UP) {
+            ++state->raw_touch_count;
+            state->touch_escape_suppressed = 1;
+            if (state->touch_down) {
+                u16 x = 0u;
+                u16 y = 0u;
+                bda_gui_touch_position(&x, &y);
+                state->touch_down = 0;
+                state->touch_x = x;
+                state->touch_y = y;
+                *x_out = x;
+                *y_out = y;
+                return 1;
+            }
+            move_pending = 0;
+        }
     }
-    down = trace[4] != 0u;
-    x = touch_raw_to_panel_x(trace[5] & 0xfffu);
-    y = touch_raw_to_panel_y(trace[6] & 0xfffu);
-    if (!state->touch_ready) {
-        state->touch_ready = 1;
-        state->touch_down = down;
+    if (move_pending && state->touch_down) {
+        u16 x = 0u;
+        u16 y = 0u;
+        bda_gui_touch_position(&x, &y);
         state->touch_x = x;
         state->touch_y = y;
-        return 0;
     }
-    state->touch_x = x;
-    state->touch_y = y;
-    if (!down && state->touch_down) {
-        state->touch_down = 0;
-        *x_out = x;
-        *y_out = y;
-        return 1;
-    }
-    state->touch_down = down;
     return 0;
 }
 
@@ -4650,6 +5033,7 @@ static int select_9288s_program(
     u16 *framebuffer;
     u32 count;
     u32 selected = 0u;
+    u32 heartbeat_tick;
     int dirty = 1;
     int result = 0;
 
@@ -4658,6 +5042,14 @@ static int select_9288s_program(
         sizeof(*entries) * PROGRAM_MAX_ENTRIES
     );
     framebuffer = (u16 *)bda_alloc(SCREEN_W * SCREEN_H * sizeof(u16));
+    compat_log_record(
+        "SELECTOR_ALLOC",
+        0,
+        (u32)state,
+        (u32)entries,
+        (u32)framebuffer,
+        sizeof(*entries) * PROGRAM_MAX_ENTRIES
+    );
     if (allocation_failed(state) ||
         allocation_failed(entries) ||
         allocation_failed(framebuffer)) {
@@ -4670,7 +5062,51 @@ static int select_9288s_program(
     bda_memset(state, 0, sizeof(*state));
     state->framebuffer = framebuffer;
     state->hzk_file = -1;
+    compat_log_record(
+        "SELECTOR_SCAN_BEGIN",
+        0,
+        sizeof(*state),
+        SCREEN_W * SCREEN_H * sizeof(u16),
+        PROGRAM_MAX_ENTRIES,
+        0u
+    );
     count = load_program_entries(entries, PROGRAM_MAX_ENTRIES);
+    compat_log_record(
+        "SELECTOR_SCAN_END",
+        0,
+        count,
+        0u,
+        0u,
+        0u
+    );
+    if (!native_input_open(state)) {
+        compat_log_record(
+            "SELECTOR_FRAME_FAILED",
+            0,
+            (u32)state->native_frame,
+            0u,
+            0u,
+            0u
+        );
+        if (state->hzk_attempted &&
+            bda_fs_file_is_valid(state->hzk_file)) {
+            (void)bda_fs_close_raw(state->hzk_file);
+        }
+        bda_free(framebuffer);
+        bda_free(entries);
+        bda_free(state);
+        bda_msgbox("9288S", "Could not open input window");
+        return -1;
+    }
+    compat_log_record(
+        "SELECTOR_FRAME_OPEN",
+        0,
+        (u32)state->native_frame,
+        (u32)state->native_draw,
+        (u32)state->native_back,
+        (u32)state->native_draw_object
+    );
+    heartbeat_tick = bda_gui_tick_count_25ms();
 
     for (;;) {
         u32 key;
@@ -4679,20 +5115,83 @@ static int select_9288s_program(
         int touched;
         int refresh = 0;
         if (dirty) {
+            compat_log_record(
+                "SELECTOR_DRAW_BEGIN",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
             draw_program_browser(state, entries, count, selected);
-            present_raw_framebuffer(state);
+            compat_log_record(
+                "SELECTOR_PRESENT_BEGIN",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
+            (void)present_native_framebuffer(state);
+            compat_log_record(
+                "SELECTOR_PRESENT_END",
+                0,
+                g_diagnostic[8],
+                g_diagnostic[9],
+                g_diagnostic[10],
+                (u32)state->native_redraw
+            );
+            compat_log_record(
+                "SELECTOR_READY",
+                0,
+                count,
+                selected,
+                (u32)state->framebuffer,
+                0u
+            );
             dirty = 0;
         }
-        key = poll_program_browser_key(state);
+        if (state->native_redraw) {
+            dirty = 1;
+        }
         touched = poll_program_browser_touch(
             state, &touch_x, &touch_y
         );
+        key = poll_program_browser_key(state);
+        if (key) {
+            compat_log_record(
+                "SELECTOR_KEY",
+                0,
+                key,
+                selected,
+                count,
+                0u
+            );
+        }
+        if (touched) {
+            compat_log_record(
+                "SELECTOR_TOUCH",
+                0,
+                touch_x,
+                touch_y,
+                selected,
+                count
+            );
+        }
         if (key == COMPAT_SCANCODE_ESCAPE) {
             result = 0;
             break;
         } else if (key == COMPAT_SCANCODE_ENTER) {
             if (count) {
                 copy_native_path(selected_path, entries[selected].path);
+                compat_log_record(
+                    "SELECTOR_CHOOSE",
+                    selected_path,
+                    selected,
+                    count,
+                    key,
+                    0u
+                );
                 result = 1;
                 break;
             }
@@ -4734,6 +5233,14 @@ static int select_9288s_program(
                     copy_native_path(
                         selected_path, entries[index].path
                     );
+                    compat_log_record(
+                        "SELECTOR_CHOOSE",
+                        selected_path,
+                        index,
+                        count,
+                        touch_x,
+                        touch_y
+                    );
                     result = 1;
                     break;
                 }
@@ -4747,6 +5254,14 @@ static int select_9288s_program(
             }
         }
         if (refresh) {
+            compat_log_record(
+                "SELECTOR_REFRESH",
+                0,
+                count,
+                selected,
+                0u,
+                0u
+            );
             bda_memset(
                 entries, 0,
                 sizeof(*entries) * PROGRAM_MAX_ENTRIES
@@ -4757,9 +5272,35 @@ static int select_9288s_program(
             selected = 0u;
             dirty = 1;
         }
+        {
+            u32 now = bda_gui_tick_count_25ms();
+            if (now - heartbeat_tick >=
+                COMPAT_LOG_HEARTBEAT_TICKS) {
+                compat_log_record(
+                    "SELECTOR_HEARTBEAT",
+                    0,
+                    count,
+                    selected,
+                    (u32)state->touch_down,
+                    ((state->raw_touch_count & 0xffffu) << 16) |
+                        (state->raw_event_count & 0xffffu)
+                );
+                heartbeat_tick = now;
+            }
+        }
         bda_sys_delay(1u);
     }
 
+    compat_log_record(
+        "SELECTOR_LEAVE",
+        result == 1 ? selected_path : 0,
+        (u32)result,
+        count,
+        selected,
+        ((state->raw_touch_count & 0xffffu) << 16) |
+            (state->raw_event_count & 0xffffu)
+    );
+    native_input_close(state);
     if (state->hzk_attempted &&
         bda_fs_file_is_valid(state->hzk_file)) {
         (void)bda_fs_close_raw(state->hzk_file);
@@ -5044,6 +5585,32 @@ static int run_selected_game(
     }
     g_diagnostic[1] = 6u;
 
+    if (!native_input_open(state)) {
+        compat_log_record(
+            "RUN_FRAME_FAILED",
+            selected_path,
+            (u32)state->native_frame,
+            0u,
+            0u,
+            0u
+        );
+        bda_msgbox("9288S", "Could not open input window");
+        bda_free(code_ram);
+        bda_free(heap_ram);
+        bda_free(api_ram);
+        bda_free(iram);
+        bda_free(framebuffer);
+        bda_free(runtime);
+        return 9;
+    }
+    compat_log_record(
+        "RUN_FRAME_OPEN",
+        selected_path,
+        (u32)state->native_frame,
+        0u,
+        0u,
+        0u
+    );
     c33_vm_reset(vm, D300_GUEST_LOAD_BASE, GUEST_STACK_TOP, 0);
     vm->sp -= 4u;
     c33_vm_write(vm, vm->sp, exit_pc, sizeof(exit_pc));
@@ -5098,6 +5665,7 @@ static int run_selected_game(
         present_framebuffer(state);
     }
 
+    native_input_close(state);
     if (vm_status == C33_VM_DONE &&
         !state->quit &&
         !state->request_reselect) {
@@ -5141,6 +5709,14 @@ static int run_selected_game(
     state->framebuffer = 0;
     *reselect_out = state->request_reselect;
     compat_log_record(
+        "INPUT_STATS",
+        selected_path,
+        state->raw_event_count,
+        state->raw_touch_count,
+        (u32)state->hardware_events_ready,
+        (u32)state->touch_down
+    );
+    compat_log_record(
         "RUN_END",
         selected_path,
         (u32)vm_status,
@@ -5167,7 +5743,7 @@ int bda_main(void)
     }
     ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
     compat_log_write(
-        "9288S compatibility real-device log v1\r\n", 1
+        "9288S compatibility real-device log v3\r\n", 1
     );
     compat_log_record(
         "BDA_START",
@@ -5176,6 +5752,14 @@ int bda_main(void)
         sizeof(compat_9588_runtime_t),
         VM_SLICE,
         CALLBACK_BUDGET
+    );
+    compat_log_record(
+        "INPUT_ARCH",
+        "GBA raw touch + input packet",
+        RAW_EVENT_MAX_PER_POLL,
+        0u,
+        0u,
+        0u
     );
     for (;;) {
         compat_log_record(

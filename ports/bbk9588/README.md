@@ -8,15 +8,17 @@ address space, loads the original program at `0x02700000`, installs
 relocation-table traps, and runs the portable C33 interpreter. No game bytes
 are embedded in the BDA.
 
-The current QEMU-specific host adapter provides:
+The current 9588 host adapter provides:
 
 - an unscaled 160×240 guest surface at the top center of the rotated 240×320
   RGB565 display;
 - side EXE/settings buttons, a centered direction pad, and 取消/确认 actions;
 - row-aligned packed 2bpp image decoding;
 - a persistent 9288S GUI message loop and timer;
-- direction/confirm/exit key translation;
-- touch down, move, and up translation through QEMU's touch-state mirror;
+- native Frame presentation through the public 9588 drawing APIs;
+- physical direction/confirm/exit input through the six-byte input packet;
+- touch down, move, and up translation through the public raw-input stream
+  and calibrated logical-coordinate API, matching the GBA 9588 port;
 - the public SDK's firmware Help Page, confirmation, window-destruction, and
   clean-exit handling;
 - nested save/load window emulation with resumable guest callbacks;
@@ -36,6 +38,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-9588-lan.ps1
 ```
 
 The public SDK is pinned as the repository's `sdk` Git submodule and is used
-only as a build dependency. The current direct scanout and diagnostic input
-mirrors are emulator interfaces; physical 9588 hardware would require a
-separate host adapter.
+only as a build dependency. The runtime does not depend on emulator-private
+framebuffer, key-queue, or touch-mirror addresses.

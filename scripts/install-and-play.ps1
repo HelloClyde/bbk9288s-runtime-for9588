@@ -163,8 +163,8 @@ Invoke-WebRequest `
   -TimeoutSec 90 | Out-Null
 
 Write-Output "installed: $TargetPath"
-Write-Output "waiting for the 9588 desktop..."
-Start-Sleep -Seconds 12
+Write-Output "waiting 45 seconds for the 9588 desktop..."
+Start-Sleep -Seconds 45
 
 # The reset desktop selects 查询典. One Right selects 背单词/E-pets, whose
 # fixed launcher filename is replaced by this compatibility BDA.
