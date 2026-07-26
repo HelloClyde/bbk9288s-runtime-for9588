@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/9288s-runtime-icon.png" width="128" alt="9288S Runtime 图标">
+  <img src="assets/readme-header.png" alt="9288S Runtime on 9588">
 </p>
 
-<h1 align="center">BBK 9288S 兼容运行时</h1>
+<h1 align="center">bbk9288s-runtime-for9588</h1>
 
 <p align="center">
   在 BBK 9588 上直接加载并运行 9288S D300 EXE
@@ -37,7 +37,7 @@
 ### 1. 准备运行时
 
 有正式版本时可从
-[GitHub Releases](https://github.com/HelloClyde/bbk9288s-compat9588/releases)
+[GitHub Releases](https://github.com/HelloClyde/bbk9288s-runtime-for9588/releases)
 下载 `9288S.bda`；尚无 Release 或需要最新开发版时，请按照后面的源码构建
 步骤自行生成。使用设备现有的 BDA 安装方式把它安装到 9588；BDA 内部标题为
 `9288S`。
@@ -77,8 +77,8 @@ A:\应用\数据\9288s\系统\程序\
 
 ```powershell
 git clone --recurse-submodules `
-  https://github.com/HelloClyde/bbk9288s-compat9588.git
-cd bbk9288s-compat9588
+  https://github.com/HelloClyde/bbk9288s-runtime-for9588.git
+cd bbk9288s-runtime-for9588
 .\scripts\build-bda.ps1
 ```
 
