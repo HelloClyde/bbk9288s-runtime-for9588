@@ -31,6 +31,7 @@ jobs:
             -I runtime/include \
             runtime/src/d300.c \
             runtime/src/c33vm.c \
+            runtime/src/c33jit.c \
             runtime/src/compat_api.c \
             runtime/src/compat_fs.c \
             tests/test_runtime.c \
