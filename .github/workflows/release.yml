@@ -66,6 +66,7 @@ jobs:
       - name: Validate and checksum
         shell: pwsh
         run: |
+          $env:PYTHONUTF8 = "1"
           $env:PYTHONPATH = (Resolve-Path .\sdk).Path
           python -m bda_packer.validate .\build\bbk9588\9288S.bda
           if ($LASTEXITCODE -ne 0) {
