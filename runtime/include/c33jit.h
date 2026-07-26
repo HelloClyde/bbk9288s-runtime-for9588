@@ -22,6 +22,9 @@ typedef struct c33_jit_stats {
     uint32_t compile_failures;
     uint64_t lookup_probes;
     uint32_t max_lookup_probes;
+    uint32_t dispatcher_calls;
+    uint32_t native_blocks;
+    uint32_t max_chain_blocks;
 } c33_jit_stats_t;
 
 /*

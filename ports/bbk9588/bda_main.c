@@ -3,6 +3,7 @@
 #include "../../runtime/include/c33vm.h"
 #include "../../runtime/include/c33jit.h"
 #include "../../runtime/include/compat_api.h"
+#include "../../runtime/include/compat_audio.h"
 #include "../../runtime/include/compat_fs.h"
 #include "../../runtime/include/compat_gui.h"
 #include "../../runtime/include/d300.h"
@@ -39,9 +40,22 @@
 #define COMPAT_LOG_VERBOSE 0
 
 #define GUEST_IRAM_SIZE  0x00004000u
+#define GUEST_IO_BASE    0x00040000u
+#define GUEST_IO_SIZE    0x00010000u
+#define GUEST_CLOCK_DIVIDER_OFFSET 0x00000153u
+#define GUEST_CLOCK_SECOND_OFFSET  0x00000154u
+#define GUEST_CLOCK_MINUTE_OFFSET  0x00000155u
+#define GUEST_CLOCK_HOUR_OFFSET    0x00000156u
+#define GUEST_CLOCK_DAY_LOW_OFFSET 0x00000157u
+#define GUEST_CLOCK_DAY_HIGH_OFFSET 0x00000158u
+#define GUEST_IVRAM_BASE 0x003c0000u
+#define GUEST_IVRAM_SIZE 0x0000a000u
+#define GUEST_IVRAM_STRIDE (GUEST_SCREEN_W / 4u)
+#define GUEST_IVRAM_VISIBLE_SIZE \
+    (GUEST_IVRAM_STRIDE * GUEST_SCREEN_H)
 #define GUEST_API_BASE   0x02000000u
 #define GUEST_API_SIZE   0x00010000u
-#define GUEST_HEAP_SIZE  0x00080000u
+#define GUEST_HEAP_SIZE  0x00100000u
 #define GUEST_CODE_BASE  0x02700000u
 #define GUEST_CODE_MIN_SIZE 0x00020000u
 #define GUEST_CODE_MAX_SIZE 0x00100000u
@@ -123,6 +137,14 @@ typedef struct compat_9588_state {
     c33_vm_t *vm;
     u16 *framebuffer;
     u16 *fullscreen_buffer;
+    u8 *guest_ivram;
+    u32 guest_ivram_region;
+    u32 guest_ivram_write_count;
+    u32 guest_ivram_present_count;
+    u32 timeslice_yield_count;
+    u32 guest_idle_yield_count;
+    u32 framebuffer_present_count;
+    u32 framebuffer_skip_count;
     char selected_path[NATIVE_PATH_CAPACITY];
     char guest_cwd[GUEST_PATH_CAPACITY];
     u32 guest_window_proc;
@@ -200,6 +222,8 @@ typedef struct compat_9588_state {
     int instant_paint;
     int quit;
     u32 api_call_count;
+    u32 audio_source_count;
+    u32 audio_mixer_compat_count;
     u32 heartbeat_tick;
 } compat_9588_state_t;
 
@@ -398,7 +422,7 @@ static void compat_log_vm(
     c33_vm_status_t status
 )
 {
-    char line[320];
+    char line[416];
     char *out = line;
     char *end = line + sizeof(line);
     append_text(&out, end, "T=");
@@ -431,6 +455,12 @@ static void compat_log_vm(
     append_hex(&out, end, state ? state->event_count : 0u);
     append_text(&out, end, " timer=");
     append_hex(&out, end, state ? state->timer_last_id : 0u);
+    append_text(&out, end, " fpc=");
+    append_hex(&out, end, vm ? vm->fault_pc : 0u);
+    append_text(&out, end, " op=");
+    append_hex(&out, end, vm ? vm->fault_opcode : 0u);
+    append_text(&out, end, " addr=");
+    append_hex(&out, end, vm ? vm->fault_address : 0u);
     append_text(&out, end, "\r\n");
     *out = 0;
     compat_log_write(line, 0);
@@ -803,6 +833,7 @@ static void fill_framebuffer(compat_9588_state_t *state, u16 color)
     for (i = 0; i < SCREEN_W * SCREEN_H; ++i) {
         state->framebuffer[i] = color;
     }
+    state->native_redraw = 1;
 }
 
 static void put_panel_pixel(
@@ -1377,6 +1408,7 @@ static void put_guest_pixel(
     }
     panel_x = GAME_VIEW_X + x;
     panel_y = y;
+    state->native_redraw = 1;
     put_panel_pixel(
         state, panel_x, panel_y, logical_color_to_rgb565(color)
     );
@@ -1422,6 +1454,7 @@ static void reverse_guest_rect(
             state->framebuffer[panel_y * SCREEN_W + panel_x] ^= 0xffffu;
         }
     }
+    state->native_redraw = 1;
 }
 
 static u32 guest_gray_from_rgb565(u16 pixel)
@@ -2040,7 +2073,118 @@ static int present_native_framebuffer(
     return 0;
 }
 
-static void present_framebuffer(compat_9588_state_t *state)
+static int sync_guest_ivram(compat_9588_state_t *state)
+{
+    static const u16 gray_palette[4] = {
+        0x0000u, 0x52aau, 0xad55u, 0xffffu
+    };
+    c33_vm_region_t *region;
+    u32 row;
+    if (!state || !state->vm || !state->framebuffer ||
+        !state->guest_ivram ||
+        state->guest_ivram_region >= state->vm->region_count) {
+        return 0;
+    }
+    region = &state->vm->regions[state->guest_ivram_region];
+    if (region->guest_base != GUEST_IVRAM_BASE ||
+        region->host != state->guest_ivram ||
+        region->size < GUEST_IVRAM_VISIBLE_SIZE ||
+        region->write_count == state->guest_ivram_write_count) {
+        return 0;
+    }
+    state->guest_ivram_write_count = region->write_count;
+    for (row = 0u; row < GUEST_SCREEN_H; ++row) {
+        const u8 *source =
+            state->guest_ivram + row * GUEST_IVRAM_STRIDE;
+        u16 *output =
+            state->framebuffer + row * SCREEN_W + GAME_VIEW_X;
+        u32 source_byte;
+        for (source_byte = 0u;
+             source_byte < GUEST_IVRAM_STRIDE;
+             ++source_byte) {
+            u8 bits = source[source_byte];
+            u16 *pixels = output + source_byte * 4u;
+            pixels[0] = gray_palette[(bits >> 6) & 3u];
+            pixels[1] = gray_palette[(bits >> 4) & 3u];
+            pixels[2] = gray_palette[(bits >> 2) & 3u];
+            pixels[3] = gray_palette[bits & 3u];
+        }
+    }
+    if (state->guest_ivram_present_count == 0u) {
+        compat_log_record(
+            "GUEST_IVRAM_ACTIVE",
+            state->selected_path,
+            GUEST_IVRAM_BASE,
+            GUEST_IVRAM_VISIBLE_SIZE,
+            region->write_count,
+            2u
+        );
+    }
+    ++state->guest_ivram_present_count;
+    return 1;
+}
+
+static void service_guest_clock_io(u8 *io_ram, u32 elapsed_ticks)
+{
+    u32 elapsed_seconds;
+    u32 elapsed_days;
+    if (!io_ram) {
+        return;
+    }
+    /*
+     * S1C33L05 clock timer registers at 0x40153..0x40158. The 9588 clock
+     * advances in verified 25 ms units, so derive the 256 Hz divider phase
+     * from 40 host ticks per second and keep the larger counters coherent.
+     */
+    elapsed_seconds = elapsed_ticks / 40u;
+    elapsed_days = elapsed_seconds / 86400u;
+    io_ram[GUEST_CLOCK_DIVIDER_OFFSET] =
+        (u8)(((elapsed_ticks % 40u) * 32u) / 5u);
+    io_ram[GUEST_CLOCK_SECOND_OFFSET] =
+        (u8)(elapsed_seconds % 60u);
+    io_ram[GUEST_CLOCK_MINUTE_OFFSET] =
+        (u8)((elapsed_seconds / 60u) % 60u);
+    io_ram[GUEST_CLOCK_HOUR_OFFSET] =
+        (u8)((elapsed_seconds / 3600u) % 24u);
+    io_ram[GUEST_CLOCK_DAY_LOW_OFFSET] = (u8)elapsed_days;
+    io_ram[GUEST_CLOCK_DAY_HIGH_OFFSET] =
+        (u8)(elapsed_days >> 8);
+}
+
+static void log_guest_ivram_stats(compat_9588_state_t *state)
+{
+    c33_vm_region_t *region;
+    u32 index;
+    u32 nonzero = 0u;
+    u32 checksum = 0u;
+    if (!state || !state->vm || !state->guest_ivram ||
+        state->guest_ivram_region >= state->vm->region_count) {
+        return;
+    }
+    region = &state->vm->regions[state->guest_ivram_region];
+    if (region->guest_base != GUEST_IVRAM_BASE ||
+        region->host != state->guest_ivram ||
+        region->write_count == 0u) {
+        return;
+    }
+    for (index = 0u; index < GUEST_IVRAM_VISIBLE_SIZE; ++index) {
+        u8 value = state->guest_ivram[index];
+        checksum += value;
+        if (value != 0u) {
+            ++nonzero;
+        }
+    }
+    compat_log_record(
+        "GUEST_IVRAM_STATS",
+        state->selected_path,
+        region->write_count,
+        state->guest_ivram_present_count,
+        nonzero,
+        checksum
+    );
+}
+
+static void present_synced_framebuffer(compat_9588_state_t *state)
 {
     if (!state->framebuffer) {
         return;
@@ -2052,6 +2196,23 @@ static void present_framebuffer(compat_9588_state_t *state)
         draw_virtual_controls(state);
     }
     (void)present_native_framebuffer(state);
+    ++state->framebuffer_present_count;
+}
+
+static void present_framebuffer(compat_9588_state_t *state)
+{
+    (void)sync_guest_ivram(state);
+    present_synced_framebuffer(state);
+}
+
+static void present_framebuffer_if_dirty(compat_9588_state_t *state)
+{
+    int guest_changed = sync_guest_ivram(state);
+    if (!guest_changed && !state->native_redraw) {
+        ++state->framebuffer_skip_count;
+        return;
+    }
+    present_synced_framebuffer(state);
 }
 
 static void log_picv_fault(
@@ -2207,8 +2368,8 @@ static int legacy_blit_virtual_2bpp(
     compat_9588_state_t *state,
     s32 x,
     s32 y,
-    u32 width,
-    u32 height,
+    s32 width,
+    s32 height,
     u32 picture,
     u32 virtual_screen,
     u32 mode,
@@ -2216,23 +2377,25 @@ static int legacy_blit_virtual_2bpp(
 )
 {
     c33_vm_t *vm = state->vm;
+    struct compat_gui_blit_clip clip;
+    int clip_result;
     u32 source_stride;
     u32 source_start_x = 0u;
     u32 source_start_y = 0u;
+    u32 source_byte_start;
+    u32 source_read_bytes;
     u32 destination_x;
     u32 destination_y;
     u32 clipped_width;
     u32 clipped_height;
     u32 row;
-    u8 source[40];
+    u8 source[(GUEST_SCREEN_W + 6u) / 4u];
     u8 destination[40];
 
     if (failure_reason) {
         *failure_reason = 0u;
     }
-    if (!virtual_screen || (!picture && mode != 4u) ||
-        !width || !height ||
-        width > GUEST_SCREEN_W || height > GUEST_SCREEN_H) {
+    if (!virtual_screen || (!picture && mode != 4u)) {
         if (failure_reason) {
             *failure_reason = PICV_FAULT_INVALID_ARGUMENT;
         }
@@ -2244,31 +2407,34 @@ static int legacy_blit_virtual_2bpp(
      * deliberately draws a 160-pixel strip at x=2. Both are valid no-op or
      * clipped draws, not VM faults.
      */
-    if (x < 0) {
-        source_start_x = (u32)-x;
+    clip_result = compat_gui_clip_packed_2bpp(
+        x,
+        y,
+        width,
+        height,
+        GUEST_SCREEN_W,
+        GUEST_SCREEN_H,
+        &clip
+    );
+    if (clip_result == COMPAT_GUI_CLIP_INVALID) {
+        if (failure_reason) {
+            *failure_reason = PICV_FAULT_INVALID_ARGUMENT;
+        }
+        return 0;
     }
-    if (y < 0) {
-        source_start_y = (u32)-y;
-    }
-    if (source_start_x >= width || source_start_y >= height ||
-        x >= (s32)GUEST_SCREEN_W || y >= (s32)GUEST_SCREEN_H) {
+    if (clip_result == COMPAT_GUI_CLIP_EMPTY) {
         return 1;
     }
-    destination_x = x < 0 ? 0u : (u32)x;
-    destination_y = y < 0 ? 0u : (u32)y;
-    clipped_width = width - source_start_x;
-    clipped_height = height - source_start_y;
-    if (clipped_width > GUEST_SCREEN_W - destination_x) {
-        clipped_width = GUEST_SCREEN_W - destination_x;
-    }
-    if (clipped_height > GUEST_SCREEN_H - destination_y) {
-        clipped_height = GUEST_SCREEN_H - destination_y;
-    }
-    if (!clipped_width || !clipped_height) {
-        return 1;
-    }
-    source_stride = (width + 3u) / 4u;
-    if (source_stride > sizeof(source)) {
+    source_start_x = clip.source_x;
+    source_start_y = clip.source_y;
+    source_byte_start = clip.source_byte_start;
+    source_read_bytes = clip.source_read_bytes;
+    destination_x = clip.destination_x;
+    destination_y = clip.destination_y;
+    clipped_width = clip.width;
+    clipped_height = clip.height;
+    source_stride = clip.source_stride;
+    if (source_read_bytes > sizeof(source)) {
         if (failure_reason) {
             *failure_reason = PICV_FAULT_SOURCE_STRIDE;
         }
@@ -2276,22 +2442,36 @@ static int legacy_blit_virtual_2bpp(
     }
     for (row = 0u; row < clipped_height; ++row) {
         u32 column;
+        u32 source_row = source_start_y + row;
+        u32 source_address = picture;
         u32 destination_address =
             virtual_screen +
             (destination_y + row) * (GUEST_SCREEN_W / 4u);
-        if (mode != 4u &&
-            !c33_vm_read(
-                vm,
-                picture + (source_start_y + row) * source_stride,
-                source,
-                source_stride
-            )) {
-            vm->fault_address =
-                picture + (source_start_y + row) * source_stride;
-            if (failure_reason) {
-                *failure_reason = PICV_FAULT_SOURCE_READ;
+        if (mode != 4u) {
+            if (picture > 0xffffffffu - source_byte_start ||
+                source_row >
+                    (0xffffffffu - picture - source_byte_start) /
+                    source_stride) {
+                vm->fault_address = picture;
+                if (failure_reason) {
+                    *failure_reason = PICV_FAULT_SOURCE_READ;
+                }
+                return 0;
             }
-            return 0;
+            source_address =
+                picture + source_row * source_stride + source_byte_start;
+            if (!c33_vm_read(
+                    vm,
+                    source_address,
+                    source,
+                    source_read_bytes
+                )) {
+                vm->fault_address = source_address;
+                if (failure_reason) {
+                    *failure_reason = PICV_FAULT_SOURCE_READ;
+                }
+                return 0;
+            }
         }
         /*
          * Most 三国霸业 assets are four-pixel-aligned tiles, including its
@@ -2299,7 +2479,7 @@ static int legacy_blit_virtual_2bpp(
          * access and branch for every individual pixel makes the intro run
          * hundreds of times slower under the 9588 CPU emulator.
          */
-        if (!source_start_x &&
+        if ((source_start_x & 3u) == 0u &&
             (destination_x & 3u) == 0u &&
             (clipped_width & 3u) == 0u) {
             u32 first_byte = destination_x / 4u;
@@ -2384,7 +2564,7 @@ static int legacy_blit_virtual_2bpp(
             return 0;
         }
         for (column = 0u; column < clipped_width; ++column) {
-            u32 source_x = source_start_x + column;
+            u32 source_x = (source_start_x & 3u) + column;
             u32 output_x = destination_x + column;
             u32 source_shift = 6u - ((source_x & 3u) * 2u);
             u32 destination_shift =
@@ -2478,6 +2658,7 @@ static int legacy_blit_screen_2bpp(
             *destination = gray_palette[output];
         }
     }
+    state->native_redraw = 1;
     return 1;
 }
 
@@ -2741,6 +2922,7 @@ static int legacy_present_virtual_2bpp(
             pixels[3] = gray_palette[bits & 3u];
         }
     }
+    state->native_redraw = 1;
     if (state->instant_paint) {
         present_framebuffer(state);
     }
@@ -3336,6 +3518,7 @@ static u32 virtual_action_scancode(u32 action)
 static void toggle_control_layout(compat_9588_state_t *state)
 {
     state->controls_left = !state->controls_left;
+    state->native_redraw = 1;
 }
 
 static int enter_fullscreen(compat_9588_state_t *state)
@@ -3665,6 +3848,7 @@ static void service_native_touch_sample(
             state->virtual_action =
                 virtual_action_at(state, panel_x, panel_y);
             state->touch_region = 2u;
+            state->native_redraw = 1;
         }
     } else if (down && state->touch_region == 1u &&
                (panel_x != state->touch_x ||
@@ -3722,6 +3906,7 @@ static void service_native_touch_sample(
         state->touch_region = 0u;
         state->virtual_action = VIRTUAL_ACTION_NONE;
         state->touch_captured = 0;
+        state->native_redraw = 1;
     }
     state->touch_down = down;
     state->touch_x = panel_x;
@@ -3741,10 +3926,12 @@ static void queue_native_key_down(
         if (scancode == COMPAT_SCANCODE_UP &&
             state->listbox_caret > 0u) {
             state->listbox_caret--;
+            state->native_redraw = 1;
         } else if (scancode == COMPAT_SCANCODE_DOWN &&
                    state->listbox_caret + 1u <
                        state->listbox_item_count) {
             state->listbox_caret++;
+            state->native_redraw = 1;
         }
     }
     queued = queue_message(
@@ -4677,6 +4864,89 @@ static c33_vm_status_t dispatch_9588_fs(
     }
 }
 
+static c33_vm_status_t dispatch_9588_audio(
+    compat_api_t *api,
+    u32 slot,
+    compat_9588_state_t *state
+)
+{
+    c33_vm_t *vm = api->vm;
+    switch (slot) {
+    case COMPAT_AUDIO_MIXER_SOURCE_OPEN:
+        {
+            u32 data_address = 0u;
+            u32 data_length = 0u;
+            int result = compat_audio_mixer_source_open(
+                vm, vm->regs[6]
+            );
+            if (result) {
+                (void)guest_read_u32(
+                    vm, vm->regs[6], &data_address
+                );
+                (void)guest_read_u32(
+                    vm, vm->regs[6] + 4u, &data_length
+                );
+            }
+            state->audio_source_count += 1u;
+            if (state->audio_source_count == 1u || !result) {
+                compat_log_record(
+                    "AUDIO_SOURCE_OPEN",
+                    state->selected_path,
+                    vm->regs[6],
+                    data_address,
+                    data_length,
+                    (u32)result
+                );
+            }
+            vm->regs[4] = (u32)result;
+            return C33_VM_OK;
+        }
+    case COMPAT_AUDIO_MIXER_SOURCE_CLOSE:
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_AUDIO_MIXER_OPEN:
+    case COMPAT_AUDIO_MIXER_SET_CHANNEL:
+    case COMPAT_AUDIO_MIXER_START:
+    case COMPAT_AUDIO_MIXER_STOP:
+    case COMPAT_AUDIO_MIXER_CLOSE:
+        /*
+         * The 9588 SDK exposes a verified 22050 Hz raw PCM queue, whereas
+         * Thunder's mixer sources are 8000 Hz. Accept the legacy mixer
+         * lifecycle so sound effects never abort the guest; native
+         * resampling/output remains a separate compatibility layer.
+         */
+        state->audio_mixer_compat_count += 1u;
+        if (state->audio_mixer_compat_count == 1u) {
+            compat_log_record(
+                "AUDIO_MIXER_COMPAT",
+                state->selected_path,
+                slot,
+                vm->regs[6],
+                vm->regs[7],
+                vm->regs[8]
+            );
+        }
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    case COMPAT_AUDIO_MUTE:
+    case COMPAT_AUDIO_SET_VOLUME:
+    case COMPAT_AUDIO_SET_EQ:
+    case COMPAT_AUDIO_SET_CHANNEL:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_AUDIO_GET_VOLUME:
+        vm->regs[4] = 5u;
+        return C33_VM_OK;
+    case COMPAT_AUDIO_GET_EQ:
+    case COMPAT_AUDIO_GET_CHANNEL:
+    case COMPAT_AUDIO_GET_FAV_PARAM:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    default:
+        return C33_VM_UNSUPPORTED;
+    }
+}
+
 static c33_vm_status_t dispatch_9588(
     compat_api_t *api,
     compat_api_group_t group,
@@ -4693,9 +4963,18 @@ static c33_vm_status_t dispatch_9588(
     if (!state) {
         return C33_VM_UNSUPPORTED;
     }
+    /*
+     * Preserve the order between direct 9288S VRAM writes and subsequent
+     * GUI-table drawing. LavaXOS clears/draws 0x003c0000 directly, then mixes
+     * normal GUI calls into the same frame.
+     */
+    sync_guest_ivram(state);
     state->api_call_count += 1u;
     if (group == COMPAT_API_FS) {
         return dispatch_9588_fs(api, slot, state);
+    }
+    if (group == COMPAT_API_AUDIO) {
+        return dispatch_9588_audio(api, slot, state);
     }
     if (group != COMPAT_API_GUI) {
         return C33_VM_UNSUPPORTED;
@@ -4802,6 +5081,17 @@ static c33_vm_status_t dispatch_9588(
             if (event.message == COMPAT_MSG_KEYDOWN) {
                 g_diagnostic[10] =
                     0x300u | ((u32)status & 0xffu);
+            }
+            if (status != C33_VM_OK && status != C33_VM_YIELD) {
+                compat_log_record(
+                    "DISPATCH_FAIL",
+                    state->selected_path,
+                    event.message,
+                    event.wparam,
+                    vm->fault_pc,
+                    ((u32)vm->fault_opcode << 16) |
+                        ((u32)status & 0xffffu)
+                );
             }
             return status;
         }
@@ -5518,8 +5808,8 @@ static c33_vm_status_t dispatch_9588(
                     state,
                     (s16)(u16)vm->regs[6],
                     (s16)(u16)vm->regs[7],
-                    vm->regs[8],
-                    vm->regs[9],
+                    (s32)vm->regs[8],
+                    (s32)vm->regs[9],
                     picture,
                     virtual_screen,
                     mode,
@@ -5533,8 +5823,8 @@ static c33_vm_status_t dispatch_9588(
                     state,
                     (s16)(u16)vm->regs[6],
                     (s16)(u16)vm->regs[7],
-                    vm->regs[8],
-                    vm->regs[9],
+                    (s32)vm->regs[8],
+                    (s32)vm->regs[9],
                     picture,
                     virtual_screen,
                     mode,
@@ -5778,6 +6068,23 @@ static c33_vm_status_t dispatch_9588(
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_GET_LANDSCAPE:
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    case COMPAT_GUI_ENABLE_STANDBY:
+        /*
+         * The 9288S API toggles the system-wide automatic standby policy.
+         * A 9588 BDA does not own that global policy, and the public SDK has
+         * no equivalent setter. Keep the guest-visible call successful while
+         * leaving power management to the 9588 firmware.
+         */
+        compat_log_record(
+            "GUEST_STANDBY",
+            state->selected_path,
+            vm->regs[6] != 0u,
+            0u,
+            0u,
+            0u
+        );
         vm->regs[4] = 0u;
         return C33_VM_OK;
     case COMPAT_GUI_ATTACH_ENABLE:
@@ -6974,6 +7281,8 @@ static int run_selected_game(
     u32 load_stage;
     s32 load_detail;
     u8 *iram = 0;
+    u8 *io_ram = 0;
+    u8 *ivram = 0;
     u8 *api_ram = 0;
     u8 *heap_ram = 0;
     u8 *code_ram = 0;
@@ -6994,6 +7303,7 @@ static int run_selected_game(
     compat_9588_state_t *state;
     c33_vm_status_t vm_status;
     u32 host_tick;
+    u32 clock_start_tick;
     u8 exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
 
     *reselect_out = 0;
@@ -7110,14 +7420,20 @@ static int run_selected_game(
         return 5;
     }
     iram = (u8 *)bda_alloc(GUEST_IRAM_SIZE);
+    io_ram = (u8 *)bda_alloc(GUEST_IO_SIZE);
+    ivram = (u8 *)bda_alloc(GUEST_IVRAM_SIZE);
     api_ram = (u8 *)bda_alloc(GUEST_API_SIZE);
     heap_ram = (u8 *)bda_alloc(GUEST_HEAP_SIZE);
     code_ram = (u8 *)bda_alloc(code_size);
     if (allocation_failed(iram) ||
+        allocation_failed(io_ram) ||
+        allocation_failed(ivram) ||
         allocation_failed(api_ram) ||
         allocation_failed(heap_ram) ||
         allocation_failed(code_ram)) {
         if (!allocation_failed(iram)) bda_free(iram);
+        if (!allocation_failed(io_ram)) bda_free(io_ram);
+        if (!allocation_failed(ivram)) bda_free(ivram);
         if (!allocation_failed(api_ram)) bda_free(api_ram);
         if (!allocation_failed(heap_ram)) bda_free(heap_ram);
         if (!allocation_failed(code_ram)) bda_free(code_ram);
@@ -7128,9 +7444,9 @@ static int run_selected_game(
             "ALLOC_GUEST_FAILED",
             selected_path,
             (u32)iram,
+            (u32)ivram,
             (u32)api_ram,
-            (u32)heap_ram,
-            (u32)code_ram
+            (u32)heap_ram
         );
         bda_msgbox("9288S compatibility", "Not enough memory for guest RAM");
         return 6;
@@ -7139,12 +7455,22 @@ static int run_selected_game(
         "ALLOC_GUEST_OK",
         selected_path,
         (u32)iram,
+        (u32)ivram,
         (u32)api_ram,
-        (u32)heap_ram,
-        (u32)code_ram
+        (u32)heap_ram
+    );
+    compat_log_record(
+        "ALLOC_GUEST_CODE",
+        selected_path,
+        (u32)code_ram,
+        GUEST_HEAP_SIZE,
+        GUEST_IVRAM_SIZE,
+        code_size
     );
     g_diagnostic[1] = 5u;
     bda_memset(iram, 0, GUEST_IRAM_SIZE);
+    bda_memset(io_ram, 0, GUEST_IO_SIZE);
+    bda_memset(ivram, 0, GUEST_IVRAM_SIZE);
     bda_memset(api_ram, 0, GUEST_API_SIZE);
     bda_memset(heap_ram, 0, GUEST_HEAP_SIZE);
     bda_memset(code_ram, 0, code_size);
@@ -7158,6 +7484,20 @@ static int run_selected_game(
 
     c33_vm_init(vm);
     c33_vm_map(vm, 0, iram, GUEST_IRAM_SIZE, 1);
+    state->guest_ivram = ivram;
+    state->guest_ivram_region = vm->region_count;
+    c33_vm_map(
+        vm, GUEST_IVRAM_BASE, ivram, GUEST_IVRAM_SIZE, 1
+    );
+    c33_vm_map(vm, GUEST_IO_BASE, io_ram, GUEST_IO_SIZE, 1);
+    compat_log_record(
+        "GUEST_IO_READY",
+        selected_path,
+        GUEST_IO_BASE,
+        GUEST_IO_SIZE,
+        GUEST_IO_BASE + GUEST_CLOCK_DIVIDER_OFFSET,
+        0u
+    );
     c33_vm_map(vm, GUEST_API_BASE, api_ram, GUEST_API_SIZE, 1);
     c33_vm_map(vm, GUEST_HEAP_BASE, heap_ram, GUEST_HEAP_SIZE, 1);
     c33_vm_map(vm, GUEST_CODE_BASE, code_ram, code_size, 1);
@@ -7177,6 +7517,8 @@ static int run_selected_game(
         bda_free(code_ram);
         bda_free(heap_ram);
         bda_free(api_ram);
+        bda_free(io_ram);
+        bda_free(ivram);
         bda_free(iram);
         bda_free(framebuffer);
         bda_free(runtime);
@@ -7225,6 +7567,8 @@ static int run_selected_game(
         bda_free(code_ram);
         bda_free(heap_ram);
         bda_free(api_ram);
+        bda_free(io_ram);
+        bda_free(ivram);
         bda_free(iram);
         bda_free(framebuffer);
         bda_free(runtime);
@@ -7243,6 +7587,8 @@ static int run_selected_game(
     vm->sp -= 4u;
     c33_vm_write(vm, vm->sp, exit_pc, sizeof(exit_pc));
     host_tick = bda_gui_tick_count_25ms();
+    clock_start_tick = host_tick;
+    service_guest_clock_io(io_ram, 0u);
     state->heartbeat_tick = bda_gui_tick_count_25ms();
     g_diagnostic[1] = 7u;
     compat_log_vm("VM_START", vm, api, state, C33_VM_OK);
@@ -7269,13 +7615,21 @@ static int run_selected_game(
          */
         {
             u32 current_tick;
-            bda_sys_delay(1u);
+            if (vm->yield_reason == C33_VM_YIELD_GUEST) {
+                ++state->guest_idle_yield_count;
+                bda_sys_delay(1u);
+            } else {
+                ++state->timeslice_yield_count;
+            }
             service_hardware_input(state);
             if (state->request_reselect) {
                 vm_status = C33_VM_DONE;
                 break;
             }
             current_tick = bda_gui_tick_count_25ms();
+            service_guest_clock_io(
+                io_ram, current_tick - clock_start_tick
+            );
             if (current_tick != host_tick) {
                 service_timer(
                     state, (current_tick - host_tick) * 25u
@@ -7316,9 +7670,19 @@ static int run_selected_game(
                 state->heartbeat_tick = current_tick;
             }
         }
-        present_framebuffer(state);
+        present_framebuffer_if_dirty(state);
     }
 
+    (void)sync_guest_ivram(state);
+    log_guest_ivram_stats(state);
+    compat_log_record(
+        "SCHED_STATS",
+        selected_path,
+        state->timeslice_yield_count,
+        state->guest_idle_yield_count,
+        state->framebuffer_present_count,
+        state->framebuffer_skip_count
+    );
     native_input_close(state);
     {
         c33_jit_stats_t jit_stats;
@@ -7363,6 +7727,14 @@ static int run_selected_game(
             (u32)jit_stats.lookup_probes,
             jit_stats.max_lookup_probes
         );
+        compat_log_record(
+            "JIT_STATS_F",
+            selected_path,
+            jit_stats.dispatcher_calls,
+            jit_stats.native_blocks,
+            jit_stats.max_chain_blocks,
+            0u
+        );
     }
     if (vm_status == C33_VM_DONE &&
         !state->quit &&
@@ -7393,6 +7765,8 @@ static int run_selected_game(
     bda_free(code_ram);
     bda_free(heap_ram);
     bda_free(api_ram);
+    bda_free(io_ram);
+    bda_free(ivram);
     bda_free(iram);
     if (state->fullscreen_buffer) {
         bda_free(state->fullscreen_buffer);
@@ -7436,7 +7810,7 @@ int bda_main(void)
     }
     ensure_native_directory_tree(COMPAT_FS_NATIVE_PROGRAMS_ROOT);
     compat_log_write(
-        "9288S compatibility real-device log v11\r\n", 1
+        "9288S compatibility real-device log v17\r\n", 1
     );
     compat_log_record(
         "BDA_START",

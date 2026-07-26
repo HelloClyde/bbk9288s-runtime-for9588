@@ -222,7 +222,8 @@ RGB565 framebuffer 与 9588 原生系统服务
 A:\应用\数据\9288s\9288LOG.TXT
 ```
 
-日志包含程序扫描、D300 装载、API 调用异常、JIT 心跳和退出统计。v11 起复用
+日志包含程序扫描、D300 装载、API 调用异常、JIT 心跳和退出统计。v12 起还会记录
+9288S 片内 VRAM 首次激活及扩展后的客体内存布局；Frame 与输入架构从 v11 起复用
 同一个日志句柄，并过滤逐项扫描、逐帧按键和触摸等高频记录，以降低日志对
 启动和运行速度的影响。
 
@@ -232,7 +233,19 @@ A:\应用\数据\9288s\9288LOG.TXT
 - `VIDEO_DIRECT_READY`：已启用直接 framebuffer 输出；
 - `VIDEO_DIRECT_REJECTED`：固件布局校验失败，已使用安全回退；
 - `SELECTOR_SCAN_END`：`v1` 为扫描耗时，单位是 25 ms；
-- `JIT_HEARTBEAT`、`JIT_STATS_*`：JIT 命中、回退和校验统计。
+- `GUEST_STANDBY`：9288S 程序请求切换待机策略；
+- `GUEST_IVRAM_ACTIVE`、`GUEST_IVRAM_STATS`：程序已直接写入 9288S
+  片内 VRAM，以及退出时的写入/提交/非零字节统计；
+- `GUEST_IO_READY`：已映射 9288S 内部外设页及 S1C33L05 时钟寄存器；
+- `AUDIO_SOURCE_OPEN`：已解析雷霆战机等程序的 RIFF/WAVE 或原始 PCM
+  `MIXERSOURCE`；
+- `AUDIO_MIXER_COMPAT`：程序进入了当前静音承接的旧 Mixer 生命周期；
+- `DISPATCH_FAIL` 与 `VM_STOP` 的 `fpc/op/addr`：窗口回调内真正失败的
+  S1C33 指令地址、opcode 和访存地址（v13 起），不会再被外层
+  `DispatchMessage` 陷阱地址遮住；
+- `JIT_HEARTBEAT`、`JIT_STATS_*`：JIT 命中、回退、校验及连续块分发统计；
+- `SCHED_STATS`（v17 起）：时间片到期、客体真正空闲、实际 framebuffer
+  提交和因画面未变化而跳过提交的次数。
 
 ## 开发与测试
 
@@ -252,6 +265,13 @@ python .\tools\d300_inspect.py .\local\pirate_ship.exe --strings
 
 ```powershell
 .\scripts\probe-d300.ps1 -Image .\local\pirate_ship.exe
+```
+
+对 LavaXOS 体验版中的五个 `.lav` 分别执行长按键回归：
+
+```powershell
+.\scripts\probe-lava-matrix.ps1 `
+  -Image "D:\path\to\系统\程序\LavaXOS.exe"
 ```
 
 仓库结构：

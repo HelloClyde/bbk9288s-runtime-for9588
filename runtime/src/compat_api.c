@@ -1,4 +1,5 @@
 #include "../include/compat_api.h"
+#include "../include/compat_audio.h"
 
 #define ROS33_SLOTS 64u
 #define GUI_SLOTS   512u
@@ -34,6 +35,96 @@ static int api_write_u32(c33_vm_t *vm, uint32_t address, uint32_t value)
         (uint8_t)(value >> 24)
     };
     return c33_vm_write(vm, address, bytes, 4);
+}
+
+static int audio_read_u32(
+    c33_vm_t *vm,
+    uint32_t address,
+    uint32_t *value
+)
+{
+    uint8_t bytes[4];
+    if (!value || !c33_vm_read(vm, address, bytes, sizeof(bytes))) {
+        return 0;
+    }
+    *value =
+        (uint32_t)bytes[0] |
+        ((uint32_t)bytes[1] << 8) |
+        ((uint32_t)bytes[2] << 16) |
+        ((uint32_t)bytes[3] << 24);
+    return 1;
+}
+
+static int audio_tag_equal(const uint8_t *bytes, const char *tag)
+{
+    return bytes[0] == (uint8_t)tag[0] &&
+           bytes[1] == (uint8_t)tag[1] &&
+           bytes[2] == (uint8_t)tag[2] &&
+           bytes[3] == (uint8_t)tag[3];
+}
+
+int compat_audio_mixer_source_open(
+    c33_vm_t *vm,
+    uint32_t source_address
+)
+{
+    uint32_t data_address;
+    uint32_t source_length;
+    uint8_t header[12];
+    uint32_t at;
+    uint32_t end;
+
+    if (!vm ||
+        !audio_read_u32(vm, source_address, &data_address) ||
+        !audio_read_u32(vm, source_address + 4u, &source_length) ||
+        !data_address ||
+        source_length < sizeof(header) ||
+        !c33_vm_read(vm, data_address, header, sizeof(header))) {
+        return 0;
+    }
+    if (!audio_tag_equal(header, "RIFF") ||
+        !audio_tag_equal(header + 8u, "WAVE")) {
+        /*
+         * Thunder's background source is already raw signed 16-bit PCM.
+         * The original mixer accepts it without changing the descriptor.
+         */
+        return 1;
+    }
+    if (source_length > 0xffffffffu - data_address) {
+        return 0;
+    }
+    at = data_address + 12u;
+    end = data_address + source_length;
+    while (at <= end && end - at >= 8u) {
+        uint8_t chunk[8];
+        uint32_t chunk_size;
+        uint32_t payload;
+        if (!c33_vm_read(vm, at, chunk, sizeof(chunk))) {
+            return 0;
+        }
+        chunk_size =
+            (uint32_t)chunk[4] |
+            ((uint32_t)chunk[5] << 8) |
+            ((uint32_t)chunk[6] << 16) |
+            ((uint32_t)chunk[7] << 24);
+        payload = at + 8u;
+        if (payload > end || chunk_size > end - payload) {
+            return 0;
+        }
+        if (audio_tag_equal(chunk, "data")) {
+            return api_write_u32(vm, source_address, payload) &&
+                   api_write_u32(
+                       vm, source_address + 4u, chunk_size
+                   );
+        }
+        if (chunk_size == 0xffffffffu ||
+            payload + chunk_size >
+                0xffffffffu - (chunk_size & 1u)) {
+            return 0;
+        }
+        at = payload + chunk_size + (chunk_size & 1u);
+    }
+    return 0;
 }
 
 static int fill_table(c33_vm_t *vm, uint32_t table,

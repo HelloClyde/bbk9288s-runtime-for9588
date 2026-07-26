@@ -2,17 +2,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <io.h>
+#endif
+
 #include "c33vm.h"
 #include "compat_api.h"
+#include "compat_audio.h"
 #include "compat_fs.h"
 #include "compat_gui.h"
 #include "d300.h"
 
 #define IRAM_SIZE  0x00004000u
+#define IO_BASE    0x00040000u
+#define IO_SIZE    0x00010000u
+#define IVRAM_BASE 0x003c0000u
+#define IVRAM_SIZE 0x0000a000u
 #define API_BASE   0x02000000u
 #define API_SIZE   0x00010000u
 #define HEAP_BASE  0x02600000u
-#define HEAP_SIZE  0x00080000u
+#define HEAP_SIZE  0x00100000u
 #define CODE_BASE  0x02700000u
 #define CODE_SIZE  0x00100000u
 
@@ -22,8 +31,137 @@ static uint32_t listbox_item_count;
 static uint32_t listbox_caret;
 static const char *guest_image_path;
 static FILE *guest_image_file;
+#ifdef _WIN32
+static intptr_t guest_find_handle = -1;
+static struct _finddata_t guest_find_entry;
+static uint32_t guest_find_block;
+#endif
 static unsigned timer_message_sent;
 static int probe_five_options;
+static int probe_gameplay;
+static int probe_thunder;
+static int probe_quiet;
+static unsigned probe_message_limit = 64u;
+static unsigned combo_scan_calls;
+static unsigned probe_lav_index;
+static unsigned create_main_calls;
+static char selected_lav_path[256];
+static unsigned long picv_calls;
+static unsigned long picv_clipped_calls;
+static unsigned long picv_wide_calls;
+static uint32_t picv_last_arguments[7];
+static int picv_last_clip_result;
+static uint32_t probe_timer_hwnd = 1u;
+static uint32_t probe_timer_id = 1u;
+static int probe_timer_active;
+
+static void update_probe_clock_io(unsigned char *io, unsigned ticks)
+{
+    unsigned seconds = ticks / 40u;
+    unsigned days = seconds / 86400u;
+    io[0x153u] = (unsigned char)(((ticks % 40u) * 32u) / 5u);
+    io[0x154u] = (unsigned char)(seconds % 60u);
+    io[0x155u] = (unsigned char)((seconds / 60u) % 60u);
+    io[0x156u] = (unsigned char)((seconds / 3600u) % 24u);
+    io[0x157u] = (unsigned char)days;
+    io[0x158u] = (unsigned char)(days >> 8);
+}
+
+static int read_guest_path(
+    c33_vm_t *vm,
+    uint32_t address,
+    char *path,
+    size_t capacity
+)
+{
+    size_t index;
+    if (!address || !path || capacity < 2u) {
+        return 0;
+    }
+    for (index = 0u; index + 1u < capacity; ++index) {
+        if (!c33_vm_read(vm, address + (uint32_t)index, path + index, 1u)) {
+            return 0;
+        }
+        if (!path[index]) {
+            return 1;
+        }
+    }
+    path[capacity - 1u] = 0;
+    return 0;
+}
+
+static int probe_native_path(
+    const char *guest_path,
+    char *native_path,
+    size_t capacity
+)
+{
+    size_t image_length;
+    size_t root_length;
+    size_t index;
+    unsigned parent_count = 0u;
+    const char *relative = guest_path;
+    if (!guest_image_path || !guest_path || !native_path || !capacity) {
+        return 0;
+    }
+    image_length = strlen(guest_image_path);
+    root_length = image_length;
+    while (root_length > 0u && parent_count < 3u) {
+        --root_length;
+        if (guest_image_path[root_length] == '\\' ||
+            guest_image_path[root_length] == '/') {
+            ++parent_count;
+        }
+    }
+    if (parent_count != 3u) {
+        return 0;
+    }
+    if (relative[0] && relative[1] == ':') {
+        relative += 2;
+    }
+    while (*relative == '\\' || *relative == '/') {
+        ++relative;
+    }
+    if (root_length + 1u + strlen(relative) + 1u > capacity) {
+        return 0;
+    }
+    memcpy(native_path, guest_image_path, root_length);
+    native_path[root_length++] = '\\';
+    for (index = 0u; relative[index]; ++index) {
+        native_path[root_length + index] =
+            relative[index] == '/' ? '\\' : relative[index];
+    }
+    native_path[root_length + index] = 0;
+    return 1;
+}
+
+static FILE *probe_open_guest_file(c33_vm_t *vm, uint32_t path_address)
+{
+    char guest_path[256];
+    char native_path[1024];
+    if (!read_guest_path(
+            vm, path_address, guest_path, sizeof(guest_path)
+        ) ||
+        !probe_native_path(
+            guest_path, native_path, sizeof(native_path)
+        )) {
+        return 0;
+    }
+    {
+        size_t length = strlen(guest_path);
+        if (length >= 4u &&
+            guest_path[length - 4u] == '.' &&
+            (guest_path[length - 3u] == 'l' ||
+             guest_path[length - 3u] == 'L') &&
+            (guest_path[length - 2u] == 'a' ||
+             guest_path[length - 2u] == 'A') &&
+            (guest_path[length - 1u] == 'v' ||
+             guest_path[length - 1u] == 'V')) {
+            memcpy(selected_lav_path, guest_path, length + 1u);
+        }
+    }
+    return fopen(native_path, "rb");
+}
 
 static int read_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t *value)
 {
@@ -48,6 +186,30 @@ static int write_guest_u32(c33_vm_t *vm, uint32_t address, uint32_t value)
     };
     return c33_vm_write(vm, address, bytes, sizeof(bytes));
 }
+
+#ifdef _WIN32
+static int write_guest_find_data(
+    c33_vm_t *vm,
+    uint32_t address,
+    const struct _finddata_t *entry
+)
+{
+    unsigned char block[0x220];
+    size_t name_length;
+    memset(block, 0, sizeof(block));
+    block[4] = (unsigned char)entry->size;
+    block[5] = (unsigned char)(entry->size >> 8);
+    block[6] = (unsigned char)(entry->size >> 16);
+    block[7] = (unsigned char)(entry->size >> 24);
+    block[8] = entry->attrib;
+    name_length = strlen(entry->name);
+    if (name_length >= 0x20au) {
+        name_length = 0x209u;
+    }
+    memcpy(block + 18u, entry->name, name_length);
+    return c33_vm_write(vm, address, block, sizeof(block));
+}
+#endif
 
 static void inspect_put_image(c33_vm_t *vm)
 {
@@ -315,6 +477,108 @@ static void inspect_show_picture_virtual(c33_vm_t *vm)
     free(packed);
 }
 
+static c33_vm_status_t validate_show_picture_virtual(c33_vm_t *vm)
+{
+    struct compat_gui_blit_clip clip;
+    uint32_t picture;
+    uint32_t virtual_screen;
+    uint32_t mode;
+    uint64_t source_address;
+    uint64_t destination_address;
+    unsigned char sample;
+    int width = (int32_t)vm->regs[8];
+    int height = (int32_t)vm->regs[9];
+    int result;
+
+    picv_last_arguments[0] = vm->regs[6];
+    picv_last_arguments[1] = vm->regs[7];
+    picv_last_arguments[2] = vm->regs[8];
+    picv_last_arguments[3] = vm->regs[9];
+    if (!read_guest_u32(vm, vm->sp + 4u, &picture) ||
+        !read_guest_u32(vm, vm->sp + 8u, &virtual_screen) ||
+        !read_guest_u32(vm, vm->sp + 12u, &mode) ||
+        !virtual_screen || (!picture && mode != 4u)) {
+        picv_last_clip_result = COMPAT_GUI_CLIP_INVALID;
+        return C33_VM_FAULT;
+    }
+    picv_last_arguments[4] = picture;
+    picv_last_arguments[5] = virtual_screen;
+    picv_last_arguments[6] = mode;
+    result = compat_gui_clip_packed_2bpp(
+        (int32_t)vm->regs[6],
+        (int32_t)vm->regs[7],
+        width,
+        height,
+        160u,
+        240u,
+        &clip
+    );
+    picv_last_clip_result = result;
+    if (result == COMPAT_GUI_CLIP_INVALID) {
+        return C33_VM_FAULT;
+    }
+    ++picv_calls;
+    if (width > 160 || height > 240) {
+        ++picv_wide_calls;
+    }
+    if (result == COMPAT_GUI_CLIP_EMPTY) {
+        ++picv_clipped_calls;
+        return C33_VM_OK;
+    }
+    if (clip.source_x || clip.source_y ||
+        clip.width != (unsigned)width ||
+        clip.height != (unsigned)height) {
+        ++picv_clipped_calls;
+    }
+    if (mode != 4u) {
+        source_address =
+            (uint64_t)picture +
+            (uint64_t)(clip.source_y + clip.height - 1u) *
+                clip.source_stride +
+            clip.source_byte_start;
+        if (source_address + clip.source_read_bytes - 1u >
+                0xffffffffu ||
+            !c33_vm_read(
+                vm,
+                (uint32_t)source_address,
+                &sample,
+                1u
+            ) ||
+            !c33_vm_read(
+                vm,
+                (uint32_t)source_address + clip.source_read_bytes - 1u,
+                &sample,
+                1u
+            )) {
+            vm->fault_address = (uint32_t)source_address;
+            return C33_VM_FAULT;
+        }
+    }
+    destination_address =
+        (uint64_t)virtual_screen +
+        (uint64_t)(clip.destination_y + clip.height - 1u) * 40u +
+        clip.destination_x / 4u;
+    if (destination_address + (clip.width + 3u) / 4u - 1u >
+            0xffffffffu ||
+        !c33_vm_read(
+            vm,
+            (uint32_t)destination_address,
+            &sample,
+            1u
+        ) ||
+        !c33_vm_read(
+            vm,
+            (uint32_t)destination_address +
+                (clip.width + 3u) / 4u - 1u,
+            &sample,
+            1u
+        )) {
+        vm->fault_address = (uint32_t)destination_address;
+        return C33_VM_FAULT;
+    }
+    return C33_VM_OK;
+}
+
 static c33_vm_status_t report_api(
     compat_api_t *api,
     compat_api_group_t group,
@@ -327,18 +591,21 @@ static c33_vm_status_t report_api(
     c33_vm_t *vm = api->vm;
     (void)opaque;
     ++calls;
-    printf(
-        "host API #%lu: group=%u slot=%u "
-        "args=0x%08lx,0x%08lx,0x%08lx,0x%08lx\n",
-        calls,
-        (unsigned)group,
-        (unsigned)slot,
-        (unsigned long)vm->regs[6],
-        (unsigned long)vm->regs[7],
-        (unsigned long)vm->regs[8],
-        (unsigned long)vm->regs[9]
-    );
-    if (group == COMPAT_API_GUI &&
+    if (!probe_quiet) {
+        printf(
+            "host API #%lu: group=%u slot=%u "
+            "args=0x%08lx,0x%08lx,0x%08lx,0x%08lx\n",
+            calls,
+            (unsigned)group,
+            (unsigned)slot,
+            (unsigned long)vm->regs[6],
+            (unsigned long)vm->regs[7],
+            (unsigned long)vm->regs[8],
+            (unsigned long)vm->regs[9]
+        );
+    }
+    if (!probe_quiet &&
+        group == COMPAT_API_GUI &&
         slot == COMPAT_GUI_PUT_IMAGE_AREA &&
         ++put_image_calls <= 24u) {
         uint32_t index;
@@ -365,7 +632,8 @@ static c33_vm_status_t report_api(
             printf("\n");
         }
     }
-    if (group == COMPAT_API_GUI &&
+    if (!probe_quiet &&
+        group == COMPAT_API_GUI &&
         slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
         slot <= COMPAT_GUI_PRINT_STRING) {
         uint32_t index;
@@ -421,7 +689,9 @@ static c33_vm_status_t report_api(
             inspect_show_picture_screen(vm);
         }
     }
-    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_TEXT_OUT_LEN) {
+    if (!probe_quiet &&
+        group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_TEXT_OUT_LEN) {
         uint32_t length = 0;
         unsigned char text_bytes[64];
         uint32_t i;
@@ -444,7 +714,19 @@ static c33_vm_status_t report_api(
             }
         }
     }
-    if (group == COMPAT_API_GUI && slot == COMPAT_GUI_DRAW_TEXT_EX) {
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_SHOW_PICTURE_VIRTUAL) {
+        c33_vm_status_t picture_status =
+            validate_show_picture_virtual(vm);
+        if (picture_status != C33_VM_OK) {
+            return picture_status;
+        }
+        vm->regs[4] = 1u;
+        return C33_VM_OK;
+    }
+    if (!probe_quiet &&
+        group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_DRAW_TEXT_EX) {
         uint32_t rect[4] = {0, 0, 0, 0};
         uint32_t stack[3] = {0, 0, 0};
         unsigned char text_bytes[64];
@@ -471,7 +753,7 @@ static c33_vm_status_t report_api(
         }
         printf("\n");
     }
-    if (group == COMPAT_API_GUI && slot == 105u) {
+    if (!probe_quiet && group == COMPAT_API_GUI && slot == 105u) {
         uint32_t i;
         printf("  CreateWindowEx stack:");
         for (i = 0; i < 12u; ++i) {
@@ -481,7 +763,7 @@ static c33_vm_status_t report_api(
         }
         printf("\n");
     }
-    if (group == COMPAT_API_FS) {
+    if (!probe_quiet && group == COMPAT_API_FS) {
         unsigned char bytes[96];
         uint32_t argument;
         for (argument = 0; argument < 4u; ++argument) {
@@ -493,6 +775,34 @@ static c33_vm_status_t report_api(
             printf("  FS arg%lu bytes:", (unsigned long)argument);
             for (i = 0; i < sizeof(bytes) && bytes[i]; ++i) {
                 printf(" %02x", bytes[i]);
+            }
+            printf("\n");
+        }
+    }
+    if (!probe_quiet && group == COMPAT_API_AUDIO) {
+        unsigned char source[32];
+        uint32_t data_address = 0u;
+        uint32_t index;
+        if (c33_vm_read(vm, vm->regs[6], source, sizeof(source))) {
+            printf("  Audio object:");
+            for (index = 0u; index < sizeof(source); ++index) {
+                printf(" %02x", source[index]);
+            }
+            printf("\n");
+            data_address =
+                (uint32_t)source[0] |
+                ((uint32_t)source[1] << 8) |
+                ((uint32_t)source[2] << 16) |
+                ((uint32_t)source[3] << 24);
+        }
+        if (data_address &&
+            c33_vm_read(vm, data_address, source, sizeof(source))) {
+            printf(
+                "  Audio data @0x%08lx:",
+                (unsigned long)data_address
+            );
+            for (index = 0u; index < sizeof(source); ++index) {
+                printf(" %02x", source[index]);
             }
             printf("\n");
         }
@@ -693,7 +1003,13 @@ static c33_vm_status_t report_api(
             return C33_VM_FAULT;
         }
         main_window_callback = callback;
-        printf("CreateMainWindow callback=0x%08lx\n", (unsigned long)callback);
+        ++create_main_calls;
+        if (!probe_quiet) {
+            printf(
+                "CreateMainWindow callback=0x%08lx\n",
+                (unsigned long)callback
+            );
+        }
         status = c33_vm_call(
             vm, callback, 1u, COMPAT_MSG_CREATE, 0u, 0u, 1000000u
         );
@@ -712,7 +1028,26 @@ static c33_vm_status_t report_api(
         if (status != C33_VM_OK) {
             return status;
         }
-        if (!probe_five_options) {
+        if (!probe_five_options && !probe_thunder) {
+            unsigned selection_step;
+            if (create_main_calls == 1u) {
+                for (selection_step = 0u;
+                     selection_step < probe_lav_index;
+                     ++selection_step) {
+                    status = c33_vm_call(
+                        vm,
+                        callback,
+                        1u,
+                        COMPAT_MSG_KEYDOWN,
+                        COMPAT_SCANCODE_DOWN,
+                        0u,
+                        1000000u
+                    );
+                    if (status != C33_VM_OK) {
+                        return status;
+                    }
+                }
+            }
             status = c33_vm_call(
                 vm,
                 callback,
@@ -808,15 +1143,12 @@ static c33_vm_status_t report_api(
                 return C33_VM_OK;
             }
         }
-        /*
-         * The probe starts with an empty 9288S data root. Returning the EXE
-         * bytes for every requested save/config file hid first-run paths.
-         */
         if (guest_image_file) {
             fclose(guest_image_file);
             guest_image_file = 0;
         }
-        vm->regs[4] = 0xffffffffu;
+        guest_image_file = probe_open_guest_file(vm, vm->regs[6]);
+        vm->regs[4] = guest_image_file ? 1u : 0xffffffffu;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == 1u) {
@@ -876,16 +1208,74 @@ static c33_vm_status_t report_api(
             ? (uint32_t)ferror(guest_image_file) : 1u;
         return C33_VM_OK;
     }
-    if (group == COMPAT_API_FS &&
-        (slot == 15u || slot == 16u)) {
+    if (group == COMPAT_API_FS && slot == COMPAT_FS_FIND_FIRST) {
+#ifdef _WIN32
+        char guest_path[256];
+        char native_path[1024];
+        if (guest_find_handle != -1) {
+            _findclose(guest_find_handle);
+            guest_find_handle = -1;
+            guest_find_block = 0u;
+        }
+        if (!read_guest_path(
+                vm, vm->regs[6], guest_path, sizeof(guest_path)
+            ) ||
+            !probe_native_path(
+                guest_path, native_path, sizeof(native_path)
+            )) {
+            vm->regs[4] = 0xffffffffu;
+            return C33_VM_OK;
+        }
+        guest_find_handle = _findfirst(native_path, &guest_find_entry);
+        if (guest_find_handle == -1 ||
+            !write_guest_find_data(
+                vm, vm->regs[8], &guest_find_entry
+            )) {
+            if (guest_find_handle != -1) {
+                _findclose(guest_find_handle);
+                guest_find_handle = -1;
+            }
+            guest_find_block = 0u;
+            vm->regs[4] = 0xffffffffu;
+            return C33_VM_OK;
+        }
+        guest_find_block = vm->regs[8];
+        vm->regs[4] = 0u;
+#else
         vm->regs[4] = 0xffffffffu;
+#endif
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == COMPAT_FS_FIND_NEXT) {
+#ifdef _WIN32
+        if (guest_find_handle == -1 ||
+            guest_find_block != vm->regs[6] ||
+            _findnext(guest_find_handle, &guest_find_entry) != 0) {
+            vm->regs[4] = 0xffffffffu;
+        } else if (!write_guest_find_data(
+                       vm, vm->regs[6], &guest_find_entry
+                   )) {
+            return C33_VM_FAULT;
+        } else {
+            vm->regs[4] = 0u;
+        }
+#else
+        vm->regs[4] = 0xffffffffu;
+#endif
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == COMPAT_FS_MKDIR) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
-    if (group == COMPAT_API_FS && slot == 17u) {
+    if (group == COMPAT_API_FS && slot == COMPAT_FS_FIND_CLOSE) {
+#ifdef _WIN32
+        if (guest_find_handle != -1) {
+            _findclose(guest_find_handle);
+            guest_find_handle = -1;
+            guest_find_block = 0u;
+        }
+#endif
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -912,6 +1302,28 @@ static c33_vm_status_t report_api(
         } else {
             vm->regs[4] = buffer;
         }
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_FS && slot == COMPAT_FS_STAT) {
+        FILE *file = probe_open_guest_file(vm, vm->regs[6]);
+        if (!file) {
+            vm->regs[4] = 0xffffffffu;
+            return C33_VM_OK;
+        }
+        if (fseek(file, 0, SEEK_END) != 0) {
+            fclose(file);
+            vm->regs[4] = 0xffffffffu;
+            return C33_VM_OK;
+        }
+        {
+            long size = ftell(file);
+            fclose(file);
+            if (size < 0 ||
+                !write_guest_u32(vm, vm->regs[7] + 8u, (uint32_t)size)) {
+                return C33_VM_FAULT;
+            }
+        }
+        vm->regs[4] = 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_FS && slot == 27u) {
@@ -978,14 +1390,16 @@ static c33_vm_status_t report_api(
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_FILL_BOX) {
         uint32_t height = 0;
         read_guest_u32(vm, vm->sp + 4u, &height);
-        printf(
-            "  FillBox hdc=%lu x=%ld y=%ld w=%lu h=%lu\n",
-            (unsigned long)vm->regs[6],
-            (long)(int32_t)vm->regs[7],
-            (long)(int32_t)vm->regs[8],
-            (unsigned long)vm->regs[9],
-            (unsigned long)height
-        );
+        if (!probe_quiet) {
+            printf(
+                "  FillBox hdc=%lu x=%ld y=%ld w=%lu h=%lu\n",
+                (unsigned long)vm->regs[6],
+                (long)(int32_t)vm->regs[7],
+                (long)(int32_t)vm->regs[8],
+                (unsigned long)vm->regs[9],
+                (unsigned long)height
+            );
+        }
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -1004,14 +1418,19 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_PUT_IMAGE_AREA) {
-        inspect_put_image(vm);
+        if (!probe_quiet) {
+            inspect_put_image(vm);
+        }
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_GET_MESSAGE) {
-        if (timer_message_sent < 64u) {
+        if (timer_message_sent < probe_message_limit) {
             uint32_t message[7] = {
-                1u, COMPAT_MSG_TIMER, 1u, 0u, 0u, 0u, 0u
+                probe_timer_hwnd,
+                COMPAT_MSG_TIMER,
+                probe_timer_active ? probe_timer_id : 1u,
+                0u, 0u, 0u, 0u
             };
             if (probe_five_options && timer_message_sent == 8u) {
                 message[1] = COMPAT_MSG_KEYDOWN;
@@ -1020,7 +1439,32 @@ static c33_vm_status_t report_api(
                        timer_message_sent == 9u) {
                 message[1] = COMPAT_MSG_KEYDOWN;
                 message[2] = COMPAT_SCANCODE_ENTER;
-            } else if (!probe_five_options &&
+            } else if (probe_thunder && timer_message_sent == 16u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = COMPAT_SCANCODE_ENTER;
+            } else if (probe_thunder &&
+                       timer_message_sent >= 32u &&
+                       timer_message_sent % 32u == 8u) {
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] =
+                    ((timer_message_sent / 32u) & 1u)
+                        ? COMPAT_SCANCODE_LEFT
+                        : COMPAT_SCANCODE_RIGHT;
+            } else if (probe_gameplay &&
+                       timer_message_sent >= 16u &&
+                       timer_message_sent % 32u == 8u) {
+                static const uint32_t gameplay_keys[5] = {
+                    COMPAT_SCANCODE_RIGHT,
+                    COMPAT_SCANCODE_LEFT,
+                    COMPAT_SCANCODE_UP,
+                    COMPAT_SCANCODE_DOWN,
+                    COMPAT_SCANCODE_ENTER
+                };
+                message[1] = COMPAT_MSG_KEYDOWN;
+                message[2] = gameplay_keys[
+                    (timer_message_sent / 32u) % 5u
+                ];
+            } else if (!probe_five_options && !probe_gameplay &&
                        timer_message_sent >= 32u &&
                 (timer_message_sent - 32u) % 8u == 0u) {
                 message[1] = COMPAT_MSG_KEYDOWN;
@@ -1043,18 +1487,25 @@ static c33_vm_status_t report_api(
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_SET_TIMER) {
-        /* Record-only timer for startup discovery; no ticks are injected. */
+        probe_timer_hwnd = vm->regs[6];
+        probe_timer_id = vm->regs[7];
+        probe_timer_active = 1;
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI && slot == COMPAT_GUI_KILL_TIMER) {
+        if (probe_timer_active &&
+            vm->regs[6] == probe_timer_hwnd &&
+            vm->regs[7] == probe_timer_id) {
+            probe_timer_active = 0;
+        }
         vm->regs[4] = 1u;
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI &&
         slot >= COMPAT_GUI_SHOW_PICTURE_VIRTUAL &&
         slot <= COMPAT_GUI_PRINT_STRING) {
-        if (slot == COMPAT_GUI_DRAW_ASCII) {
+        if (!probe_quiet && slot == COMPAT_GUI_DRAW_ASCII) {
             uint32_t virtual_screen = 0u;
             printf(
                 "  SysAscii sp=0x%08lx stack5=%s0x%08lx\n",
@@ -1105,16 +1556,38 @@ static c33_vm_status_t report_api(
     }
     if (group == COMPAT_API_GUI &&
         slot == COMPAT_GUI_SCAN_GAME_COMBO_KEYS) {
-        static const unsigned char keys[6] = {0, 0, 0, 0, 0, 0};
+        unsigned char keys[6] = {0, 0, 0, 0, 0, 0};
+        if (probe_gameplay || probe_thunder) {
+            unsigned phase = combo_scan_calls++ % 160u;
+            if (phase >= 8u && phase < 40u) {
+                keys[0] = 1u; /* right */
+            } else if (phase >= 48u && phase < 80u) {
+                keys[1] = 1u; /* left */
+            } else if (phase >= 88u && phase < 104u) {
+                keys[2] = 1u; /* down */
+            } else if (phase >= 112u && phase < 128u) {
+                keys[3] = 1u; /* up */
+            }
+            if ((phase % 20u) < 5u) {
+                keys[5] = 1u; /* enter/fire */
+            }
+        }
         if (!c33_vm_write(vm, vm->regs[6], keys, sizeof(keys))) {
             return C33_VM_FAULT;
         }
-        vm->regs[4] = 0u;
+        vm->regs[4] =
+            keys[0] || keys[1] || keys[2] ||
+            keys[3] || keys[4] || keys[5];
         return C33_VM_OK;
     }
     if (group == COMPAT_API_GUI &&
         (slot == COMPAT_GUI_SET_LANDSCAPE ||
          slot == COMPAT_GUI_GET_LANDSCAPE)) {
+        vm->regs[4] = 0u;
+        return C33_VM_OK;
+    }
+    if (group == COMPAT_API_GUI &&
+        slot == COMPAT_GUI_ENABLE_STANDBY) {
         vm->regs[4] = 0u;
         return C33_VM_OK;
     }
@@ -1145,6 +1618,37 @@ static c33_vm_status_t report_api(
         }
         vm->regs[4] = 0u;
         return C33_VM_OK;
+    }
+    if (group == COMPAT_API_AUDIO) {
+        switch (slot) {
+        case COMPAT_AUDIO_MUTE:
+        case COMPAT_AUDIO_SET_VOLUME:
+        case COMPAT_AUDIO_SET_EQ:
+        case COMPAT_AUDIO_MIXER_SOURCE_CLOSE:
+        case COMPAT_AUDIO_MIXER_OPEN:
+        case COMPAT_AUDIO_MIXER_SET_CHANNEL:
+        case COMPAT_AUDIO_MIXER_START:
+        case COMPAT_AUDIO_MIXER_STOP:
+        case COMPAT_AUDIO_MIXER_CLOSE:
+        case COMPAT_AUDIO_SET_CHANNEL:
+            vm->regs[4] = 1u;
+            return C33_VM_OK;
+        case COMPAT_AUDIO_MIXER_SOURCE_OPEN:
+            vm->regs[4] = (uint32_t)compat_audio_mixer_source_open(
+                vm, vm->regs[6]
+            );
+            return C33_VM_OK;
+        case COMPAT_AUDIO_GET_VOLUME:
+            vm->regs[4] = 5u;
+            return C33_VM_OK;
+        case COMPAT_AUDIO_GET_EQ:
+        case COMPAT_AUDIO_GET_FAV_PARAM:
+        case COMPAT_AUDIO_GET_CHANNEL:
+            vm->regs[4] = 0u;
+            return C33_VM_OK;
+        default:
+            break;
+        }
     }
     return C33_VM_UNSUPPORTED;
 }
@@ -1179,6 +1683,8 @@ int main(int argc, char **argv)
 {
     unsigned char *file_bytes;
     unsigned char *iram;
+    unsigned char *io_ram;
+    unsigned char *ivram;
     unsigned char *api_ram;
     unsigned char *heap_ram;
     unsigned char *code_ram;
@@ -1188,16 +1694,55 @@ int main(int argc, char **argv)
     compat_api_t api;
     c33_vm_status_t status;
     unsigned char exit_pc[4] = {0xfc, 0xff, 0xff, 0x0f};
+    unsigned run_slice;
+    unsigned run_slice_limit;
+    int idle_yield = 0;
 
-    if (argc == 3 && strcmp(argv[1], "--five-options") == 0) {
-        probe_five_options = 1;
-        ++argv;
-        --argc;
+    while (argc > 1) {
+        if (strcmp(argv[1], "--five-options") == 0) {
+            probe_five_options = 1;
+            ++argv;
+            --argc;
+        } else if (strcmp(argv[1], "--gameplay") == 0) {
+            probe_gameplay = 1;
+            ++argv;
+            --argc;
+        } else if (strcmp(argv[1], "--thunder") == 0) {
+            probe_thunder = 1;
+            ++argv;
+            --argc;
+        } else if (strcmp(argv[1], "--quiet") == 0) {
+            probe_quiet = 1;
+            ++argv;
+            --argc;
+        } else if (strcmp(argv[1], "--messages") == 0 && argc > 2) {
+            unsigned long requested = strtoul(argv[2], 0, 0);
+            if (!requested || requested > 1000000u) {
+                fprintf(stderr, "invalid --messages value\n");
+                return 2;
+            }
+            probe_message_limit = (unsigned)requested;
+            argv += 2;
+            argc -= 2;
+        } else if (strcmp(argv[1], "--lav-index") == 0 && argc > 2) {
+            unsigned long requested = strtoul(argv[2], 0, 0);
+            if (requested > 4u) {
+                fprintf(stderr, "invalid --lav-index value\n");
+                return 2;
+            }
+            probe_lav_index = (unsigned)requested;
+            argv += 2;
+            argc -= 2;
+        } else {
+            break;
+        }
     }
     if (argc != 2) {
         fprintf(
             stderr,
-            "usage: d300-core-probe [--five-options] path-to-app.exe\n"
+            "usage: d300-core-probe [--five-options] [--gameplay] "
+            "[--thunder] [--quiet] "
+            "[--messages count] [--lav-index 0..4] path-to-app.exe\n"
         );
         return 2;
     }
@@ -1213,12 +1758,17 @@ int main(int argc, char **argv)
         return 2;
     }
     iram = (unsigned char *)calloc(1, IRAM_SIZE);
+    io_ram = (unsigned char *)calloc(1, IO_SIZE);
+    ivram = (unsigned char *)calloc(1, IVRAM_SIZE);
     api_ram = (unsigned char *)calloc(1, API_SIZE);
     heap_ram = (unsigned char *)calloc(1, HEAP_SIZE);
     code_ram = (unsigned char *)calloc(1, CODE_SIZE);
-    if (!iram || !api_ram || !heap_ram || !code_ram) {
+    if (!iram || !io_ram || !ivram ||
+        !api_ram || !heap_ram || !code_ram) {
         fprintf(stderr, "allocation failed\n");
         free(iram);
+        free(io_ram);
+        free(ivram);
         free(api_ram);
         free(heap_ram);
         free(code_ram);
@@ -1232,6 +1782,8 @@ int main(int argc, char **argv)
     );
     c33_vm_init(&vm);
     c33_vm_map(&vm, 0, iram, IRAM_SIZE, 1);
+    c33_vm_map(&vm, IVRAM_BASE, ivram, IVRAM_SIZE, 1);
+    c33_vm_map(&vm, IO_BASE, io_ram, IO_SIZE, 1);
     c33_vm_map(&vm, API_BASE, api_ram, API_SIZE, 1);
     c33_vm_map(&vm, HEAP_BASE, heap_ram, HEAP_SIZE, 1);
     c33_vm_map(&vm, CODE_BASE, code_ram, CODE_SIZE, 1);
@@ -1242,26 +1794,113 @@ int main(int argc, char **argv)
     vm.sp -= 4;
     c33_vm_write(&vm, vm.sp, exit_pc, sizeof(exit_pc));
 
-    status = c33_vm_run(&vm, 5000000);
+    status = C33_VM_YIELD;
+    run_slice_limit = 16u + probe_message_limit / 16u;
+    for (run_slice = 0u; run_slice < run_slice_limit; ++run_slice) {
+        update_probe_clock_io(io_ram, run_slice);
+        status = c33_vm_run(&vm, 5000000u);
+        if (status != C33_VM_YIELD) {
+            break;
+        }
+        /*
+         * A long guest window callback can consume its private budget and
+         * suspend through c33_vm_call. Resume it exactly as the 9588 runtime
+         * loop does. Stop once the outer message loop itself is idle.
+         */
+        if (!vm.callback_depth &&
+            vm.pc == compat_api_trap(
+                COMPAT_API_GUI, COMPAT_GUI_GET_MESSAGE
+            )) {
+            idle_yield = 1;
+            break;
+        }
+        if (!probe_quiet) {
+            printf(
+                "resume yield slice=%u callback-depth=%u pc=0x%08lx\n",
+                run_slice + 1u,
+                vm.callback_depth,
+                (unsigned long)vm.pc
+            );
+        }
+    }
     printf(
         "status=%s instructions=%llu pc=0x%08lx opcode=0x%04x "
-        "fault-address=0x%08lx last-api=%lu/%lu\n",
+        "fault-address=0x%08lx last-api=%lu/%lu messages=%u/%u "
+        "lav-index=%u\n",
         c33_vm_status_string(status),
         (unsigned long long)vm.instructions,
         (unsigned long)(vm.fault_pc ? vm.fault_pc : vm.pc),
         vm.fault_opcode,
         (unsigned long)vm.fault_address,
         (unsigned long)api.last_group,
-        (unsigned long)api.last_slot
+        (unsigned long)api.last_slot,
+        timer_message_sent,
+        probe_message_limit,
+        probe_lav_index
     );
+    if (selected_lav_path[0]) {
+        size_t path_index;
+        printf("selected-lav-hex=");
+        for (path_index = 0u;
+             selected_lav_path[path_index];
+             ++path_index) {
+            printf(
+                "%02x",
+                (unsigned char)selected_lav_path[path_index]
+            );
+        }
+        printf("\n");
+    }
+    {
+        size_t index;
+        unsigned long nonzero = 0u;
+        unsigned long checksum = 0u;
+        for (index = 0u; index < 160u * 240u / 4u; ++index) {
+            checksum += ivram[index];
+            if (ivram[index]) {
+                ++nonzero;
+            }
+        }
+        printf(
+            "ivram writes=%lu nonzero=%lu checksum=0x%08lx\n",
+            (unsigned long)vm.regions[1].write_count,
+            nonzero,
+            checksum
+        );
+        printf(
+            "picv calls=%lu clipped=%lu wide=%lu\n",
+            picv_calls,
+            picv_clipped_calls,
+            picv_wide_calls
+        );
+        printf(
+            "picv last=%ld x=%ld y=%ld w=%ld h=%ld "
+            "picture=0x%08lx virtual=0x%08lx mode=%lu\n",
+            (long)picv_last_clip_result,
+            (long)(int32_t)picv_last_arguments[0],
+            (long)(int32_t)picv_last_arguments[1],
+            (long)(int32_t)picv_last_arguments[2],
+            (long)(int32_t)picv_last_arguments[3],
+            (unsigned long)picv_last_arguments[4],
+            (unsigned long)picv_last_arguments[5],
+            (unsigned long)picv_last_arguments[6]
+        );
+    }
 
     free(code_ram);
     free(heap_ram);
     free(api_ram);
+    free(ivram);
+    free(io_ram);
     free(iram);
     if (guest_image_file) {
         fclose(guest_image_file);
     }
+#ifdef _WIN32
+    if (guest_find_handle != -1) {
+        _findclose(guest_find_handle);
+    }
+#endif
     free(file_bytes);
-    return status == C33_VM_DONE ? 0 : 1;
+    return status == C33_VM_DONE || idle_yield ? 0 : 1;
 }

@@ -1,6 +1,13 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$Image
+  [string]$Image,
+  [ValidateRange(1, 1000000)]
+  [int]$Messages = 64,
+  [ValidateRange(0, 4)]
+  [int]$LavIndex = 0,
+  [switch]$Gameplay,
+  [switch]$Thunder,
+  [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,5 +33,25 @@ if ($LASTEXITCODE -ne 0) {
   throw "probe build failed with exit code $LASTEXITCODE"
 }
 
-& $ProbeExe $Image
+$ProbeArguments = @()
+if ($Quiet) {
+  $ProbeArguments += "--quiet"
+}
+if ($Gameplay) {
+  $ProbeArguments += "--gameplay"
+}
+if ($Thunder) {
+  $ProbeArguments += "--thunder"
+}
+if ($Messages -ne 64) {
+  $ProbeArguments += "--messages"
+  $ProbeArguments += $Messages.ToString()
+}
+if ($LavIndex -ne 0) {
+  $ProbeArguments += "--lav-index"
+  $ProbeArguments += $LavIndex.ToString()
+}
+$ProbeArguments += $Image
+
+& $ProbeExe @ProbeArguments
 exit $LASTEXITCODE

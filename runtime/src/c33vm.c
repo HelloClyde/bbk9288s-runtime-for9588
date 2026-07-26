@@ -344,6 +344,7 @@ int c33_vm_map(c33_vm_t *vm, uint32_t guest_base, void *host,
     region->guest_base = guest_base;
     region->size = size;
     region->host = (uint8_t *)host;
+    region->write_count = 0u;
     region->writable = writable ? 1 : 0;
     return 1;
 }
@@ -362,6 +363,7 @@ void c33_vm_reset(c33_vm_t *vm, uint32_t entry,
     vm->ahr = 0;
     vm->ext_count = 0;
     vm->callback_depth = 0;
+    vm->yield_reason = C33_VM_YIELD_NONE;
     /* S1C33 GNU ABI: the first argument is passed in R6. */
     vm->regs[6] = argument;
     vm->fault_pc = 0;
@@ -401,6 +403,7 @@ int c33_vm_write(c33_vm_t *vm, uint32_t address,
     for (i = 0; i < size; ++i) {
         dst[i] = src[i];
     }
+    ++region->write_count;
     return 1;
 }
 
@@ -818,6 +821,51 @@ stack_fault:
         return C33_VM_OK;
     }
 
+    /*
+     * Memory bit operations:
+     *   0xA8__ btst, 0xAC__ bclr, 0xB0__ bset, 0xB4__ bnot.
+     *
+     * LavaXOS's LVM uses btst while loading a program, then bclr when a
+     * direction key advances the game state. They all address one byte and
+     * accept the same one/two ext displacement prefixes. Only btst changes
+     * flags; the three read-modify-write forms preserve the complete PSR.
+     */
+    if ((word & 0xff08u) == 0xa800u ||
+        (word & 0xff08u) == 0xac00u ||
+        (word & 0xff08u) == 0xb000u ||
+        (word & 0xff08u) == 0xb400u) {
+        uint32_t address;
+        uint8_t value;
+        uint8_t mask = (uint8_t)(1u << (word & 7u));
+        uint16_t operation = word & 0xff08u;
+        rb = (word >> 4) & 0xfu;
+        address = extended_addr(vm, vm->regs[rb]);
+        if (!read_u8(vm, address, &value)) {
+            vm->fault_address = address;
+            return fault(vm, C33_VM_FAULT, instruction_pc, word);
+        }
+        if (operation == 0xa800u) {
+            vm->psr &= ~C33_PSR_Z;
+            if (!(value & mask)) {
+                vm->psr |= C33_PSR_Z;
+            }
+        } else {
+            if (operation == 0xac00u) {
+                value &= (uint8_t)~mask;
+            } else if (operation == 0xb000u) {
+                value |= mask;
+            } else {
+                value ^= mask;
+            }
+            if (!write_u8(vm, address, value)) {
+                vm->fault_address = address;
+                return fault(vm, C33_VM_FAULT, instruction_pc, word);
+            }
+        }
+        clear_ext(vm);
+        return C33_VM_OK;
+    }
+
     if (word >= 0xa100 && word <= 0xadff &&
         ((word >> 8) & 3u) == 1u &&
         ((word >> 10) & 7u) <= 3u) {
@@ -909,6 +957,7 @@ stack_fault:
 
 c33_vm_status_t c33_vm_run(c33_vm_t *vm, uint32_t budget)
 {
+    vm->yield_reason = C33_VM_YIELD_NONE;
     while (budget) {
         uint32_t native_count = c33_jit_run_block(vm, budget);
         if (native_count) {
@@ -937,10 +986,15 @@ c33_vm_status_t c33_vm_run(c33_vm_t *vm, uint32_t budget)
             continue;
         }
         if (status != C33_VM_OK) {
+            if (status == C33_VM_YIELD &&
+                vm->yield_reason == C33_VM_YIELD_NONE) {
+                vm->yield_reason = C33_VM_YIELD_GUEST;
+            }
             return status;
         }
         }
     }
+    vm->yield_reason = C33_VM_YIELD_TIMESLICE;
     return C33_VM_YIELD;
 }
 
@@ -976,6 +1030,7 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     vm->regs[8] = arg2;
     vm->regs[9] = arg3;
     vm->ext_count = 0;
+    vm->yield_reason = C33_VM_YIELD_NONE;
     status = C33_VM_OK;
     while (budget) {
         uint32_t native_count = c33_jit_run_block(vm, budget);
@@ -992,6 +1047,10 @@ c33_vm_status_t c33_vm_call(c33_vm_t *vm, uint32_t target,
     }
     if (status == C33_VM_OK) {
         status = C33_VM_YIELD;
+        vm->yield_reason = C33_VM_YIELD_TIMESLICE;
+    } else if (status == C33_VM_YIELD &&
+               vm->yield_reason == C33_VM_YIELD_NONE) {
+        vm->yield_reason = C33_VM_YIELD_GUEST;
     }
 
     /*

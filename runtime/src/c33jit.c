@@ -26,6 +26,12 @@
 #define C33_JIT_MEM_SIZE_4 2u
 #define C33_JIT_MEM_STORE  (1u << 2)
 #define C33_JIT_MEM_SIGNED (1u << 3)
+#define C33_JIT_MEM_BIT_CLEAR (1u << 4)
+#define C33_JIT_MEM_BIT_SET   (1u << 5)
+#define C33_JIT_MEM_BIT_NOT   (1u << 6)
+#define C33_JIT_MEM_BIT_MASK \
+    (C33_JIT_MEM_BIT_CLEAR | C33_JIT_MEM_BIT_SET | \
+     C33_JIT_MEM_BIT_NOT)
 
 typedef uint32_t (*c33_jit_entry_fn)(c33_vm_t *vm);
 
@@ -95,6 +101,8 @@ static void jit_copy_vm(c33_vm_t *destination, const c33_vm_t *source)
             source->regions[index].guest_base;
         destination->regions[index].size = source->regions[index].size;
         destination->regions[index].host = source->regions[index].host;
+        destination->regions[index].write_count =
+            source->regions[index].write_count;
         destination->regions[index].writable =
             source->regions[index].writable;
     }
@@ -106,6 +114,7 @@ static void jit_copy_vm(c33_vm_t *destination, const c33_vm_t *source)
             source->callbacks[index].resume_sp;
     }
     destination->callback_depth = source->callback_depth;
+    destination->yield_reason = source->yield_reason;
     destination->hostcall = source->hostcall;
     destination->hostcall_opaque = source->hostcall_opaque;
     destination->fault_pc = source->fault_pc;
@@ -162,6 +171,25 @@ static uint32_t jit_memory_access(
         size_code == C33_JIT_MEM_SIZE_1 ? 1u :
         size_code == C33_JIT_MEM_SIZE_2 ? 2u : 4u;
     uint32_t value;
+    if (descriptor & C33_JIT_MEM_BIT_MASK) {
+        if (!c33_vm_read(vm, address, bytes, 1u)) {
+            vm->fault_address = address;
+            return 0u;
+        }
+        if (descriptor & C33_JIT_MEM_BIT_CLEAR) {
+            bytes[0] &= (uint8_t)~store_value;
+        } else if (descriptor & C33_JIT_MEM_BIT_SET) {
+            bytes[0] |= (uint8_t)store_value;
+        } else {
+            bytes[0] ^= (uint8_t)store_value;
+        }
+        if (!c33_vm_write(vm, address, bytes, 1u)) {
+            vm->fault_address = address;
+            return 0u;
+        }
+        vm->jit_value = bytes[0];
+        return 1u;
+    }
     if (descriptor & C33_JIT_MEM_STORE) {
         bytes[0] = (uint8_t)store_value;
         bytes[1] = (uint8_t)(store_value >> 8);
@@ -898,6 +926,14 @@ static int jit_is_memory_instruction(uint16_t word)
     return word >= 0x4000u && word <= 0x5fffu;
 }
 
+static int jit_is_memory_bit_operation(uint16_t word)
+{
+    uint16_t operation = word & 0xff08u;
+    return operation == 0xa800u ||
+           operation == 0xac00u ||
+           operation == 0xb000u;
+}
+
 static uint32_t jit_memory_size_code(uint32_t operation)
 {
     if (operation == 0u || operation == 1u || operation == 5u) {
@@ -1022,6 +1058,111 @@ static int jit_emit_memory(
         );
         mips_store_guest_reg(emitter, MIPS_T0, base);
     }
+    return !emitter->failed;
+}
+
+static int jit_emit_memory_bit_operation(
+    mips_emitter_t *emitter,
+    uint16_t word,
+    uint32_t ext_count,
+    uint16_t ext0,
+    uint16_t ext1
+)
+{
+    uint32_t base;
+    uint32_t offset;
+    uint32_t mask;
+    uint32_t descriptor = C33_JIT_MEM_SIZE_1;
+    uint16_t operation = word & 0xff08u;
+    uint32_t psr_offset = (uint32_t)offsetof(c33_vm_t, psr);
+
+    if (!jit_is_memory_bit_operation(word)) {
+        return 0;
+    }
+    base = (word >> 4) & 15u;
+    mask = 1u << (word & 7u);
+    if (ext_count == 0u) {
+        offset = 0u;
+    } else if (ext_count == 1u) {
+        offset = ext0;
+    } else {
+        offset = ((uint32_t)ext0 << 13) + ext1;
+    }
+
+    mips_load_guest_reg(emitter, MIPS_T0, base);
+    mips_li(emitter, MIPS_T1, offset);
+    mips_emit(
+        emitter,
+        mips_r(MIPS_T0, MIPS_T1, MIPS_A1, 0u, 0x21u)
+    );
+    if (operation == 0xac00u) {
+        descriptor |= C33_JIT_MEM_BIT_CLEAR;
+    } else if (operation == 0xb000u) {
+        descriptor |= C33_JIT_MEM_BIT_SET;
+    } else if (operation == 0xb400u) {
+        descriptor |= C33_JIT_MEM_BIT_NOT;
+    }
+    mips_li(emitter, MIPS_A2, descriptor);
+    mips_li(emitter, MIPS_A3, mask);
+    mips_li(
+        emitter,
+        MIPS_T9,
+        (uint32_t)(uintptr_t)&jit_memory_access
+    );
+    mips_emit(
+        emitter,
+        mips_r(MIPS_T9, MIPS_ZERO, MIPS_RA, 0u, 0x09u)
+    );
+    mips_nop(emitter);
+
+    if (emitter->bailout_count >= C33_JIT_MAX_BLOCK_INSNS) {
+        emitter->failed = 1;
+        return 0;
+    }
+    emitter->bailout_branches[emitter->bailout_count++] =
+        emitter->count;
+    mips_emit(
+        emitter,
+        mips_i(0x04u, MIPS_V0, MIPS_ZERO, 0u)
+    );
+    mips_nop(emitter);
+    mips_lw(emitter, MIPS_A0, MIPS_SP, 8u);
+
+    if (operation != 0xa800u) {
+        return !emitter->failed;
+    }
+
+    /*
+     * Preserve all PSR bits except Z. sltiu produces one exactly when the
+     * selected source bit is zero, which is then shifted into C33_PSR_Z.
+     */
+    mips_lw(
+        emitter,
+        MIPS_T0,
+        MIPS_A0,
+        (uint32_t)offsetof(c33_vm_t, jit_value)
+    );
+    mips_li(emitter, MIPS_T1, mask);
+    mips_emit(
+        emitter,
+        mips_r(MIPS_T0, MIPS_T1, MIPS_T0, 0u, 0x24u)
+    );
+    mips_emit(emitter, mips_i(0x0bu, MIPS_T0, MIPS_T0, 1u));
+    mips_emit(
+        emitter,
+        mips_r(MIPS_ZERO, MIPS_T0, MIPS_T0, 1u, 0x00u)
+    );
+    mips_lw(emitter, MIPS_T1, MIPS_A0, psr_offset);
+    mips_li(emitter, MIPS_T2, ~C33_PSR_Z);
+    mips_emit(
+        emitter,
+        mips_r(MIPS_T1, MIPS_T2, MIPS_T1, 0u, 0x24u)
+    );
+    mips_emit(
+        emitter,
+        mips_r(MIPS_T1, MIPS_T0, MIPS_T1, 0u, 0x25u)
+    );
+    mips_sw(emitter, MIPS_T1, MIPS_A0, psr_offset);
     return !emitter->failed;
 }
 
@@ -1423,7 +1564,8 @@ static c33_jit_entry_t *jit_compile_block(
                 scan_pc += 2u;
                 continue;
             }
-            uses_call = jit_is_memory_instruction(word);
+            uses_call = jit_is_memory_instruction(word) ||
+                        jit_is_memory_bit_operation(word);
             break;
         }
     }
@@ -1496,6 +1638,21 @@ static c33_jit_entry_t *jit_compile_block(
                 memory_emitted ||
                 source_count != ext_count ||
                 !jit_emit_memory(
+                    &emitter, word, ext_count, ext0, ext1
+                )) {
+                break;
+            }
+            memory_emitted = 1;
+            ext_count = 0u;
+            ++source_count;
+            source_pc += 2u;
+            continue;
+        }
+        if (jit_is_memory_bit_operation(word)) {
+            if (!uses_call ||
+                memory_emitted ||
+                source_count != ext_count ||
+                !jit_emit_memory_bit_operation(
                     &emitter, word, ext_count, ext0, ext1
                 )) {
                 break;
@@ -1627,88 +1784,115 @@ void c33_jit_reset(c33_vm_t *vm)
     g_c33_jit.stats.compile_failures = 0u;
     g_c33_jit.stats.lookup_probes = 0u;
     g_c33_jit.stats.max_lookup_probes = 0u;
+    g_c33_jit.stats.dispatcher_calls = 0u;
+    g_c33_jit.stats.native_blocks = 0u;
+    g_c33_jit.stats.max_chain_blocks = 0u;
 }
 
 uint32_t c33_jit_run_block(c33_vm_t *vm, uint32_t budget)
 {
 #if C33_JIT_NATIVE_MIPS
-    c33_jit_entry_t *entry;
-    uint32_t executed;
-    int known_unsupported;
+    uint32_t total_executed = 0u;
+    uint32_t chain_blocks = 0u;
     if (!g_c33_jit.stats.enabled ||
         g_c33_jit.owner != vm ||
         vm->ext_count != 0u ||
         !budget) {
         return 0u;
     }
-    entry = jit_find_entry(
-        &g_c33_jit, vm->pc, &known_unsupported
-    );
-    if (known_unsupported) {
-        ++g_c33_jit.stats.negative_hits;
-        return 0u;
-    }
-    if (entry) {
-        ++g_c33_jit.stats.cache_hits;
-    } else {
-        ++g_c33_jit.stats.cache_misses;
-        entry = jit_compile_block(&g_c33_jit, vm, vm->pc);
-        if (!entry) {
-            jit_set_lookup(
-                &g_c33_jit,
-                vm->pc,
-                C33_JIT_LOOKUP_UNSUPPORTED,
-                0u
-            );
-            ++g_c33_jit.stats.compile_failures;
+    ++g_c33_jit.stats.dispatcher_calls;
+    /*
+     * Stay in the JIT dispatcher while consecutive compiled blocks remain
+     * available. LavaXOS averages fewer than three guest instructions per
+     * block, so returning through c33_vm_run after every block used to add
+     * tens of millions of avoidable C call/return pairs on real hardware.
+     * Unsupported PCs still return to the interpreter after one lookup.
+     */
+    while (total_executed < budget && vm->ext_count == 0u) {
+        c33_jit_entry_t *entry;
+        uint32_t executed;
+        uint32_t remaining = budget - total_executed;
+        int known_unsupported;
+
+        entry = jit_find_entry(
+            &g_c33_jit, vm->pc, &known_unsupported
+        );
+        if (known_unsupported) {
+            ++g_c33_jit.stats.negative_hits;
+            break;
         }
-    }
-    if (!entry || entry->source_instructions > budget) {
-        return 0u;
-    }
-    if (entry->invalid) {
-        return 0u;
-    }
-    if (!entry->verified) {
-        c33_vm_t reference;
-        c33_vm_status_t status = C33_VM_OK;
-        uint64_t reference_start;
-        jit_copy_vm(&reference, vm);
-        reference_start = reference.instructions;
-        while (status == C33_VM_OK &&
-               reference.instructions - reference_start <
-                   entry->source_instructions) {
-            status = c33_vm_step(&reference);
+        if (entry) {
+            ++g_c33_jit.stats.cache_hits;
+        } else {
+            ++g_c33_jit.stats.cache_misses;
+            entry = jit_compile_block(&g_c33_jit, vm, vm->pc);
+            if (!entry) {
+                jit_set_lookup(
+                    &g_c33_jit,
+                    vm->pc,
+                    C33_JIT_LOOKUP_UNSUPPORTED,
+                    0u
+                );
+                ++g_c33_jit.stats.compile_failures;
+            }
+        }
+        if (!entry ||
+            entry->source_instructions > remaining ||
+            entry->invalid) {
+            break;
+        }
+        if (!entry->verified) {
+            c33_vm_t reference;
+            c33_vm_status_t status = C33_VM_OK;
+            uint64_t reference_start;
+            jit_copy_vm(&reference, vm);
+            reference_start = reference.instructions;
+            while (status == C33_VM_OK &&
+                   reference.instructions - reference_start <
+                       entry->source_instructions) {
+                status = c33_vm_step(&reference);
+            }
+            executed = entry->native_entry(vm);
+            if (status != C33_VM_OK ||
+                reference.instructions - reference_start !=
+                    entry->source_instructions ||
+                executed != entry->source_instructions ||
+                !jit_same_architecture(vm, &reference)) {
+                entry->invalid = 1u;
+                ++g_c33_jit.stats.verification_failures;
+                g_c33_jit.stats.last_failed_pc = entry->guest_pc;
+                jit_set_lookup(
+                    &g_c33_jit,
+                    entry->guest_pc,
+                    C33_JIT_LOOKUP_UNSUPPORTED,
+                    0u
+                );
+                jit_copy_vm(vm, &reference);
+                return total_executed + entry->source_instructions;
+            }
+            entry->verified = 1u;
+            ++g_c33_jit.stats.blocks_verified;
+            g_c33_jit.stats.native_instructions += executed;
+            ++g_c33_jit.stats.native_blocks;
+            ++chain_blocks;
+            if (chain_blocks > g_c33_jit.stats.max_chain_blocks) {
+                g_c33_jit.stats.max_chain_blocks = chain_blocks;
+            }
+            return total_executed + executed;
         }
         executed = entry->native_entry(vm);
-        if (status != C33_VM_OK ||
-            reference.instructions - reference_start !=
-                entry->source_instructions ||
-            executed != entry->source_instructions ||
-            !jit_same_architecture(vm, &reference)) {
-            entry->invalid = 1u;
-            ++g_c33_jit.stats.verification_failures;
-            g_c33_jit.stats.last_failed_pc = entry->guest_pc;
-            jit_set_lookup(
-                &g_c33_jit,
-                entry->guest_pc,
-                C33_JIT_LOOKUP_UNSUPPORTED,
-                0u
-            );
-            jit_copy_vm(vm, &reference);
-            return entry->source_instructions;
+        if (executed != entry->source_instructions) {
+            return total_executed;
         }
-        entry->verified = 1u;
-        ++g_c33_jit.stats.blocks_verified;
         g_c33_jit.stats.native_instructions += executed;
-        return executed;
+        ++g_c33_jit.stats.native_blocks;
+        ++chain_blocks;
+        if (chain_blocks > g_c33_jit.stats.max_chain_blocks) {
+            g_c33_jit.stats.max_chain_blocks = chain_blocks;
+        }
+        total_executed += executed;
     }
-    executed = entry->native_entry(vm);
-    if (executed != entry->source_instructions) {
-        return 0u;
-    }
-    g_c33_jit.stats.native_instructions += executed;
-    return executed;
+    return total_executed;
 #else
     (void)vm;
     (void)budget;
@@ -1749,6 +1933,11 @@ void c33_jit_get_stats(c33_vm_t *vm, c33_jit_stats_t *stats)
         stats->lookup_probes = g_c33_jit.stats.lookup_probes;
         stats->max_lookup_probes =
             g_c33_jit.stats.max_lookup_probes;
+        stats->dispatcher_calls =
+            g_c33_jit.stats.dispatcher_calls;
+        stats->native_blocks = g_c33_jit.stats.native_blocks;
+        stats->max_chain_blocks =
+            g_c33_jit.stats.max_chain_blocks;
         stats->cache_used = g_c33_jit.cache_used;
     }
 }

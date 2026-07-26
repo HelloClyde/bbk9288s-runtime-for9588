@@ -27,10 +27,17 @@ typedef enum c33_vm_status {
     C33_VM_UNSUPPORTED
 } c33_vm_status_t;
 
+typedef enum c33_vm_yield_reason {
+    C33_VM_YIELD_NONE = 0,
+    C33_VM_YIELD_TIMESLICE,
+    C33_VM_YIELD_GUEST
+} c33_vm_yield_reason_t;
+
 typedef struct c33_vm_region {
     uint32_t guest_base;
     uint32_t size;
     uint8_t *host;
+    uint32_t write_count;
     uint8_t writable;
 } c33_vm_region_t;
 
@@ -60,6 +67,7 @@ typedef struct c33_vm {
     uint8_t region_count;
     c33_vm_callback_t callbacks[C33_VM_MAX_CALLBACKS];
     uint8_t callback_depth;
+    uint8_t yield_reason;
     c33_vm_hostcall_fn hostcall;
     void *hostcall_opaque;
     uint32_t fault_pc;

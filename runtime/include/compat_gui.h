@@ -102,6 +102,7 @@ enum compat_gui_slot {
     COMPAT_GUI_GET_SCREEN_HEIGHT = 438,
     COMPAT_GUI_SET_LANDSCAPE = 439,
     COMPAT_GUI_GET_LANDSCAPE = 440,
+    COMPAT_GUI_ENABLE_STANDBY = 447,
     COMPAT_GUI_HELP2 = 448,
     COMPAT_GUI_TRACE_INIT = 449,
     COMPAT_GUI_ATTACH_ENABLE = 455,
@@ -147,6 +148,98 @@ enum compat_gui_scancode {
 #define COMPAT_KEYSTATE_LEFT_BUTTON 0x00001000u
 #define COMPAT_MAIN_WIN_CREATE_PROC_OFFSET 24u
 #define COMPAT_GUI_IMAGE_HEADER_SIZE 16u
+
+enum compat_gui_clip_result {
+    COMPAT_GUI_CLIP_INVALID = -1,
+    COMPAT_GUI_CLIP_EMPTY = 0,
+    COMPAT_GUI_CLIP_VISIBLE = 1
+};
+
+struct compat_gui_blit_clip {
+    unsigned source_x;
+    unsigned source_y;
+    unsigned destination_x;
+    unsigned destination_y;
+    unsigned width;
+    unsigned height;
+    unsigned source_stride;
+    unsigned source_byte_start;
+    unsigned source_read_bytes;
+};
+
+static inline int compat_gui_clip_packed_2bpp(
+    int x,
+    int y,
+    int width,
+    int height,
+    unsigned screen_width,
+    unsigned screen_height,
+    struct compat_gui_blit_clip *clip
+)
+{
+    unsigned source_width;
+    unsigned source_height;
+    unsigned source_x = 0u;
+    unsigned source_y = 0u;
+    unsigned destination_x;
+    unsigned destination_y;
+    unsigned clipped_width;
+    unsigned clipped_height;
+
+    if (!clip || !screen_width || !screen_height ||
+        screen_width > 0x7fffffffu ||
+        screen_height > 0x7fffffffu) {
+        return COMPAT_GUI_CLIP_INVALID;
+    }
+    /*
+     * Several shipped games calculate a remaining sprite rectangle before
+     * calling SysShowPicV. Once the sprite has moved completely beyond an
+     * edge, that calculation can become zero or negative. The 9288S routine
+     * treats it as an empty draw.
+     */
+    if (width <= 0 || height <= 0) {
+        return COMPAT_GUI_CLIP_EMPTY;
+    }
+    source_width = (unsigned)width;
+    source_height = (unsigned)height;
+    if (x < 0) {
+        source_x = (unsigned)(-(x + 1)) + 1u;
+    }
+    if (y < 0) {
+        source_y = (unsigned)(-(y + 1)) + 1u;
+    }
+    if (source_x >= source_width || source_y >= source_height ||
+        x >= (int)screen_width || y >= (int)screen_height) {
+        return COMPAT_GUI_CLIP_EMPTY;
+    }
+    destination_x = x < 0 ? 0u : (unsigned)x;
+    destination_y = y < 0 ? 0u : (unsigned)y;
+    clipped_width = source_width - source_x;
+    clipped_height = source_height - source_y;
+    if (clipped_width > screen_width - destination_x) {
+        clipped_width = screen_width - destination_x;
+    }
+    if (clipped_height > screen_height - destination_y) {
+        clipped_height = screen_height - destination_y;
+    }
+    if (!clipped_width || !clipped_height) {
+        return COMPAT_GUI_CLIP_EMPTY;
+    }
+
+    clip->source_x = source_x;
+    clip->source_y = source_y;
+    clip->destination_x = destination_x;
+    clip->destination_y = destination_y;
+    clip->width = clipped_width;
+    clip->height = clipped_height;
+    clip->source_stride =
+        source_width / 4u + ((source_width & 3u) != 0u);
+    clip->source_byte_start = source_x / 4u;
+    clip->source_read_bytes =
+        ((source_x & 3u) + clipped_width + 3u) / 4u;
+    return COMPAT_GUI_CLIP_VISIBLE;
+}
+
 static inline unsigned compat_gui_timer_interval_ms(unsigned speed)
 {
     /*

@@ -3,6 +3,7 @@
 
 #include "c33vm.h"
 #include "compat_api.h"
+#include "compat_audio.h"
 #include "compat_fs.h"
 #include "compat_gui.h"
 #include "d300.h"
@@ -110,6 +111,33 @@ static int test_fs_path_mapping(void)
     return 0;
 }
 
+static int test_vm_region_write_tracking(void)
+{
+    unsigned char ram[8] = {0};
+    unsigned char value = 0x5au;
+    c33_vm_t vm;
+
+    c33_vm_init(&vm);
+    if (!c33_vm_map(&vm, 0x003c0000u, ram, sizeof(ram), 1) ||
+        vm.regions[0].write_count != 0u) {
+        return 1;
+    }
+    if (!c33_vm_write(&vm, 0x003c0003u, &value, 1u) ||
+        ram[3] != value ||
+        vm.regions[0].write_count != 1u) {
+        return 2;
+    }
+    if (!c33_vm_read(&vm, 0x003c0003u, &value, 1u) ||
+        vm.regions[0].write_count != 1u) {
+        return 3;
+    }
+    if (c33_vm_write(&vm, 0x003c0008u, &value, 1u) ||
+        vm.regions[0].write_count != 1u) {
+        return 4;
+    }
+    return 0;
+}
+
 static int test_vm_return(void)
 {
     unsigned char iram[0x4000];
@@ -141,6 +169,65 @@ static int test_vm_return(void)
         return 3;
     }
     return vm.regs[4] == 1 ? 0 : 4;
+}
+
+static int test_vm_memory_bit_test(void)
+{
+    unsigned char code[14] = {
+        0xf7, 0xa8, /* btst [%r15],7 */
+        0xf7, 0xac, /* bclr [%r15],7 */
+        0xf7, 0xb0, /* bset [%r15],7 */
+        0xf4, 0xb4, /* bnot [%r15],4 */
+        0x01, 0xc0, /* ext 1 */
+        0xf7, 0xa8, /* btst [%r15+1],7 */
+        0x00, 0x00
+    };
+    unsigned char data[2] = {0x90, 0x00};
+    c33_vm_t vm;
+
+    c33_vm_init(&vm);
+    if (!c33_vm_map(
+            &vm, 0x02700000u, code, sizeof(code), 0
+        ) ||
+        !c33_vm_map(
+            &vm, 0x02600000u, data, sizeof(data), 1
+        )) {
+        return 1;
+    }
+    c33_vm_reset(&vm, 0x02700000u, 0x3f80u, 0u);
+    vm.regs[15] = 0x02600000u;
+    vm.psr = C33_PSR_N | C33_PSR_V | C33_PSR_C | C33_PSR_Z;
+    if (c33_vm_step(&vm) != C33_VM_OK ||
+        (vm.psr & C33_PSR_Z) ||
+        (vm.psr & (C33_PSR_N | C33_PSR_V | C33_PSR_C)) !=
+            (C33_PSR_N | C33_PSR_V | C33_PSR_C)) {
+        return 2;
+    }
+    if (c33_vm_step(&vm) != C33_VM_OK ||
+        data[0] != 0x10u ||
+        (vm.psr & (C33_PSR_N | C33_PSR_V |
+                   C33_PSR_C | C33_PSR_Z)) !=
+            (C33_PSR_N | C33_PSR_V | C33_PSR_C)) {
+        return 3;
+    }
+    if (c33_vm_step(&vm) != C33_VM_OK ||
+        data[0] != 0x90u ||
+        c33_vm_step(&vm) != C33_VM_OK ||
+        data[0] != 0x80u ||
+        (vm.psr & (C33_PSR_N | C33_PSR_V |
+                   C33_PSR_C | C33_PSR_Z)) !=
+            (C33_PSR_N | C33_PSR_V | C33_PSR_C)) {
+        return 4;
+    }
+    if (c33_vm_step(&vm) != C33_VM_OK ||
+        c33_vm_step(&vm) != C33_VM_OK ||
+        !(vm.psr & C33_PSR_Z) ||
+        vm.ext_count != 0u ||
+        (vm.psr & (C33_PSR_N | C33_PSR_V | C33_PSR_C)) !=
+            (C33_PSR_N | C33_PSR_V | C33_PSR_C)) {
+        return 5;
+    }
+    return 0;
 }
 
 static int test_vm_callback(void)
@@ -246,6 +333,7 @@ static int test_vm_suspended_callback(void)
     async_callback_tail = 0x02700000u;
     status = c33_vm_run(&vm, 16);
     if (status != C33_VM_YIELD ||
+        vm.yield_reason != C33_VM_YIELD_GUEST ||
         vm.callback_depth != 1u ||
         vm.pc != inner_trap) {
         return 3;
@@ -260,6 +348,25 @@ static int test_vm_suspended_callback(void)
         return 4;
     }
     async_callback_tail = 0u;
+    return 0;
+}
+
+static int test_vm_timeslice_yield(void)
+{
+    unsigned char code[64];
+    c33_vm_t vm;
+
+    memset(code, 0, sizeof(code));
+    c33_vm_init(&vm);
+    if (!c33_vm_map(&vm, 0x02700000u, code, sizeof(code), 0)) {
+        return 1;
+    }
+    c33_vm_reset(&vm, 0x02700000u, 0x3f80u, 0u);
+    if (c33_vm_run(&vm, 32u) != C33_VM_YIELD ||
+        vm.yield_reason != C33_VM_YIELD_TIMESLICE ||
+        vm.instructions != 32u) {
+        return 2;
+    }
     return 0;
 }
 
@@ -390,6 +497,7 @@ static int test_api_tables(void)
 
 static int test_gui_image_header(void)
 {
+    struct compat_gui_blit_clip clip;
     unsigned char header[COMPAT_GUI_IMAGE_HEADER_SIZE] = {
         0x10, 0x00, 0x10, 0x00,
         0x00, 0x02, 0x00, 0x00,
@@ -432,6 +540,106 @@ static int test_gui_image_header(void)
         compat_gui_timer_interval_ms(0) != 3u) {
         return 6;
     }
+    if (COMPAT_GUI_ENABLE_STANDBY != 447u) {
+        return 7;
+    }
+    if (compat_gui_clip_packed_2bpp(
+            -41, 239, 200, 13, 160, 240, &clip
+        ) != COMPAT_GUI_CLIP_VISIBLE ||
+        clip.source_x != 41u ||
+        clip.source_y != 0u ||
+        clip.destination_x != 0u ||
+        clip.destination_y != 239u ||
+        clip.width != 159u ||
+        clip.height != 1u ||
+        clip.source_stride != 50u ||
+        clip.source_byte_start != 10u ||
+        clip.source_read_bytes != 40u) {
+        return 8;
+    }
+    if (compat_gui_clip_packed_2bpp(
+            180, 20, 16, 16, 160, 240, &clip
+        ) != COMPAT_GUI_CLIP_EMPTY) {
+        return 9;
+    }
+    if (compat_gui_clip_packed_2bpp(
+            -16, 20, 16, 16, 160, 240, &clip
+        ) != COMPAT_GUI_CLIP_EMPTY) {
+        return 10;
+    }
+    if (compat_gui_clip_packed_2bpp(
+            0, 0, -1, 16, 160, 240, &clip
+        ) != COMPAT_GUI_CLIP_EMPTY) {
+        return 11;
+    }
+    if (compat_gui_clip_packed_2bpp(
+            0, 0, 16, 16, 0, 240, &clip
+        ) != COMPAT_GUI_CLIP_INVALID) {
+        return 12;
+    }
+    return 0;
+}
+
+static int test_audio_mixer_source(void)
+{
+    unsigned char ram[256];
+    c33_vm_t vm;
+    const unsigned base = 0x1000u;
+    const unsigned descriptor = base;
+    const unsigned wave = base + 0x40u;
+    const unsigned data_payload = wave + 54u;
+
+    memset(ram, 0, sizeof(ram));
+    c33_vm_init(&vm);
+    if (!c33_vm_map(&vm, base, ram, sizeof(ram), 1)) {
+        return 1;
+    }
+    put_u32(ram, wave);
+    put_u32(ram + 4u, 58u);
+    memcpy(ram + 0x40u, "RIFF", 4u);
+    put_u32(ram + 0x44u, 50u);
+    memcpy(ram + 0x48u, "WAVEfmt ", 8u);
+    put_u32(ram + 0x50u, 16u);
+    ram[0x54u] = 1u;
+    ram[0x56u] = 1u;
+    ram[0x58u] = 0x40u;
+    ram[0x59u] = 0x1fu;
+    memcpy(ram + 0x64u, "JUNK", 4u);
+    put_u32(ram + 0x68u, 1u);
+    ram[0x6cu] = 0x5au;
+    memcpy(ram + 0x6eu, "data", 4u);
+    put_u32(ram + 0x72u, 4u);
+    ram[0x76u] = 1u;
+    ram[0x77u] = 2u;
+    ram[0x78u] = 3u;
+    ram[0x79u] = 4u;
+    if (!compat_audio_mixer_source_open(&vm, descriptor) ||
+        ram[0] != (unsigned char)data_payload ||
+        ram[1] != (unsigned char)(data_payload >> 8) ||
+        ram[2] != (unsigned char)(data_payload >> 16) ||
+        ram[3] != (unsigned char)(data_payload >> 24) ||
+        ram[4] != 4u) {
+        return 2;
+    }
+
+    put_u32(ram + 0x10u, base + 0xc0u);
+    put_u32(ram + 0x14u, 16u);
+    memset(ram + 0xc0u, 0xa5, 16u);
+    if (!compat_audio_mixer_source_open(&vm, base + 0x10u) ||
+        ram[0x10u] != 0xc0u ||
+        ram[0x11u] != 0x10u ||
+        ram[0x14u] != 16u) {
+        return 3;
+    }
+
+    put_u32(ram, wave);
+    put_u32(ram + 4u, 20u);
+    memcpy(ram + 0x40u, "RIFF", 4u);
+    memcpy(ram + 0x48u, "WAVEdata", 8u);
+    put_u32(ram + 0x50u, 0x1000u);
+    if (compat_audio_mixer_source_open(&vm, descriptor)) {
+        return 4;
+    }
     return 0;
 }
 
@@ -448,9 +656,19 @@ int main(void)
         fprintf(stderr, "test_fs_path_mapping failed: %d\n", rc);
         return 1;
     }
+    rc = test_vm_region_write_tracking();
+    if (rc) {
+        fprintf(stderr, "test_vm_region_write_tracking failed: %d\n", rc);
+        return 1;
+    }
     rc = test_vm_return();
     if (rc) {
         fprintf(stderr, "test_vm_return failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_vm_memory_bit_test();
+    if (rc) {
+        fprintf(stderr, "test_vm_memory_bit_test failed: %d\n", rc);
         return 1;
     }
     rc = test_vm_callback();
@@ -461,6 +679,11 @@ int main(void)
     rc = test_vm_suspended_callback();
     if (rc) {
         fprintf(stderr, "test_vm_suspended_callback failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_vm_timeslice_yield();
+    if (rc) {
+        fprintf(stderr, "test_vm_timeslice_yield failed: %d\n", rc);
         return 1;
     }
     rc = test_vm_arithmetic_extensions();
@@ -476,6 +699,11 @@ int main(void)
     rc = test_gui_image_header();
     if (rc) {
         fprintf(stderr, "test_gui_image_header failed: %d\n", rc);
+        return 1;
+    }
+    rc = test_audio_mixer_source();
+    if (rc) {
+        fprintf(stderr, "test_audio_mixer_source failed: %d\n", rc);
         return 1;
     }
     puts("host runtime tests: ok");
